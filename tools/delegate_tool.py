@@ -2825,7 +2825,7 @@ DELEGATE_TASK_SCHEMA = {
             "model": {
                 "type": "string",
                 "description": (
-                    "Model name for the subagent (e.g. 'gpt-5.5', 'claude-sonnet-4-5'). "
+                    "Model name for the subagent (e.g. 'gpt-5.5', 'claude-sonnet-4-6'). "
                     "Overrides delegation.model config and the parent's model. "
                     "Pair with 'provider' when routing to a specific provider:model. "
                     "Leave unset to inherit from delegation.model config or parent."
