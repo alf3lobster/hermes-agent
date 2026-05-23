@@ -364,6 +364,7 @@ RULES:
 - Extract facts, not conversation. Write "Delivery scripts live at /path/..." not "User asked about delivery scripts."
 - One fact per output line. Each fact must be self-contained — no pronouns without referents.
 - Only extract facts that are specific, durable, and would be useful to recall in a future session.
+- Mine BOTH user and assistant turns — tool outputs, confirmed paths, resolved errors, and synthesised answers often contain the most durable facts.
 - Skip: pleasantries, clarifying questions, transient status ("I'm looking at it now"), general knowledge.
 - Maximum 15 facts. Prefer fewer, high-quality facts over many weak ones.
 
@@ -391,11 +392,16 @@ Output only FACT lines. No preamble, no explanation."""
         return ""
 
     def _format_conversation(self, messages: list, max_turns: int) -> str:
-        """Render the last max_turns user/assistant turns as plain text."""
+        """Render the last max_turns user/assistant turns as plain text.
+
+        max_turns=0 means include all turns.
+        """
         relevant = [
             m for m in messages
             if m.get("role") in ("user", "assistant")
-        ][-max_turns:]
+        ]
+        if max_turns > 0:
+            relevant = relevant[-max_turns:]
 
         lines = []
         for msg in relevant:
@@ -459,8 +465,9 @@ Output only FACT lines. No preamble, no explanation."""
         """
         model = str(self._config.get("auto_extract_model", "claude-haiku-4-5-20251001")).strip()
         provider = str(self._config.get("auto_extract_provider", "anthropic")).strip().lower()
-        max_turns = int(self._config.get("auto_extract_max_turns", 40))
+        max_turns = int(self._config.get("auto_extract_max_turns", 80))
         min_turns = int(self._config.get("auto_extract_min_turns", 5))
+        dry_run = bool(self._config.get("auto_extract_dry_run", False))
 
         relevant_count = sum(
             1 for m in messages if m.get("role") in ("user", "assistant")
@@ -485,6 +492,11 @@ Output only FACT lines. No preamble, no explanation."""
             for content, category, tags in candidates:
                 if self._store.fact_exists_similar(content):
                     skipped += 1
+                    logger.debug("Holographic auto-extract: duplicate skipped: %s", content[:80])
+                    continue
+                if dry_run:
+                    logger.info("Holographic auto-extract [DRY RUN] would store: [%s] %s", category, content)
+                    stored += 1
                     continue
                 try:
                     self._store.add_fact(content, category=category, tags=tags)
@@ -492,10 +504,16 @@ Output only FACT lines. No preamble, no explanation."""
                 except Exception as exc:
                     logger.debug("Holographic: failed to store extracted fact: %s", exc)
 
-            logger.info(
-                "Holographic auto-extract: %d new facts stored, %d duplicates skipped",
-                stored, skipped,
-            )
+            if dry_run:
+                logger.info(
+                    "Holographic auto-extract [DRY RUN]: %d facts would be stored, %d duplicates skipped — set auto_extract_dry_run: false to commit",
+                    stored, skipped,
+                )
+            else:
+                logger.info(
+                    "Holographic auto-extract: %d new facts stored, %d duplicates skipped",
+                    stored, skipped,
+                )
 
         except Exception as exc:
             logger.warning(
