@@ -1020,6 +1020,10 @@ def _build_child_agent(
     # Resolve effective credentials: config override > parent inherit
     effective_model = model or parent_agent.model
     effective_provider = override_provider or getattr(parent_agent, "provider", None)
+    logger.debug(
+        "delegate_task: child[%d] effective_model=%r effective_provider=%r",
+        task_index, effective_model, effective_provider,
+    )
     effective_base_url = override_base_url or parent_agent.base_url
     effective_api_key = override_api_key or parent_api_key
     # Bug #20558 / PR #20563: api_mode must NOT be inherited when the child uses a
@@ -1925,6 +1929,8 @@ def delegate_task(
     acp_args: Optional[List[str]] = None,
     role: Optional[str] = None,
     parent_agent=None,
+    model: Optional[str] = None,
+    provider: Optional[str] = None,
 ) -> str:
     """
     Spawn one or more child agents to handle delegated tasks.
@@ -1996,6 +2002,51 @@ def delegate_task(
         creds = _resolve_delegation_credentials(cfg, parent_agent)
     except ValueError as exc:
         return tool_error(str(exc))
+
+    # Per-call model/provider overrides take precedence over delegation config.
+    # Useful when the orchestrator wants to route a specific task to a different
+    # model without changing the global delegation.model / delegation.provider config.
+    # When provider is given we resolve the full credential bundle for that
+    # provider (base_url, api_key, api_mode) — just like _resolve_delegation_credentials
+    # does when delegation.provider is configured.  This is essential for OAuth
+    # providers like openai-codex where the parent's api_key is the wrong credential
+    # type entirely; stuffing only provider into creds causes agent_init to build
+    # the client with the parent's (e.g. Anthropic) key against the wrong endpoint.
+    call_model = (str(model).strip() or None) if model is not None else None
+    if call_model:
+        creds = dict(creds)
+        creds["model"] = call_model
+    if provider is not None:
+        call_provider = str(provider).strip().lower() or None
+        if call_provider:
+            try:
+                from hermes_cli.runtime_provider import resolve_runtime_provider
+
+                runtime = resolve_runtime_provider(
+                    requested=call_provider,
+                    target_model=call_model or creds.get("model"),
+                )
+                resolved_api_key = runtime.get("api_key") or ""
+                if not resolved_api_key:
+                    return tool_error(
+                        f"Per-call provider '{call_provider}' resolved but has no API key. "
+                        f"Check that the provider is configured (run 'hermes auth' for OAuth "
+                        f"providers, or set the appropriate API key environment variable)."
+                    )
+                creds = dict(creds)
+                creds["provider"] = runtime.get("provider") or call_provider
+                creds["base_url"] = runtime.get("base_url") or None
+                creds["api_key"] = resolved_api_key
+                creds["api_mode"] = runtime.get("api_mode") or None
+                if runtime.get("command"):
+                    creds["command"] = runtime["command"]
+                if runtime.get("args"):
+                    creds["args"] = list(runtime["args"])
+            except Exception as exc:
+                return tool_error(
+                    f"Cannot resolve per-call provider '{call_provider}': {exc}. "
+                    f"Check that the provider is configured and credentials are valid."
+                )
 
     # Normalize to task list
     max_children = _get_max_concurrent_children()
@@ -2771,6 +2822,24 @@ DELEGATE_TASK_SCHEMA = {
                     "Leave empty unless acp_command is explicitly provided."
                 ),
             },
+            "model": {
+                "type": "string",
+                "description": (
+                    "Model name for the subagent (e.g. 'gpt-5.5', 'claude-sonnet-4-5'). "
+                    "Overrides delegation.model config and the parent's model. "
+                    "Pair with 'provider' when routing to a specific provider:model. "
+                    "Leave unset to inherit from delegation.model config or parent."
+                ),
+            },
+            "provider": {
+                "type": "string",
+                "description": (
+                    "Provider for the subagent (e.g. 'openai-codex', 'anthropic', 'openrouter'). "
+                    "Overrides delegation.provider config. When set, the subagent uses this "
+                    "provider with the parent's base_url/api_key unless delegation.base_url is "
+                    "also configured. Leave unset to inherit from delegation.provider config or parent."
+                ),
+            },
         },
         "required": [],
     },
@@ -2794,6 +2863,8 @@ registry.register(
         acp_args=args.get("acp_args"),
         role=args.get("role"),
         parent_agent=kw.get("parent_agent"),
+        model=args.get("model"),
+        provider=args.get("provider"),
     ),
     check_fn=check_delegate_requirements,
     emoji="🔀",
