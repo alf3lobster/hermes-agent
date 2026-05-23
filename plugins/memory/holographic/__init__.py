@@ -356,7 +356,155 @@ class HolographicMemoryProvider(MemoryProvider):
 
     # -- Auto-extraction (on_session_end) ------------------------------------
 
+    # Extraction prompt sent to the LLM. Keep it tight — output must be parseable.
+    _EXTRACTION_PROMPT = """\
+Review the following conversation and extract facts worth storing permanently in a structured memory system.
+
+RULES:
+- Extract facts, not conversation. Write "Delivery scripts live at /path/..." not "User asked about delivery scripts."
+- One fact per output line. Each fact must be self-contained — no pronouns without referents.
+- Only extract facts that are specific, durable, and would be useful to recall in a future session.
+- Skip: pleasantries, clarifying questions, transient status ("I'm looking at it now"), general knowledge.
+- Maximum 15 facts. Prefer fewer, high-quality facts over many weak ones.
+
+OUTPUT FORMAT — one fact per line, exactly:
+FACT [category] [tag1,tag2] fact content here
+
+category must be one of: tool | project | user_pref | general
+tags: 2-4 lowercase hyphenated keywords (e.g. delivery,scripts,macbook)
+
+CONVERSATION:
+{conversation}
+
+Output only FACT lines. No preamble, no explanation."""
+
+    def _extract_text_from_content(self, content) -> str:
+        """Pull plain text from a message content field (str or list of blocks)."""
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            parts = []
+            for block in content:
+                if isinstance(block, dict) and block.get("type") == "text":
+                    parts.append(block.get("text", ""))
+            return "\n".join(parts)
+        return ""
+
+    def _format_conversation(self, messages: list, max_turns: int) -> str:
+        """Render the last max_turns user/assistant turns as plain text."""
+        relevant = [
+            m for m in messages
+            if m.get("role") in ("user", "assistant")
+        ][-max_turns:]
+
+        lines = []
+        for msg in relevant:
+            role = msg.get("role", "")
+            text = self._extract_text_from_content(msg.get("content", "")).strip()
+            if text:
+                lines.append(f"{role.upper()}: {text[:800]}")
+        return "\n\n".join(lines)
+
+    def _call_extraction_model(self, conversation: str, model: str, provider: str) -> str:
+        """Make a synchronous LLM call and return the raw text response."""
+        prompt = self._EXTRACTION_PROMPT.format(conversation=conversation)
+
+        if provider == "anthropic":
+            import anthropic
+            try:
+                from agent.anthropic_adapter import resolve_anthropic_token
+                api_key = resolve_anthropic_token() or ""
+            except Exception:
+                import os
+                api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+            if not api_key:
+                raise RuntimeError("No Anthropic API key available for extraction")
+            client = anthropic.Anthropic(api_key=api_key)
+            response = client.messages.create(
+                model=model,
+                max_tokens=1024,
+                messages=[{"role": "user", "content": prompt}],
+            )
+            return response.content[0].text if response.content else ""
+
+        raise ValueError(f"Unsupported auto_extract_provider: {provider!r}")
+
+    def _parse_extraction_output(self, raw: str) -> list[tuple[str, str, str]]:
+        """Parse FACT lines into (content, category, tags) tuples."""
+        valid_categories = {"tool", "project", "user_pref", "general"}
+        results = []
+        for line in raw.splitlines():
+            line = line.strip()
+            if not line.startswith("FACT "):
+                continue
+            parts = line[5:].split(None, 2)  # strip "FACT ", split into [cat, tags, content]
+            if len(parts) < 3:
+                continue
+            category, tags, content = parts
+            category = category.strip("[]").lower()
+            tags = tags.strip("[]")
+            content = content.strip()
+            if category not in valid_categories:
+                category = "general"
+            if content:
+                results.append((content, category, tags))
+        return results
+
     def _auto_extract_facts(self, messages: list) -> None:
+        """LLM-based session-end fact extraction using a cheap fast model.
+
+        Passes the last N turns to the configured extraction model, parses
+        structured FACT lines, deduplicates against existing facts, and stores
+        new facts.  Falls back to regex extraction if the LLM call fails.
+        """
+        model = str(self._config.get("auto_extract_model", "claude-haiku-4-5-20251001")).strip()
+        provider = str(self._config.get("auto_extract_provider", "anthropic")).strip().lower()
+        max_turns = int(self._config.get("auto_extract_max_turns", 40))
+        min_turns = int(self._config.get("auto_extract_min_turns", 5))
+
+        relevant_count = sum(
+            1 for m in messages if m.get("role") in ("user", "assistant")
+        )
+        if relevant_count < min_turns:
+            logger.debug(
+                "Holographic auto-extract: only %d turns, skipping (min=%d)",
+                relevant_count, min_turns,
+            )
+            return
+
+        try:
+            conversation = self._format_conversation(messages, max_turns)
+            if not conversation.strip():
+                return
+
+            raw = self._call_extraction_model(conversation, model, provider)
+            candidates = self._parse_extraction_output(raw)
+
+            stored = 0
+            skipped = 0
+            for content, category, tags in candidates:
+                if self._store.fact_exists_similar(content):
+                    skipped += 1
+                    continue
+                try:
+                    self._store.add_fact(content, category=category, tags=tags)
+                    stored += 1
+                except Exception as exc:
+                    logger.debug("Holographic: failed to store extracted fact: %s", exc)
+
+            logger.info(
+                "Holographic auto-extract: %d new facts stored, %d duplicates skipped",
+                stored, skipped,
+            )
+
+        except Exception as exc:
+            logger.warning(
+                "Holographic LLM auto-extraction failed (%s), falling back to regex", exc
+            )
+            self._auto_extract_facts_regex(messages)
+
+    def _auto_extract_facts_regex(self, messages: list) -> None:
+        """Regex-based fallback extraction — sparse but zero-dependency."""
         _PREF_PATTERNS = [
             re.compile(r'\bI\s+(?:prefer|like|love|use|want|need)\s+(.+)', re.IGNORECASE),
             re.compile(r'\bmy\s+(?:favorite|preferred|default)\s+\w+\s+is\s+(.+)', re.IGNORECASE),
@@ -366,15 +514,13 @@ class HolographicMemoryProvider(MemoryProvider):
             re.compile(r'\bwe\s+(?:decided|agreed|chose)\s+(?:to\s+)?(.+)', re.IGNORECASE),
             re.compile(r'\bthe\s+project\s+(?:uses|needs|requires)\s+(.+)', re.IGNORECASE),
         ]
-
         extracted = 0
         for msg in messages:
             if msg.get("role") != "user":
                 continue
-            content = msg.get("content", "")
-            if not isinstance(content, str) or len(content) < 10:
+            content = self._extract_text_from_content(msg.get("content", ""))
+            if not content or len(content) < 10:
                 continue
-
             for pattern in _PREF_PATTERNS:
                 if pattern.search(content):
                     try:
@@ -383,7 +529,6 @@ class HolographicMemoryProvider(MemoryProvider):
                     except Exception:
                         pass
                     break
-
             for pattern in _DECISION_PATTERNS:
                 if pattern.search(content):
                     try:
@@ -392,9 +537,8 @@ class HolographicMemoryProvider(MemoryProvider):
                     except Exception:
                         pass
                     break
-
         if extracted:
-            logger.info("Auto-extracted %d facts from conversation", extracted)
+            logger.info("Holographic regex fallback extracted %d facts", extracted)
 
 
 # ---------------------------------------------------------------------------

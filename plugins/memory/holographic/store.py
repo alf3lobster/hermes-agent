@@ -567,6 +567,31 @@ class MemoryStore:
         """Convert a sqlite3.Row to a plain dict."""
         return dict(row)
 
+    def fact_exists_similar(
+        self,
+        content: str,
+        min_trust: float = 0.4,
+        check_words: int = 6,
+    ) -> bool:
+        """Return True if a fact with similar opening words already exists.
+
+        Uses the first ``check_words`` words as an FTS5 query so we avoid
+        storing near-duplicate extracted facts.  Falls back to False on any
+        error so the caller can safely proceed with add_fact().
+        """
+        words = content.strip().split()[:check_words]
+        if not words:
+            return False
+        sanitized = [re.sub(r"[^\w]", "", w) for w in words]
+        query = " ".join(w for w in sanitized if w)
+        if not query:
+            return False
+        try:
+            results = self.search_facts(query, min_trust=min_trust, limit=1)
+            return len(results) > 0
+        except Exception:
+            return False
+
     def close(self) -> None:
         """Close the database connection."""
         self._conn.close()
