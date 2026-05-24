@@ -20,6 +20,9 @@ from __future__ import annotations
 import json
 import logging
 import re
+import threading
+from collections import deque
+from pathlib import Path
 from typing import Any, Dict, List
 
 from agent.memory_provider import MemoryProvider
@@ -108,6 +111,30 @@ def _load_plugin_config() -> dict:
         return {}
 
 
+def _load_stack_role(role: str) -> dict:
+    """Read a model role from ~/.alfred/config/stack.yaml.
+
+    role: dotted path under llm, e.g. "api.haiku" → llm.api.haiku block.
+    Returns dict with "model", "endpoint", "provider" keys.
+    Raises KeyError if the role or file is missing.
+    """
+    stack_path = Path.home() / ".alfred" / "config" / "stack.yaml"
+    try:
+        import yaml
+        with open(stack_path, encoding="utf-8") as f:
+            stack = yaml.safe_load(f) or {}
+    except FileNotFoundError as exc:
+        raise KeyError(f"stack.yaml not found at {stack_path}") from exc
+    node = stack.get("llm", {})
+    for part in role.split("."):
+        if not isinstance(node, dict) or part not in node:
+            raise KeyError(f"llm.{role} not found in stack.yaml")
+        node = node[part]
+    if not isinstance(node, dict):
+        raise KeyError(f"llm.{role} is not a dict in stack.yaml")
+    return node
+
+
 # ---------------------------------------------------------------------------
 # MemoryProvider implementation
 # ---------------------------------------------------------------------------
@@ -120,6 +147,10 @@ class HolographicMemoryProvider(MemoryProvider):
         self._store = None
         self._retriever = None
         self._min_trust = float(self._config.get("min_trust_threshold", 0.3))
+        # Per-turn extraction state (used when auto_extract_trigger == 'per_turn')
+        self._turn_counts: dict[str, int] = {}
+        self._session_buffers: dict[str, deque] = {}
+        self._extracting_sessions: set[str] = set()
 
     @property
     def name(self) -> str:
@@ -220,9 +251,95 @@ class HolographicMemoryProvider(MemoryProvider):
             return ""
 
     def sync_turn(self, user_content: str, assistant_content: str, *, session_id: str = "") -> None:
-        # Holographic memory stores explicit facts via tools, not auto-sync.
-        # The on_session_end hook handles auto-extraction if configured.
-        pass
+        if not self._config.get("auto_extract", False):
+            return
+        trigger = str(self._config.get("auto_extract_trigger", "session_end")).strip()
+        if trigger != "per_turn":
+            return
+
+        every_n = int(self._config.get("auto_extract_every_n_turns", 8))
+        window = int(self._config.get("auto_extract_window_turns", 20))
+        sid = session_id or "_default"
+
+        if sid not in self._session_buffers:
+            # maxlen = window * 2: one deque entry per role (user + assistant per turn)
+            self._session_buffers[sid] = deque(maxlen=window * 2)
+            self._turn_counts[sid] = 0
+
+        buf = self._session_buffers[sid]
+        if user_content:
+            buf.append({"role": "user", "content": user_content})
+        if assistant_content:
+            buf.append({"role": "assistant", "content": assistant_content})
+
+        self._turn_counts[sid] = self._turn_counts.get(sid, 0) + 1
+        count = self._turn_counts[sid]
+
+        if count % every_n == 0 and sid not in self._extracting_sessions:
+            messages_snapshot = list(buf)
+            t = threading.Thread(
+                target=self._auto_extract_from_buffer,
+                args=(sid, messages_snapshot),
+                daemon=True,
+            )
+            t.start()
+
+    def _auto_extract_from_buffer(self, session_id: str, messages: list) -> None:
+        """Daemon-thread extraction from the per-session sliding window buffer."""
+        self._extracting_sessions.add(session_id)
+        try:
+            if not self._store:
+                return
+
+            dry_run = bool(self._config.get("auto_extract_dry_run", False))
+            model, provider, endpoint = self._resolve_extraction_model()
+
+            lines = []
+            for msg in messages:
+                role = msg.get("role", "")
+                text = self._extract_text_from_content(msg.get("content", "")).strip()
+                if text:
+                    lines.append(f"{role.upper()}: {text[:800]}")
+            conversation = "\n\n".join(lines)
+            if not conversation.strip():
+                return
+
+            raw = self._call_extraction_model(conversation, model, provider, endpoint=endpoint)
+            candidates = self._parse_extraction_output(raw)
+
+            stored = 0
+            skipped = 0
+            for content, category, tags in candidates:
+                if self._store.fact_exists_similar(content):
+                    skipped += 1
+                    logger.debug("Holographic per-turn extract: duplicate skipped: %s", content[:80])
+                    continue
+                if dry_run:
+                    logger.info(
+                        "Holographic per-turn extract [DRY RUN] would store: [%s] %s",
+                        category, content,
+                    )
+                    stored += 1
+                    continue
+                try:
+                    self._store.add_fact(content, category=category, tags=tags)
+                    stored += 1
+                except Exception as exc:
+                    logger.debug("Holographic: failed to store extracted fact: %s", exc)
+
+            label = "[DRY RUN] " if dry_run else ""
+            logger.info(
+                "Holographic per-turn extract %s(session=%s): %d facts %s, %d duplicates skipped",
+                label, session_id, stored,
+                "would be stored" if dry_run else "stored",
+                skipped,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Holographic per-turn extract failed (session=%s): %s", session_id, exc
+            )
+        finally:
+            self._extracting_sessions.discard(session_id)
 
     def get_tool_schemas(self) -> List[Dict[str, Any]]:
         return [FACT_STORE_SCHEMA, FACT_FEEDBACK_SCHEMA]
@@ -237,7 +354,18 @@ class HolographicMemoryProvider(MemoryProvider):
     def on_session_end(self, messages: List[Dict[str, Any]]) -> None:
         if not self._config.get("auto_extract", False):
             return
-        if not self._store or not messages:
+        if not self._store:
+            return
+
+        trigger = str(self._config.get("auto_extract_trigger", "session_end")).strip()
+        if trigger == "per_turn":
+            # Extraction happens in sync_turn daemon threads; clean up session state.
+            sid = getattr(self, "_session_id", "_default") or "_default"
+            self._turn_counts.pop(sid, None)
+            self._session_buffers.pop(sid, None)
+            return
+
+        if not messages:
             return
         self._auto_extract_facts(messages)
 
@@ -354,7 +482,31 @@ class HolographicMemoryProvider(MemoryProvider):
         except Exception as exc:
             return tool_error(str(exc))
 
-    # -- Auto-extraction (on_session_end) ------------------------------------
+    # -- Auto-extraction ----------------------------------------------------
+
+    def _resolve_extraction_model(self) -> tuple[str, str, str]:
+        """Return (model, provider, endpoint) from stack.yaml role or fallback config keys."""
+        stack_role = str(self._config.get("auto_extract_stack_role", "")).strip()
+        model = "claude-haiku-4-5-20251001"
+        provider = "anthropic"
+        endpoint = ""
+        if stack_role:
+            try:
+                role_cfg = _load_stack_role(stack_role)
+                model = str(role_cfg.get("model", model))
+                provider = str(role_cfg.get("provider", provider))
+                endpoint = str(role_cfg.get("endpoint", ""))
+            except KeyError as exc:
+                logger.warning(
+                    "Holographic auto-extract: stack.yaml role %r not found (%s), using config keys",
+                    stack_role, exc,
+                )
+                model = str(self._config.get("auto_extract_model", model)).strip()
+                provider = str(self._config.get("auto_extract_provider", provider)).strip().lower()
+        else:
+            model = str(self._config.get("auto_extract_model", model)).strip()
+            provider = str(self._config.get("auto_extract_provider", provider)).strip().lower()
+        return model, provider, endpoint
 
     # Extraction prompt sent to the LLM. Keep it tight — output must be parseable.
     _EXTRACTION_PROMPT = """\
@@ -411,11 +563,17 @@ Output only FACT lines. No preamble, no explanation."""
                 lines.append(f"{role.upper()}: {text[:800]}")
         return "\n\n".join(lines)
 
-    def _call_extraction_model(self, conversation: str, model: str, provider: str) -> str:
-        """Make a synchronous LLM call and return the raw text response."""
+    def _call_extraction_model(
+        self, conversation: str, model: str, provider: str, endpoint: str = ""
+    ) -> str:
+        """Make a synchronous LLM call and return the raw text response.
+
+        provider: "api" or "anthropic" → Anthropic SDK
+                  "local" → Ollama OpenAI-compatible chat endpoint
+        """
         prompt = self._EXTRACTION_PROMPT.format(conversation=conversation)
 
-        if provider == "anthropic":
+        if provider in ("api", "anthropic"):
             import anthropic
             try:
                 from agent.anthropic_adapter import resolve_anthropic_token
@@ -432,6 +590,25 @@ Output only FACT lines. No preamble, no explanation."""
                 messages=[{"role": "user", "content": prompt}],
             )
             return response.content[0].text if response.content else ""
+
+        if provider == "local":
+            import urllib.request
+            base = (endpoint or "http://localhost:11434").rstrip("/")
+            url = f"{base}/v1/chat/completions"
+            payload = json.dumps({
+                "model": model,
+                "messages": [{"role": "user", "content": prompt}],
+                "stream": False,
+            }).encode()
+            req = urllib.request.Request(
+                url,
+                data=payload,
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=120) as resp:
+                data = json.loads(resp.read())
+            return data["choices"][0]["message"]["content"]
 
         raise ValueError(f"Unsupported auto_extract_provider: {provider!r}")
 
@@ -463,8 +640,7 @@ Output only FACT lines. No preamble, no explanation."""
         structured FACT lines, deduplicates against existing facts, and stores
         new facts.  Falls back to regex extraction if the LLM call fails.
         """
-        model = str(self._config.get("auto_extract_model", "claude-haiku-4-5-20251001")).strip()
-        provider = str(self._config.get("auto_extract_provider", "anthropic")).strip().lower()
+        model, provider, endpoint = self._resolve_extraction_model()
         max_turns = int(self._config.get("auto_extract_max_turns", 80))
         min_turns = int(self._config.get("auto_extract_min_turns", 5))
         dry_run = bool(self._config.get("auto_extract_dry_run", False))
@@ -484,7 +660,7 @@ Output only FACT lines. No preamble, no explanation."""
             if not conversation.strip():
                 return
 
-            raw = self._call_extraction_model(conversation, model, provider)
+            raw = self._call_extraction_model(conversation, model, provider, endpoint=endpoint)
             candidates = self._parse_extraction_output(raw)
 
             stored = 0
