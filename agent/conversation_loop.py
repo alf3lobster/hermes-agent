@@ -3796,6 +3796,50 @@ def run_conversation(
                     continue
 
                 agent._codex_incomplete_retries = 0
+
+                # ── LOCAL PATCH 2026-06-23 (codex-exhaustion failover) ──────────
+                # Codex usage-exhaustion surfaces as an HTTP-200 response with
+                # finish_reason=="incomplete" (empty/truncated completions), NOT a
+                # 429 — so it never reaches error_classifier and the fallback chain
+                # is bypassed, leaving the agent dark instead of failing over. Wire
+                # the existing fallback in here: drop the trailing partial
+                # 'incomplete' assistant messages (codex-specific state the next
+                # provider can't consume), then activate the fallback provider and
+                # retry the turn via the same `continue` path the retry loop already
+                # uses above. If no fallback is configured/available, fall through to
+                # the original partial/error return. Re-apply after `hermes update`.
+                try:
+                    from agent.error_classifier import FailoverReason as _FailoverReason
+                    _fb_reason = _FailoverReason.rate_limit
+                except Exception:
+                    _fb_reason = None
+                while (
+                    messages
+                    and isinstance(messages[-1], dict)
+                    and messages[-1].get("role") == "assistant"
+                    and messages[-1].get("finish_reason") == "incomplete"
+                ):
+                    messages.pop()
+                if agent._try_activate_fallback(_fb_reason):
+                    # WARNING-level via the module logger so failovers are visible
+                    # in gateway/cron logs, not just interactive sessions
+                    # (quiet_mode suppresses _vprint).
+                    logger.warning(
+                        "%scodex-exhaustion failover: codex 'incomplete' after 3 retries "
+                        "→ %s/%s",
+                        agent.log_prefix,
+                        getattr(agent, "provider", "?"),
+                        getattr(agent, "model", "?"),
+                    )
+                    if not agent.quiet_mode:
+                        agent._vprint(
+                            f"{agent.log_prefix}🔄 Codex incomplete after 3 retries — "
+                            f"failing over to {getattr(agent, 'provider', '?')}/{getattr(agent, 'model', '?')}"
+                        )
+                    agent._session_messages = messages
+                    continue
+                # ── END LOCAL PATCH ─────────────────────────────────────────────
+
                 agent._persist_session(messages, conversation_history)
                 return {
                     "final_response": None,
