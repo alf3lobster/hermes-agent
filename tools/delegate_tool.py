@@ -1562,7 +1562,16 @@ def _run_single_child(
     _stale_count = [0]
 
     def _heartbeat_loop():
-        while not _heartbeat_stop.wait(_HEARTBEAT_INTERVAL):
+        # Send the first heartbeat immediately, then wait between subsequent
+        # touches. Under load, waiting for the first interval made short but
+        # legitimate in-tool child work look stale in tests and delayed the
+        # gateway activity refresh for real runs.
+        _first_heartbeat = True
+        while True:
+            if _first_heartbeat:
+                _first_heartbeat = False
+            elif _heartbeat_stop.wait(_HEARTBEAT_INTERVAL):
+                break
             if parent_agent is None:
                 continue
             touch = getattr(parent_agent, "_touch_activity", None)
