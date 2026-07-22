@@ -215,3 +215,27 @@ class TestWebSocketHostOriginGuard:
             },
         ):
             pass
+
+
+class TestExtraAcceptedHosts:
+    """Local customization: HERMES_DASHBOARD_EXTRA_HOSTS allowlist for the
+    Tailscale Serve front (proxy preserves the client Host header)."""
+
+    def test_extra_host_accepted_on_loopback_bind(self, monkeypatch):
+        import importlib
+
+        monkeypatch.setenv(
+            "HERMES_DASHBOARD_EXTRA_HOSTS", "100.113.208.100"
+        )
+        import hermes_cli.web_server as ws
+        importlib.reload(ws)
+        try:
+            assert ws._is_accepted_host("100.113.208.100:9127", "127.0.0.1")
+            assert ws._is_accepted_host("100.113.208.100", "127.0.0.1")
+            # attacker hosts still rejected
+            assert not ws._is_accepted_host("evil.example:9127", "127.0.0.1")
+            # loopback names still accepted
+            assert ws._is_accepted_host("127.0.0.1:9128", "127.0.0.1")
+        finally:
+            monkeypatch.delenv("HERMES_DASHBOARD_EXTRA_HOSTS")
+            importlib.reload(ws)

@@ -412,6 +412,20 @@ def should_require_auth(host: str, allow_public: bool = False) -> bool:
     return host not in _LOOPBACK_HOST_VALUES
 
 
+# Local customization (alfred-mini): extra Host values accepted by
+# _is_accepted_host, from HERMES_DASHBOARD_EXTRA_HOSTS (comma-separated).
+# Used for the Tailscale Serve front (100.113.208.100:9127/:9119 ->
+# 127.0.0.1:9128): the proxy preserves the client's Host header, which the
+# loopback-bind check would otherwise reject. IP-literal entries do not
+# reopen GHSA-ppp5-vxwm-4cf7 -- DNS rebinding requires an attacker-owned
+# DNS *name* in Host; a fixed IP allowlist is not rebindable.
+_EXTRA_ACCEPTED_HOSTS = frozenset(
+    h.strip().lower()
+    for h in os.environ.get("HERMES_DASHBOARD_EXTRA_HOSTS", "").split(",")
+    if h.strip()
+)
+
+
 def _is_accepted_host(host_header: str, bound_host: str) -> bool:
     """True if the Host header targets the interface we bound to.
 
@@ -440,6 +454,9 @@ def _is_accepted_host(host_header: str, bound_host: str) -> bool:
     else:
         host_only = h.rsplit(":", 1)[0] if ":" in h else h
     host_only = host_only.lower()
+
+    if host_only in _EXTRA_ACCEPTED_HOSTS:
+        return True
 
     # 0.0.0.0 bind means operator explicitly opted into all-interfaces
     # (requires --insecure per web_server.start_server). No Host-layer
