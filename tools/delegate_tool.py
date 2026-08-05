@@ -3935,10 +3935,11 @@ DELEGATE_TASK_SCHEMA = {
             "provider": {
                 "type": "string",
                 "description": (
-                    "Provider for the subagent (e.g. 'openai-codex', 'anthropic', 'openrouter'). "
-                    "Overrides delegation.provider config. When set, the subagent uses this "
-                    "provider with the parent's base_url/api_key unless delegation.base_url is "
-                    "also configured. Leave unset to inherit from delegation.provider config or parent."
+                    "Provider for the subagent (e.g. 'openai-codex' or a configured "
+                    "'custom:<name>' provider). Overrides delegation.provider config. When set, "
+                    "the subagent uses this provider with the parent's base_url/api_key unless "
+                    "delegation.base_url is also configured. Leave unset to inherit from "
+                    "delegation.provider config or parent."
                 ),
             },
         },
