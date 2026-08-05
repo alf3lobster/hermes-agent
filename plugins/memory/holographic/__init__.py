@@ -27,6 +27,7 @@ from typing import Any, Dict, List
 
 from agent.memory_provider import MemoryProvider
 from tools.registry import tool_error
+from utils import is_truthy_value
 from .store import MemoryStore
 from .retrieval import FactRetriever
 from hermes_cli.config import cfg_get
@@ -98,14 +99,11 @@ FACT_FEEDBACK_SCHEMA = {
 # ---------------------------------------------------------------------------
 
 def _load_plugin_config() -> dict:
-    from hermes_constants import get_hermes_home
-    config_path = get_hermes_home() / "config.yaml"
-    if not config_path.exists():
-        return {}
     try:
-        import yaml
-        with open(config_path, encoding="utf-8-sig") as f:
-            all_config = yaml.safe_load(f) or {}
+        # Canonical loader: behavioral read now honors the managed-scope
+        # overlay + ${VAR} expansion (e.g. an api key template) too.
+        from hermes_cli.config import load_config_readonly
+        all_config = load_config_readonly()
         return cfg_get(all_config, "plugins", "hermes-memory-store", default={}) or {}
     except Exception:
         return {}
@@ -165,10 +163,10 @@ class HolographicMemoryProvider(MemoryProvider):
         config_path = Path(hermes_home) / "config.yaml"
         try:
             import yaml
-            existing = {}
-            if config_path.exists():
-                with open(config_path, encoding="utf-8-sig") as f:
-                    existing = yaml.safe_load(f) or {}
+            # Write-back round-trip: raw read is correct (merged defaults
+            # must not be persisted back into the user's file).
+            from hermes_cli.config import read_user_config_raw
+            existing = read_user_config_raw(config_path)
             existing.setdefault("plugins", {})
             existing["plugins"]["hermes-memory-store"] = values
             with open(config_path, "w", encoding="utf-8") as f:
@@ -251,7 +249,7 @@ class HolographicMemoryProvider(MemoryProvider):
             return ""
 
     def sync_turn(self, user_content: str, assistant_content: str, *, session_id: str = "") -> None:
-        if not self._config.get("auto_extract", False):
+        if not is_truthy_value(self._config.get("auto_extract", False)):
             return
         trigger = str(self._config.get("auto_extract_trigger", "session_end")).strip()
         if trigger != "per_turn":
@@ -291,7 +289,7 @@ class HolographicMemoryProvider(MemoryProvider):
             if not self._store:
                 return
 
-            dry_run = bool(self._config.get("auto_extract_dry_run", False))
+            dry_run = is_truthy_value(self._config.get("auto_extract_dry_run", False))
             model, provider, endpoint = self._resolve_extraction_model()
 
             lines = []
@@ -352,7 +350,10 @@ class HolographicMemoryProvider(MemoryProvider):
         return tool_error(f"Unknown tool: {tool_name}")
 
     def on_session_end(self, messages: List[Dict[str, Any]]) -> None:
-        if not self._config.get("auto_extract", False):
+        # is_truthy_value: the config schema declares auto_extract as a string
+        # enum ("false"/"true"), and a plain truthiness check treats the string
+        # "false" as enabled (#57682).
+        if not is_truthy_value(self._config.get("auto_extract", False)):
             return
         if not self._store:
             return
@@ -654,16 +655,19 @@ Output only FACT lines. No preamble, no explanation."""
         model, provider, endpoint = self._resolve_extraction_model()
         max_turns = int(self._config.get("auto_extract_max_turns", 80))
         min_turns = int(self._config.get("auto_extract_min_turns", 5))
-        dry_run = bool(self._config.get("auto_extract_dry_run", False))
+        dry_run = is_truthy_value(self._config.get("auto_extract_dry_run", False))
 
         relevant_count = sum(
             1 for m in messages if m.get("role") in ("user", "assistant")
         )
         if relevant_count < min_turns:
             logger.debug(
-                "Holographic auto-extract: only %d turns, skipping (min=%d)",
-                relevant_count, min_turns,
+                "Holographic auto-extract: only %d turns for LLM extraction "
+                "(min=%d); using regex fallback",
+                relevant_count,
+                min_turns,
             )
+            self._auto_extract_facts_regex(messages)
             return
 
         try:
@@ -710,6 +714,25 @@ Output only FACT lines. No preamble, no explanation."""
 
     def _auto_extract_facts_regex(self, messages: list) -> None:
         """Regex-based fallback extraction — sparse but zero-dependency."""
+        # Local import (pattern used in initialize()): the compressor module is
+        # heavier than this plugin and is only needed when auto_extract is on.
+        from agent.context_compressor import (
+            _MERGED_PRIOR_CONTEXT_HEADER,
+            _MERGED_SUMMARY_DELIMITER,
+            is_compaction_summary_message,
+        )
+
+        def _pre_delimiter_user_segment(msg: dict):
+            """Return genuine user text before a merged compaction summary."""
+            content = msg.get("content", "")
+            if not isinstance(content, str) or _MERGED_SUMMARY_DELIMITER not in content:
+                return None
+            pre = content.split(_MERGED_SUMMARY_DELIMITER, 1)[0]
+            if pre.startswith(_MERGED_PRIOR_CONTEXT_HEADER):
+                pre = pre[len(_MERGED_PRIOR_CONTEXT_HEADER):]
+            pre = pre.strip()
+            return pre or None
+
         _PREF_PATTERNS = [
             re.compile(r'\bI\s+(?:prefer|like|love|use|want|need)\s+(.+)', re.IGNORECASE),
             re.compile(r'\bmy\s+(?:favorite|preferred|default)\s+\w+\s+is\s+(.+)', re.IGNORECASE),
@@ -723,7 +746,16 @@ Output only FACT lines. No preamble, no explanation."""
         for msg in messages:
             if msg.get("role") != "user":
                 continue
-            content = self._extract_text_from_content(msg.get("content", ""))
+            # Compaction handoff summaries can be inserted as role="user".
+            # Preserve genuine pre-delimiter user content, but never harvest
+            # the generated summary suffix as durable memory.
+            pre_delimiter_segment = _pre_delimiter_user_segment(msg)
+            if pre_delimiter_segment is not None:
+                content = pre_delimiter_segment
+            elif is_compaction_summary_message(msg):
+                continue
+            else:
+                content = self._extract_text_from_content(msg.get("content", ""))
             if not content or len(content) < 10:
                 continue
             for pattern in _PREF_PATTERNS:
