@@ -560,6 +560,18 @@ _SERVER_DISCONNECT_PATTERNS = [
     "incomplete chunked read",
 ]
 
+# Provider/backend outage signatures delivered mid-stream as a status-less
+# SSE APIError (notably Envoy 503 bodies from the Codex backend). These are
+# unambiguously transport-wide failures, unlike the disconnect patterns above,
+# and must never be mistaken for context overflow on a large session.
+_UPSTREAM_CONNECT_PATTERNS = [
+    "upstream connect error",
+    "disconnect/reset before headers",
+    "remote connection failure",
+    "connection refused",
+    "connection timeout",
+]
+
 # SSL certificate verification failures — deterministic, NOT transient.
 #
 # A failed certificate chain (TLS-inspecting corporate proxy, missing
@@ -925,6 +937,12 @@ def classify_api_error(
     # alert text but the type isn't ssl.SSLError (happens with some SDKs
     # that re-raise without chaining).
     if any(p in error_msg for p in _SSL_TRANSIENT_PATTERNS):
+        return _result(FailoverReason.timeout, retryable=True)
+
+    # A status-less SSE APIError carrying an upstream gateway failure is not a
+    # credential problem and not context overflow. Classify it as transport so
+    # the normal retry/client-rebuild/fallback path can recover.
+    if not status_code and any(p in error_msg for p in _UPSTREAM_CONNECT_PATTERNS):
         return _result(FailoverReason.timeout, retryable=True)
 
     # ── 6. Server disconnect + large session → context overflow ─────

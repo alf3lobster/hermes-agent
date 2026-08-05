@@ -1520,6 +1520,44 @@ def test_codex_incomplete_opaque_state_updated_in_place(monkeypatch):
         )
 
 
+def test_codex_incomplete_exhaustion_activates_fallback_and_cleans_replay_state(monkeypatch):
+    """Three HTTP-200 incomplete responses must use a configured fallback."""
+    from agent.error_classifier import FailoverReason
+
+    agent = _build_agent(monkeypatch)
+    responses = [
+        _codex_incomplete_with_reasoning("Still working...", "rs_1"),
+        _codex_incomplete_with_reasoning("Still working...", "rs_2"),
+        _codex_incomplete_with_reasoning("Still working...", "rs_3"),
+        _codex_message_response("Recovered on fallback."),
+    ]
+    monkeypatch.setattr(agent, "_interruptible_api_call", lambda api_kwargs: responses.pop(0))
+
+    activated = []
+
+    def _activate(*, reason=None):
+        activated.append(reason)
+        return True
+
+    monkeypatch.setattr(agent, "_try_activate_fallback", _activate)
+
+    result = agent.run_conversation("recover after incomplete responses")
+
+    assert result["completed"] is True
+    assert result["final_response"] == "Recovered on fallback."
+    assert activated == [FailoverReason.rate_limit]
+    assert not any(
+        m.get("finish_reason") == "incomplete"
+        for m in result["messages"]
+        if isinstance(m, dict)
+    )
+    assert not any(
+        m.get("content") == "Please continue and provide the final answer."
+        for m in result["messages"]
+        if isinstance(m, dict)
+    )
+
+
 def test_normalize_codex_response_marks_commentary_only_message_as_incomplete(monkeypatch):
     agent = _build_agent(monkeypatch)
     from agent.codex_responses_adapter import _normalize_codex_response

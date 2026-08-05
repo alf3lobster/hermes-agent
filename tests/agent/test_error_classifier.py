@@ -274,6 +274,24 @@ class TestClassifyApiError:
         result = classify_api_error(e)
         assert result.reason == FailoverReason.overloaded
 
+    def test_statusless_upstream_connect_error_is_transport_not_context_overflow(self):
+        """A status-less Envoy SSE outage must not compress a huge session."""
+        e = MockAPIError(
+            "upstream connect error or disconnect/reset before headers. "
+            "reset reason: remote connection failure, connection refused"
+        )
+        result = classify_api_error(
+            e,
+            provider="openai-codex",
+            model="gpt-5-codex",
+            approx_tokens=500_000,
+            num_messages=1_000,
+            context_length=1_000_000,
+        )
+        assert result.reason == FailoverReason.timeout
+        assert result.retryable is True
+        assert result.should_compress is False
+
 
     def test_408_request_timeout_is_retryable_timeout(self):
         """HTTP 408 Request Timeout is a transient timing failure the server

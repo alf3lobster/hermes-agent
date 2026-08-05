@@ -4458,8 +4458,13 @@ def run_conversation(
                     # etc.) is throttling OpenRouter, so always fall back to a
                     # different model regardless of pool state.
                     _is_upstream = classified.reason == FailoverReason.upstream_rate_limit
+                    # Credential rotation can recover a per-key rate limit, but
+                    # not a provider-wide transport/backend outage. Once the
+                    # transport retry budget is exhausted, bypass the pool gate
+                    # and move to the configured fallback provider.
+                    _bypass_pool_gate = _is_upstream or _is_transport_failure
                     pool_may_recover = (
-                        False if _is_upstream
+                        False if _bypass_pool_gate
                         else _ra()._pool_may_recover_from_rate_limit(
                             agent._credential_pool,
                         )
@@ -5940,6 +5945,46 @@ def run_conversation(
                     continue
 
                 agent._codex_incomplete_retries = 0
+
+                # Codex usage exhaustion and some backend failures can arrive
+                # as three consecutive HTTP-200 `incomplete` responses, never
+                # entering the normal error-classifier fallback path. Remove
+                # Codex-only continuation state and retry with a configured
+                # fallback before returning the partial-error sentinel.
+                while messages:
+                    _tail = messages[-1]
+                    if (
+                        isinstance(_tail, dict)
+                        and _tail.get("role") == "assistant"
+                        and _tail.get("finish_reason") == "incomplete"
+                    ):
+                        messages.pop()
+                        continue
+                    if (
+                        isinstance(_tail, dict)
+                        and _tail.get("role") == "user"
+                        and _tail.get("content") == _CODEX_INCOMPLETE_NUDGE
+                    ):
+                        messages.pop()
+                        continue
+                    break
+
+                if agent._try_activate_fallback(reason=FailoverReason.rate_limit):
+                    logger.warning(
+                        "%scodex-incomplete failover after 3 continuations -> %s/%s",
+                        agent.log_prefix,
+                        getattr(agent, "provider", "?"),
+                        getattr(agent, "model", "?"),
+                    )
+                    active_system_prompt = _sync_failover_system_message(
+                        agent, api_messages, active_system_prompt
+                    )
+                    retry_count = 0
+                    compression_attempts = 0
+                    _retry.primary_recovery_attempted = False
+                    agent._session_messages = messages
+                    continue
+
                 agent._persist_session(messages, conversation_history)
                 return {
                     "final_response": "Codex response remained incomplete after 3 continuation attempts",
