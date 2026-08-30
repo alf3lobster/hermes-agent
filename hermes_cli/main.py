@@ -182,6 +182,7 @@ def _run_and_exit_oneshot(
     toolsets: object = None,
     skills: object = None,
     usage_file: object = None,
+    ignore_rules: bool = False,
 ) -> None:
     try:
         from hermes_cli.oneshot import run_oneshot
@@ -193,6 +194,7 @@ def _run_and_exit_oneshot(
             toolsets=toolsets,
             skills=skills,
             usage_file=usage_file,
+            ignore_rules=ignore_rules,
         )
     except KeyboardInterrupt:
         rc = 130
@@ -12677,6 +12679,10 @@ def _try_fast_chat_launch() -> bool:
             toolsets=getattr(args, "toolsets", None),
             skills=getattr(args, "skills", None),
             usage_file=getattr(args, "usage_file", None),
+            ignore_rules=bool(
+                getattr(args, "ignore_rules", False)
+                or getattr(args, "safe_mode", False)
+            ),
         )
 
     if (args.resume or args.continue_last) and args.command is None:
@@ -12735,6 +12741,10 @@ def _try_termux_fast_cli_launch() -> bool:
             toolsets=getattr(args, "toolsets", None),
             skills=getattr(args, "skills", None),
             usage_file=getattr(args, "usage_file", None),
+            ignore_rules=bool(
+                getattr(args, "ignore_rules", False)
+                or getattr(args, "safe_mode", False)
+            ),
         )
 
     if (args.resume or args.continue_last) and args.command is None:
@@ -14732,6 +14742,10 @@ def main():
             toolsets=getattr(args, "toolsets", None),
             skills=getattr(args, "skills", None),
             usage_file=getattr(args, "usage_file", None),
+            ignore_rules=bool(
+                getattr(args, "ignore_rules", False)
+                or getattr(args, "safe_mode", False)
+            ),
         )
 
     # Handle top-level --resume / --continue as shortcut to chat

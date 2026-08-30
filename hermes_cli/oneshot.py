@@ -206,6 +206,7 @@ def run_oneshot(
     toolsets: object = None,
     skills: object = None,
     usage_file: Optional[str] = None,
+    ignore_rules: bool = False,
 ) -> int:
     """Execute a single prompt and print only the final content block.
 
@@ -221,6 +222,8 @@ def run_oneshot(
             cost, token counts, model, api_calls) is written there after the
             run — even when the run fails — so pipelines can account for
             spend per invocation.
+        ignore_rules: Skip project context, identity and persistent memory for
+            an isolated one-shot invocation.
 
     Returns the exit code.  The caller owns process termination.
     """
@@ -283,6 +286,7 @@ def run_oneshot(
                     toolsets=explicit_toolsets,
                     use_config_toolsets=use_config_toolsets,
                     skills=skills,
+                    ignore_rules=ignore_rules,
                 )
             except BaseException as exc:  # noqa: BLE001
                 # Capture anything that escapes the agent (including OSError
@@ -361,6 +365,7 @@ def _run_agent(
     toolsets: object = None,
     use_config_toolsets: bool = True,
     skills: object = None,
+    ignore_rules: bool = False,
 ) -> tuple[str, dict]:
     """Build an AIAgent exactly like a normal CLI chat turn would, then
     run a single conversation.  Returns ``(final_response, run_result)``."""
@@ -487,6 +492,8 @@ def _run_agent(
             credential_pool=runtime.get("credential_pool"),
             fallback_model=_fb or None,
             ephemeral_system_prompt=skills_prompt,
+            skip_context_files=ignore_rules,
+            skip_memory=ignore_rules,
             # Interactive callbacks are intentionally NOT wired beyond this
             # one.  In oneshot mode there's no user sitting at a terminal:
             #   - clarify  → returns a synthetic "pick a default" instruction

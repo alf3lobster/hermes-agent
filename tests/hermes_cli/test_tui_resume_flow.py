@@ -102,6 +102,35 @@ def test_exit_after_oneshot_flushes_stdio_and_calls_os_exit(
     assert flushed == ["stdout", "stderr"]
 
 
+def test_run_and_exit_oneshot_forwards_ignore_rules(monkeypatch, main_mod):
+    captured = {}
+
+    def fake_run_oneshot(prompt, **kwargs):
+        captured["prompt"] = prompt
+        captured.update(kwargs)
+        return 0
+
+    monkeypatch.setitem(
+        sys.modules,
+        "hermes_cli.oneshot",
+        types.SimpleNamespace(run_oneshot=fake_run_oneshot),
+    )
+    monkeypatch.setattr(main_mod, "_cleanup_oneshot_runtime", lambda: None)
+    monkeypatch.setattr(main_mod, "_exit_after_oneshot", _raise_exit)
+
+    with pytest.raises(SystemExit) as exc:
+        main_mod._run_and_exit_oneshot(
+            "isolated",
+            model="m",
+            provider="p",
+            ignore_rules=True,
+        )
+
+    assert exc.value.code == 0
+    assert captured["prompt"] == "isolated"
+    assert captured["ignore_rules"] is True
+
+
 
 
 
@@ -208,11 +237,13 @@ def test_oneshot_wires_session_db_for_recall(monkeypatch):
         mod("hermes_cli.tools_config", _get_platform_tools=lambda *_args, **_kwargs: {"session_search"}),
     )
 
-    text, result = _run_agent("recall this")
+    text, result = _run_agent("recall this", ignore_rules=True)
     assert text == "ok"
     assert not result.get("failed")
     assert captured["session_db"] is sentinel_db
     assert captured["enabled_toolsets"] == ["session_search"]
+    assert captured["skip_context_files"] is True
+    assert captured["skip_memory"] is True
     assert captured["prompt"] == "recall this"
 
 
