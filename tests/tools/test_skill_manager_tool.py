@@ -2,6 +2,7 @@
 
 import json
 from contextlib import contextmanager
+from contextvars import copy_context
 from pathlib import Path
 from unittest.mock import patch
 
@@ -359,6 +360,79 @@ class TestSkillManageDispatcher:
         # entirely (telemetry best-effort) or present with created_by unset.
         rec = usage.get("test-skill") or {}
         assert rec.get("created_by") in {None, "", False}
+
+    def test_successful_mutations_emit_lifecycle_with_correlation(self, tmp_path):
+        with (
+            _skill_dir(tmp_path),
+            patch("tools.skill_provenance.is_background_review", return_value=False),
+            patch("tools.skill_usage.record_created") as record_created,
+            patch("tools.skill_usage.bump_patch") as bump_patch,
+        ):
+            created = json.loads(skill_manage(
+                action="create",
+                name="test-skill",
+                content=VALID_SKILL_CONTENT,
+                task_id="task-mutation",
+                session_id="session-mutation",
+            ))
+            patched = json.loads(skill_manage(
+                action="patch",
+                name="test-skill",
+                old_string="Step 1: Do the thing.",
+                new_string="Step 1: Do the thing safely.",
+                task_id="task-mutation",
+                session_id="session-mutation",
+            ))
+            edited = json.loads(skill_manage(
+                action="edit",
+                name="test-skill",
+                content=VALID_SKILL_CONTENT_2,
+                task_id="task-mutation",
+                session_id="session-mutation",
+            ))
+
+        assert created["success"] is True
+        assert patched["success"] is True
+        assert edited["success"] is True
+        record_created.assert_called_once_with(
+            "test-skill",
+            agent_created=False,
+            task_id="task-mutation",
+            session_id="session-mutation",
+        )
+        assert [call.kwargs for call in bump_patch.call_args_list] == [
+            {
+                "action": "patch",
+                "task_id": "task-mutation",
+                "session_id": "session-mutation",
+            },
+            {
+                "action": "edit",
+                "task_id": "task-mutation",
+                "session_id": "session-mutation",
+            },
+        ]
+        assert all(call.args == ("test-skill",) for call in bump_patch.call_args_list)
+
+    def test_failed_mutations_do_not_emit_lifecycle(self, tmp_path):
+        with (
+            _skill_dir(tmp_path),
+            patch("tools.skill_usage.record_created") as record_created,
+            patch("tools.skill_usage.bump_patch") as bump_patch,
+        ):
+            create_result = json.loads(skill_manage(
+                action="create",
+                name="test-skill",
+            ))
+            patch_result = json.loads(skill_manage(
+                action="patch",
+                name="test-skill",
+            ))
+
+        assert create_result["success"] is False
+        assert patch_result["success"] is False
+        record_created.assert_not_called()
+        bump_patch.assert_not_called()
 
 
     def test_background_review_delete_refuses_bundled_even_with_absorbed_into(self, tmp_path):
@@ -841,6 +915,61 @@ class TestCuratorConsolidationDeleteGuard:
         # Skill must remain active on disk — fail closed, no archive.
         assert (skills_root / "active-skill").exists()
 
+    def test_background_review_read_survives_copied_tool_contexts(
+        self, tmp_path, monkeypatch
+    ):
+        """A view in one tool worker authorizes a patch in the next worker."""
+        from tools.skills_tool import skill_view
+        from tools.skill_manager_tool import _reset_background_review_read_marks
+
+        _reset_background_review_read_marks()
+        with _curator_pass(tmp_path, monkeypatch=monkeypatch):
+            _create_curator_skill("reviewed", _skill_content("reviewed"))
+
+            viewed = copy_context().run(skill_view, "reviewed")
+            assert json.loads(viewed)["success"] is True
+
+            patched = copy_context().run(
+                skill_manage,
+                action="patch",
+                name="reviewed",
+                old_string="Step 1: Do the thing.",
+                new_string="Step 1: Do the thing safely.",
+            )
+            assert json.loads(patched)["success"] is True
+
+        _reset_background_review_read_marks()
+
+    def test_background_review_read_marks_stay_isolated_between_reviews(
+        self, tmp_path, monkeypatch
+    ):
+        """Copied tool contexts share only their own review's read marks."""
+        from tools.skills_tool import skill_view
+        from tools.skill_manager_tool import _reset_background_review_read_marks
+
+        _reset_background_review_read_marks()
+        with _curator_pass(tmp_path, monkeypatch=monkeypatch):
+            _create_curator_skill("reviewed", _skill_content("reviewed"))
+
+            first_review = copy_context()
+            _reset_background_review_read_marks()
+            second_review = copy_context()
+
+            viewed = first_review.run(skill_view, "reviewed")
+            assert json.loads(viewed)["success"] is True
+
+            blocked = second_review.run(
+                skill_manage,
+                action="patch",
+                name="reviewed",
+                old_string="Step 1: Do the thing.",
+                new_string="Step 1: Do the thing safely.",
+            )
+            result = json.loads(blocked)
+            assert result["success"] is False
+            assert result.get("_read_before_write_required") is True
+
+        _reset_background_review_read_marks()
 
     def test_background_review_support_file_overwrite_requires_that_file_read(self, tmp_path, monkeypatch):
         from tools.skills_tool import skill_view

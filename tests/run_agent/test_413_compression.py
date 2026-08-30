@@ -135,10 +135,12 @@ def test_current_user_turn_is_persisted_before_provider_call(agent):
     assert observed[0][0] == "persist"
     assert observed[1][0] == "provider"
     persisted_messages = observed[0][1]
-    assert persisted_messages[-1] == {
-        "role": "user",
-        "content": "new message that must survive a crash",
-    }
+    assert persisted_messages[-1]["role"] == "user"
+    assert (
+        persisted_messages[-1]["content"]
+        == "new message that must survive a crash"
+    )
+    assert isinstance(persisted_messages[-1]["timestamp"], float)
 
 
 class TestHTTP413Compression:
@@ -506,6 +508,25 @@ class TestPreflightCompression:
         assert [event for event, _ in events] == ["lifecycle", "warn", "compacted"]
         assert events[-1] == ("compacted", COMPACTION_DONE_STATUS)
 
+    def test_compress_context_does_not_emit_completion_after_an_abort(self, agent):
+        """An aborted summary must not claim that compaction completed."""
+        agent.compression_enabled = False
+        events = []
+        agent.status_callback = lambda event, message: events.append((event, message))
+        messages = [{"role": "user", "content": "hello"}]
+
+        def _abort_compression(current_messages, **_kwargs):
+            agent.context_compressor._last_compress_aborted = True
+            agent.context_compressor._last_summary_error = "auxiliary model unavailable"
+            return current_messages
+
+        with patch.object(agent.context_compressor, "compress", side_effect=_abort_compression):
+            compressed, prompt = agent._compress_context(messages, "system prompt", force=True)
+
+        assert compressed is messages
+        assert prompt == "You are helpful."
+        assert [event for event, _ in events] == ["lifecycle", "warn"]
+        assert ("compacted", COMPACTION_DONE_STATUS) not in events
 
     def test_compression_reuses_cached_prompt_when_memory_snapshot_is_unchanged(self, agent):
         """A memory reload without new injected text must keep the cache prefix."""
@@ -771,13 +792,16 @@ class TestPreflightCompression:
         assert not any("Preflight compression" in msg for msg in lifecycle_messages)
 
 
-    def test_preflight_compresses_when_rough_growth_after_fit_is_large(self, agent):
-        """Large rough growth after a fitting request still triggers preflight."""
+    def test_preflight_compresses_when_projected_real_usage_crosses(self, agent):
+        """Projected real usage (last real + rough growth) crossing the
+        threshold still triggers preflight: 95K real + 12K rough growth =
+        107K >= 100K. Growth alone no longer decides — real usage far below
+        the threshold defers instead (see TestPreflightDeferral)."""
         agent.compression_enabled = True
         agent.context_compressor.context_length = 200_000
         agent.context_compressor.threshold_tokens = 100_000
-        agent.context_compressor.last_prompt_tokens = 58_000
-        agent.context_compressor.last_real_prompt_tokens = 58_000
+        agent.context_compressor.last_prompt_tokens = 95_000
+        agent.context_compressor.last_real_prompt_tokens = 95_000
         agent.context_compressor.last_rough_tokens_when_real_prompt_fit = 113_000
 
         big_history = []
