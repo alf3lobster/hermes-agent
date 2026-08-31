@@ -61,15 +61,18 @@ jobs:
       - name: Run install + update E2E
         run: |
           set -euo pipefail
-          case '${{ inputs.route }}' in
+          case "$E2E_ROUTE" in
             update) update_method=hermes-update ;;
             installer) update_method=installer-script ;;
-            *) echo 'unsupported route: ${{ inputs.route }}' >&2; exit 2 ;;
+            *) echo "unsupported route: $E2E_ROUTE" >&2; exit 2 ;;
           esac
           tests/install/installer-script-e2e.sh \
             --update-method "$update_method" \
-            --install-ref '${{ inputs.install-ref }}'
+            --install-ref "$E2E_INSTALL_REF"
         env:
+          # Inputs are data, never interpolated into shell source.
+          E2E_ROUTE: ${{ inputs.route }}
+          E2E_INSTALL_REF: ${{ inputs.install-ref }}
           # Outside the workspace: the driver requires a clean tracked checkout.
           HERMES_E2E_LOG_DIR: ${{ runner.temp }}/e2e-logs
 
