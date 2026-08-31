@@ -7,18 +7,22 @@ forwards to the real host:
 * ``<root>/<host>/<path>`` exists -> serve it. This is how the sandbox answers
   the canonical install URL with the installer under test, so the payload can
   run the true ``curl -fsSL https://…/install.sh | bash`` one-liner.
-* otherwise -> forward upstream, verifying against the real CA bundle. The
+* a host with no fixture directory -> relay its CONNECT tunnel unchanged. The
   sandbox is isolated from the *host*, not from the internet: a real install
-  still has to reach PyPI and npm.
+  still has to reach PyPI and npm, and their concurrent TLS stays end-to-end.
+* a non-fixture path on a fixture host -> forward upstream after interception,
+  verifying against the real CA bundle.
 
-HTTPS is intercepted by minting a per-host certificate from the sandbox's own
-throwaway CA, which the payload trusts via CURL_CA_BUNDLE / SSL_CERT_FILE.
+Fixture-host HTTPS is intercepted by minting a per-host certificate from the
+sandbox's throwaway CA. Clients trust a combined sandbox+real CA bundle so raw
+tunnels continue to validate the upstream server's real certificate.
 
 Usage: proxy.py <fixture-root> <certs-dir> <real-ca-bundle>
 """
 
 import os
 import pathlib
+import select
 import socket
 import ssl
 import subprocess
@@ -60,6 +64,18 @@ def run_openssl(args):
         raise RuntimeError(
             f'openssl {args[0]} failed (exit {done.returncode}): {detail}'
         )
+
+
+def write_trust_bundle():
+    """Atomically publish the CA bundle trusted by intercepted and raw TLS."""
+    sandbox_ca = (CERTS / 'ca.pem').read_bytes()
+    real_ca = REAL_CA.read_bytes()
+    separator = b'' if sandbox_ca.endswith(b'\n') else b'\n'
+    destination = CERTS / 'trust-bundle.pem'
+    temporary = CERTS / f'.trust-bundle.pem.{os.getpid()}.{threading.get_ident()}'
+    temporary.write_bytes(sandbox_ca + separator + real_ca)
+    os.replace(temporary, destination)
+    return destination
 
 
 _CERT_LOCK = threading.Lock()
@@ -150,6 +166,34 @@ def relay(source, destination):
         destination.sendall(chunk)
 
 
+def has_fixtures_for_host(host):
+    """Whether this host needs TLS interception for local fixture lookup."""
+    if not host or '/' in host or '\\' in host or '..' in host:
+        return False
+    return (ROOT / host).is_dir()
+
+
+def tunnel_connect(conn, host, port):
+    """Relay a non-fixture CONNECT tunnel without terminating its TLS."""
+    with socket.create_connection((host, port), timeout=UPSTREAM_TIMEOUT_SECONDS) as upstream:
+        upstream.settimeout(None)
+        conn.sendall(b'HTTP/1.1 200 Connection Established\r\n\r\n')
+        peers = {conn: upstream, upstream: conn}
+        while peers:
+            readable, _, _ = select.select(list(peers), [], [])
+            for source in readable:
+                destination = peers[source]
+                chunk = source.recv(MAX_REQUEST_BYTES)
+                if not chunk:
+                    peers.pop(source, None)
+                    try:
+                        destination.shutdown(socket.SHUT_WR)
+                    except OSError:
+                        pass
+                    continue
+                destination.sendall(chunk)
+
+
 def forward_https(conn, host, port, request):
     context = ssl.create_default_context(cafile=str(REAL_CA))
     with socket.create_connection((host, port), timeout=UPSTREAM_TIMEOUT_SECONDS) as raw:
@@ -168,10 +212,8 @@ def forward_http(conn, host, port, request, target):
         relay(upstream, conn)
 
 
-def handle_connect(conn, target):
-    """Intercept a CONNECT tunnel, terminating TLS with a minted cert."""
-    host, _, port_text = target.rpartition(':')
-    port = int(port_text or '443')
+def intercept_connect(conn, host, port):
+    """Terminate fixture-host TLS so requests can resolve local fixtures."""
     conn.sendall(b'HTTP/1.1 200 Connection Established\r\n\r\n')
     cert, key = cert_for(host)
     context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
@@ -187,6 +229,16 @@ def handle_connect(conn, target):
             respond_fixture(tls, found)
         else:
             forward_https(tls, host, port, nested)
+
+
+def handle_connect(conn, target):
+    """Intercept fixture hosts; raw-tunnel every other CONNECT target."""
+    host, _, port_text = target.rpartition(':')
+    port = int(port_text or '443')
+    if not has_fixtures_for_host(host):
+        tunnel_connect(conn, host, port)
+        return
+    intercept_connect(conn, host, port)
 
 
 def host_from_headers(request):
@@ -224,6 +276,7 @@ def handle(conn):
 
 
 def main():
+    write_trust_bundle()
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server:
         server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         server.bind(LISTEN_ADDRESS)
