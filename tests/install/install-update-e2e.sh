@@ -98,10 +98,19 @@ collect_sandbox_logs() {
   # with "a: unbound variable".
   local tag="$1"
   local src="$SANDBOX_ROOT/root/logs"
+  local npm_src="$SANDBOX_ROOT/home/.npm/_logs"
   local dest="$LOG_DIR/sandbox-$tag"
   [ -d "$src" ] || return 0
   mkdir -p "$dest"
   cp -a "$src/." "$dest/" 2>/dev/null || true
+  # npm --silent can exit non-zero with an empty captured stderr while writing
+  # the causal network/registry error only to ~/.npm/_logs. Preserve those
+  # diagnostics beside the proxy/slirp logs instead of reducing CI to
+  # "npm install failed or timed out".
+  if [ -d "$npm_src" ]; then
+    mkdir -p "$dest/npm"
+    cp -a "$npm_src/." "$dest/npm/" 2>/dev/null || true
+  fi
   # Print it, not just archive it: a rejected TLS handshake here is the whole
   # explanation for a failure that otherwise reads as a bare `curl: (35)`, and
   # whoever is reading the job log should not have to download an artifact to
