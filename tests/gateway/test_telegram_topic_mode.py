@@ -327,6 +327,270 @@ async def test_managed_topic_binding_reuses_restored_session_over_static_lane_se
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("replacement_durable", [True, False])
+@pytest.mark.parametrize(
+    "guard_kind", ["metadata", "metadata_lineage", "reset_tombstone"]
+)
+@pytest.mark.parametrize("repair_write_fails", [False, True])
+@pytest.mark.parametrize("binding_present", [True, False])
+async def test_stale_topic_binding_cannot_reopen_hygiene_retired_predecessor(
+    tmp_path,
+    monkeypatch,
+    replacement_durable,
+    guard_kind,
+    repair_write_fails,
+    binding_present,
+):
+    import gateway.run as gateway_run
+
+    if not binding_present and guard_kind == "reset_tombstone":
+        pytest.skip("no stale binding exists for tombstone-only admission")
+
+    session_db = SessionDB(db_path=tmp_path / "state.db")
+    session_db.enable_telegram_topic_mode(chat_id="208214988", user_id="208214988")
+    source = _make_source(thread_id="17585")
+    session_key = build_session_key(source)
+    session_db.create_session(
+        session_id="oversized-parent",
+        source="telegram",
+        user_id="208214988",
+    )
+    stale_session_id = "oversized-parent"
+    if guard_kind == "metadata_lineage":
+        stale_session_id = "later-oversized-parent"
+        session_db.create_session(
+            session_id=stale_session_id,
+            source="telegram",
+            user_id="208214988",
+        )
+    if replacement_durable:
+        session_db.create_session(
+            session_id="clean-replacement",
+            source="telegram",
+            user_id="208214988",
+        )
+    if binding_present:
+        session_db.bind_telegram_topic(
+            chat_id="208214988",
+            thread_id="17585",
+            user_id="208214988",
+            session_key=session_key,
+            session_id=stale_session_id,
+        )
+    if guard_kind == "reset_tombstone":
+        assert session_db.promote_to_session_reset(
+            "oversized-parent", "session_reset"
+        )
+    if repair_write_fails:
+        real_bind = session_db.bind_telegram_topic
+
+        def fail_replacement_binding(**kwargs):
+            if kwargs.get("session_id") == "clean-replacement":
+                raise RuntimeError("replacement binding failed")
+            return real_bind(**kwargs)
+
+        monkeypatch.setattr(session_db, "bind_telegram_topic", fail_replacement_binding)
+    runner = _make_runner(session_db=session_db)
+    fresh = SessionEntry(
+        session_key=session_key,
+        session_id="clean-replacement",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+        origin=source,
+        metadata=(
+            {
+                "hygiene_retired_predecessor_id": "oversized-parent",
+                "hygiene_retired_predecessor_ids": [
+                    "oversized-parent",
+                    "later-oversized-parent",
+                ],
+            }
+            if guard_kind == "metadata_lineage"
+            else (
+                {"hygiene_retired_predecessor_id": "oversized-parent"}
+                if guard_kind == "metadata"
+                else {}
+            )
+        ),
+    )
+    runner.session_store.get_or_create_session.side_effect = None
+    runner.session_store.get_or_create_session.return_value = fresh
+    captured = {}
+
+    async def fake_run_agent(*args, **kwargs):
+        captured["session_id"] = kwargs.get("session_id")
+        return {
+            "success": True,
+            "final_response": "clean response",
+            "session_id": kwargs.get("session_id"),
+            "messages": [],
+        }
+
+    runner._run_agent = AsyncMock(side_effect=fake_run_agent)
+    monkeypatch.setattr(
+        gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "***"}
+    )
+
+    result = await runner._handle_message(_make_event("continue", thread_id="17585"))
+
+    if replacement_durable and not repair_write_fails:
+        assert result == "clean response"
+        assert captured["session_id"] == "clean-replacement"
+    else:
+        assert "message was not processed" in result
+        assert "session_id" not in captured
+    runner.session_store.switch_session.assert_not_called()
+    session_db.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("binding_present", [True, False])
+async def test_current_topic_route_on_reset_tombstone_never_reaches_model(
+    tmp_path, monkeypatch, binding_present
+):
+    import gateway.run as gateway_run
+
+    session_db = SessionDB(db_path=tmp_path / "state.db")
+    session_db.enable_telegram_topic_mode(
+        chat_id="208214988", user_id="208214988"
+    )
+    source = _make_source(thread_id="17585")
+    session_key = build_session_key(source)
+    session_db.create_session(
+        session_id="reset-parent", source="telegram", user_id="208214988"
+    )
+    if binding_present:
+        session_db.bind_telegram_topic(
+            chat_id="208214988",
+            thread_id="17585",
+            user_id="208214988",
+            session_key=session_key,
+            session_id="reset-parent",
+        )
+    assert session_db.promote_to_session_reset("reset-parent", "session_reset")
+
+    runner = _make_runner(session_db=session_db)
+    current = SessionEntry(
+        session_key=session_key,
+        session_id="reset-parent",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+        origin=source,
+    )
+    runner.session_store.get_or_create_session.side_effect = None
+    runner.session_store.get_or_create_session.return_value = current
+    runner._run_agent = AsyncMock()
+    monkeypatch.setattr(
+        gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "***"}
+    )
+
+    result = await runner._handle_message(
+        _make_event("continue", thread_id="17585")
+    )
+
+    assert "message was not processed" in result
+    runner._run_agent.assert_not_awaited()
+    runner.session_store.switch_session.assert_not_called()
+    session_db.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "failure",
+    [
+        "current_read",
+        "binding_read",
+        "bound_read",
+        "bound_missing",
+        "compression_tip_read",
+        "compression_tip_missing",
+        "switch",
+    ],
+)
+async def test_topic_route_verification_failures_never_reach_model(
+    tmp_path, monkeypatch, failure
+):
+    import gateway.run as gateway_run
+
+    session_db = SessionDB(db_path=tmp_path / "state.db")
+    session_db.enable_telegram_topic_mode(
+        chat_id="208214988", user_id="208214988"
+    )
+    source = _make_source(thread_id="17585")
+    session_key = build_session_key(source)
+    for session_id in ("current-safe", "bound-safe"):
+        session_db.create_session(
+            session_id=session_id, source="telegram", user_id="208214988"
+        )
+    session_db.bind_telegram_topic(
+        chat_id="208214988",
+        thread_id="17585",
+        user_id="208214988",
+        session_key=session_key,
+        session_id="bound-safe",
+    )
+    runner = _make_runner(session_db=session_db)
+    current = SessionEntry(
+        session_key=session_key,
+        session_id="current-safe",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+        origin=source,
+    )
+    runner.session_store.get_or_create_session.side_effect = None
+    runner.session_store.get_or_create_session.return_value = current
+    runner._run_agent = AsyncMock()
+    monkeypatch.setattr(
+        gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "***"}
+    )
+
+    if failure == "current_read":
+        runner._session_db.get_session = AsyncMock(
+            side_effect=RuntimeError("current read failed")
+        )
+    elif failure == "binding_read":
+        runner._session_db.get_telegram_topic_binding = AsyncMock(
+            side_effect=RuntimeError("binding read failed")
+        )
+    elif failure in {"bound_read", "bound_missing"}:
+        real_get_session = runner._session_db.get_session
+
+        async def fail_bound_read(session_id):
+            if session_id == "bound-safe":
+                if failure == "bound_missing":
+                    return None
+                raise RuntimeError("bound read failed")
+            return await real_get_session(session_id)
+
+        runner._session_db.get_session = fail_bound_read
+    elif failure == "compression_tip_read":
+        runner._session_db.get_compression_tip = AsyncMock(
+            side_effect=RuntimeError("compression tip read failed")
+        )
+    elif failure == "compression_tip_missing":
+        runner._session_db.get_compression_tip = AsyncMock(
+            return_value="missing-compression-tip"
+        )
+    else:
+        runner.session_store.switch_session.side_effect = None
+        runner.session_store.switch_session.return_value = None
+
+    result = await runner._handle_message(
+        _make_event("continue", thread_id="17585")
+    )
+
+    assert "message was not processed" in result
+    runner._run_agent.assert_not_awaited()
+    session_db.close()
+
+
+@pytest.mark.asyncio
 async def test_telegram_group_prompt_is_not_topic_lobby_even_when_dm_topic_mode_enabled(
     tmp_path, monkeypatch
 ):

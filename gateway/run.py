@@ -154,88 +154,6 @@ _TELEGRAM_NOISY_STATUS_RE = re.compile(
 )
 
 
-_HYGIENE_COOLDOWN_LADDER_MULTIPLIERS = (1, 3, 9)
-# Absolute ceiling on an escalated hygiene cooldown, mirroring
-# _RECONNECT_BACKOFF_CAP above: with an operator-raised base the multiplier
-# ladder alone would reach 9h (base 3600 -> 32400s), which is indistinguishable
-# from "compaction silently switched off". 1h is well past the point where a
-# retry is cheap and still recovers within a session.
-_HYGIENE_COOLDOWN_MAX_SECONDS = 3600.0
-
-
-def _hygiene_cooldown_for_failure(
-    gateway,
-    session_key: str,
-    base_cooldown_seconds: float,
-) -> float:
-    """Bump the hygiene failure streak and return the escalated cooldown.
-
-    This is a MULTIPLIER ladder (x1, x3, x9) over the operator's configured
-    ``hygiene_failure_cooldown_seconds``, clamped to
-    ``_HYGIENE_COOLDOWN_MAX_SECONDS``, so a tuned base is preserved as rung 1.
-
-    It exists because the in-agent equivalent is unreachable from here:
-    ``ContextCompressor.record_timeout_failure`` escalates on an absolute
-    60 -> 300 -> 900s ladder driven by the in-memory
-    ``_consecutive_timeout_failures`` counter, which ``bind_session_state``
-    zeroes.  Session hygiene constructs a FRESH ``AIAgent`` per run and re-binds
-    state every time, so from the gateway that streak is structurally always 0
-    and only the flat ``hygiene_failure_cooldown_seconds`` could ever be
-    recorded — a session whose summary model always times out retried on that
-    same fixed interval forever (#79624).  The streak is mirrored to SQLite by
-    rotation-stable ``session_key`` so it outlives both the per-run agent and
-    gateway restarts; ``PersistentState`` keeps the hot in-process view.
-    """
-    streak = 1
-    state = None
-    try:
-        state = gateway._session_state(session_key).persistent
-    except Exception as exc:
-        logger.debug("hygiene failure streak update failed: %s", exc)
-    session_db = getattr(gateway, "_session_db", None)
-    session_db = getattr(session_db, "_db", session_db)
-    increment = getattr(session_db, "increment_hygiene_failure_streak", None)
-    if callable(increment):
-        try:
-            streak = max(1, int(increment(session_key)))
-            if state is not None:
-                state.hygiene_failure_streak = streak
-        except Exception as exc:
-            logger.debug("hygiene failure streak persist failed: %s", exc)
-            if state is not None:
-                state.hygiene_failure_streak += 1
-                streak = state.hygiene_failure_streak
-    elif state is not None:
-        state.hygiene_failure_streak += 1
-        streak = state.hygiene_failure_streak
-    multiplier = _HYGIENE_COOLDOWN_LADDER_MULTIPLIERS[
-        min(streak, len(_HYGIENE_COOLDOWN_LADDER_MULTIPLIERS)) - 1
-    ]
-    return min(base_cooldown_seconds * multiplier, _HYGIENE_COOLDOWN_MAX_SECONDS)
-
-
-def _reset_hygiene_failure_streak(gateway, session_key: str) -> None:
-    """Clear the hygiene failure streak after a compression that reduced context.
-
-    Peeks rather than get-or-creates: writing a 0 that is already 0 must not
-    materialise a ``_sessions`` entry (those are never evicted).
-    """
-    try:
-        state = gateway._peek_session_state(session_key)
-        if state is not None:
-            state.persistent.hygiene_failure_streak = 0
-    except Exception as exc:
-        logger.debug("hygiene failure streak reset failed: %s", exc)
-    session_db = getattr(gateway, "_session_db", None)
-    session_db = getattr(session_db, "_db", session_db)
-    reset = getattr(session_db, "reset_hygiene_failure_streak", None)
-    if callable(reset):
-        try:
-            reset(session_key)
-        except Exception as exc:
-            logger.debug("hygiene failure streak persistent reset failed: %s", exc)
-
-
 def hygiene_compaction_recovered(
     *,
     aborted: bool,
@@ -278,39 +196,6 @@ def hygiene_compaction_recovered(
     return compression_made_progress(
         msg_count, new_count, approx_tokens, new_tokens
     )
-
-
-def _record_hygiene_cooldown(
-    gateway,
-    session_id: str,
-    cooldown_seconds: float,
-    error: Optional[str] = None,
-) -> None:
-    """Persist a session-hygiene compression-failure cooldown to the state DB.
-
-    Uses the same ``compression_failure_cooldown_until`` column and
-    ``record_compression_failure_cooldown`` method that the in-conversation
-    compression path (``agent/context_compressor.py``) already uses, so the
-    cooldown survives gateway restarts (#74136).
-
-    ``error`` is forwarded because the recorder writes
-    ``compression_failure_error`` UNCONDITIONALLY — omitting it clobbers to NULL
-    any reason the in-conversation path recorded, and readers surface that
-    reason to the user (falling back to "unknown error"). That matters more now
-    that an escalated cooldown can last up to an hour.
-    """
-    import time as _time
-    session_db = getattr(gateway, "_session_db", None)
-    if session_db is None:
-        return
-    session_db = getattr(session_db, "_db", session_db)
-    recorder = getattr(session_db, "record_compression_failure_cooldown", None)
-    if recorder is None:
-        return
-    try:
-        recorder(session_id, _time.time() + cooldown_seconds, error)
-    except Exception as exc:
-        logger.debug("session hygiene cooldown persist failed: %s", exc)
 
 
 def _status_template_to_regex(template: str) -> str:
@@ -2645,6 +2530,7 @@ from gateway.config import (
 from gateway.session import (
     AsyncSessionStore,
     SessionEntry,
+    SessionResetPersistenceError,
     SessionStore,
     SessionSource,
     SessionContext,
@@ -7960,6 +7846,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         session_entry,
         *,
         reason: str,
+        strict: bool = False,
     ) -> None:
         """Update the topic binding to point at ``session_entry.session_id``.
 
@@ -7979,6 +7866,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             logger.debug(
                 "telegram topic binding refresh failed (%s)", reason, exc_info=True,
             )
+            if strict:
+                raise
 
     def _recover_telegram_topic_thread_id(
         self,
@@ -19117,6 +19006,75 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             self._async_session_store = facade
         return facade
 
+    async def _retire_session_after_hygiene_failure(
+        self,
+        *,
+        source: SessionSource,
+        session_key: str,
+        session_entry: SessionEntry,
+        quick_key: str,
+        run_generation: int,
+    ) -> SessionEntry:
+        """Replace one uncompressible session without replaying its history."""
+        old_session_id = session_entry.session_id
+        persistence_error = None
+        try:
+            new_entry = await self.async_session_store.reset_session(
+                session_key, strict_persistence=True
+            )
+        except SessionResetPersistenceError as exc:
+            # reset_session has already persisted the fresh key→session route.
+            # Keep any platform binding off the predecessor before surfacing the
+            # DB lifecycle failure; the current message still must not run.
+            new_entry = exc.replacement_entry
+            persistence_error = exc
+        if new_entry is None or new_entry.session_id == old_session_id:
+            raise RuntimeError("session reset did not create a fresh session")
+
+        self._evict_cached_agent(session_key)
+        self._clear_conversation_scope(
+            session_key, reason="hygiene_compression_failure"
+        )
+        # Move the durable platform route first. If persistence or the
+        # process-local turn lease fails, this turn stops, but the next inbound
+        # message still cannot route back to the retired predecessor.
+        await asyncio.to_thread(
+            self._sync_telegram_topic_binding,
+            source,
+            new_entry,
+            reason="hygiene-compression-failure",
+            strict=True,
+        )
+        if persistence_error is not None:
+            raise persistence_error
+        if not self._rebind_turn_lease(
+            quick_key, run_generation, new_entry.session_id
+        ):
+            raise RuntimeError("active turn lease could not follow fresh session")
+        logger.warning(
+            "Retired uncompressible gateway session %s; current turn will use %s",
+            old_session_id,
+            new_entry.session_id,
+        )
+        return new_entry
+
+    async def _finish_hygiene_retirement_despite_cancellation(
+        self, **retirement_kwargs
+    ) -> SessionEntry:
+        """Finish the retirement boundary despite repeated task cancellation."""
+        retirement_task = asyncio.create_task(
+            self._retire_session_after_hygiene_failure(**retirement_kwargs)
+        )
+        while True:
+            try:
+                return await asyncio.shield(retirement_task)
+            except asyncio.CancelledError:
+                if retirement_task.done():
+                    return retirement_task.result()
+                # Preserve cancellation semantics at the caller, but do not let
+                # repeated shutdown cancellation interrupt the durable boundary.
+                continue
+
     async def _mark_durable_active_turn(
         self,
         event: "MessageEvent",
@@ -19429,16 +19387,145 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             session_entry = resolved_entry
         self._cache_session_source(session_key, source)
         if await asyncio.to_thread(self._is_telegram_topic_lane, source):
+            session_metadata = getattr(session_entry, "metadata", None) or {}
+            raw_blocked_predecessor_ids = session_metadata.get(
+                "hygiene_retired_predecessor_ids", []
+            )
+            blocked_predecessor_ids = {
+                str(session_id)
+                for session_id in (
+                    raw_blocked_predecessor_ids
+                    if isinstance(raw_blocked_predecessor_ids, list)
+                    else []
+                )
+                if session_id
+            }
+            blocked_predecessor_id = str(
+                session_metadata.get("hygiene_retired_predecessor_id", "")
+            )
+            if blocked_predecessor_id:
+                blocked_predecessor_ids.add(blocked_predecessor_id)
+            try:
+                current_route_row = (
+                    await self._session_db.get_session(session_entry.session_id)
+                    if self._session_db
+                    else None
+                )
+            except Exception:
+                logger.warning(
+                    "Could not verify current Telegram session route",
+                    exc_info=True,
+                )
+                return (
+                    "⚠️ I could not verify this conversation route safely. "
+                    "Your message was not processed. Please try again."
+                )
+            if blocked_predecessor_ids and current_route_row is None:
+                return (
+                    "⚠️ This conversation was retired, but its clean replacement "
+                    "could not be verified durably. Your message was not processed. "
+                    "Please use /reset and resend it."
+                )
+            if (
+                isinstance(current_route_row, dict)
+                and current_route_row.get("ended_at")
+                and current_route_row.get("end_reason") == "session_reset"
+            ):
+                logger.warning(
+                    "Refusing current Telegram route to reset tombstone %s",
+                    session_entry.session_id,
+                )
+                return (
+                    "⚠️ This conversation route points to a retired session. "
+                    "Your message was not processed. Please use /reset and resend it."
+                )
             try:
                 binding = (await self._session_db.get_telegram_topic_binding(
                     chat_id=str(source.chat_id),
                     thread_id=str(source.thread_id),
                 )) if self._session_db else None
             except Exception:
-                logger.debug("Failed to read Telegram topic binding", exc_info=True)
-                binding = None
+                logger.warning(
+                    "Failed to read Telegram topic binding safely",
+                    exc_info=True,
+                )
+                return (
+                    "⚠️ I could not verify this Telegram topic route safely. "
+                    "Your message was not processed. Please try again."
+                )
             if binding:
                 bound_session_id = str(binding.get("session_id") or "")
+                bound_is_reset_tombstone = False
+                if bound_session_id and self._session_db is not None:
+                    try:
+                        bound_row = await self._session_db.get_session(
+                            bound_session_id
+                        )
+                    except Exception:
+                        logger.warning(
+                            "Could not verify bound Telegram session row %s",
+                            bound_session_id,
+                            exc_info=True,
+                        )
+                        return (
+                            "⚠️ I could not verify the bound Telegram session "
+                            "safely. Your message was not processed. Please try again."
+                        )
+                    if not (
+                        isinstance(bound_row, dict)
+                        and str(bound_row.get("id") or "") == bound_session_id
+                    ):
+                        logger.warning(
+                            "Refusing unverifiable Telegram bound session %s",
+                            bound_session_id,
+                        )
+                        return (
+                            "⚠️ I could not verify the bound Telegram session "
+                            "safely. Your message was not processed. Please try again."
+                        )
+                    bound_is_reset_tombstone = bool(
+                        bound_row.get("ended_at")
+                        and bound_row.get("end_reason") == "session_reset"
+                    )
+                if bound_session_id and (
+                    bound_session_id in blocked_predecessor_ids
+                    or bound_is_reset_tombstone
+                ):
+                    logger.warning(
+                        "Ignoring stale Telegram topic binding to retired session %s",
+                        bound_session_id,
+                    )
+                    bound_session_id = ""
+                    try:
+                        replacement_row = await self._session_db.get_session(
+                            session_entry.session_id
+                        )
+                    except Exception:
+                        replacement_row = None
+                    if replacement_row is None:
+                        return (
+                            "⚠️ This conversation was retired, but its clean "
+                            "replacement is not durable yet. Your message was not "
+                            "processed. Please use /reset and resend it."
+                        )
+                    try:
+                        await asyncio.to_thread(
+                            self._sync_telegram_topic_binding,
+                            source,
+                            session_entry,
+                            reason="hygiene-retired-predecessor-guard",
+                            strict=True,
+                        )
+                    except Exception:
+                        logger.warning(
+                            "Could not durably move stale hygiene predecessor binding",
+                            exc_info=True,
+                        )
+                        return (
+                            "⚠️ This conversation was retired, but its Telegram "
+                            "route could not be repaired safely. Your message was not "
+                            "processed. Please use /reset and resend it."
+                        )
                 # Heal bindings that point at a pre-compression parent: walk
                 # the compression-continuation chain forward to its tip so the
                 # next message resumes the compressed child instead of
@@ -19451,15 +19538,43 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             bound_session_id,
                         )
                     except Exception:
-                        logger.debug(
-                            "compression-tip lookup failed for %s",
-                            bound_session_id, exc_info=True,
+                        logger.warning(
+                            "Could not resolve Telegram compression tip for %s",
+                            bound_session_id,
+                            exc_info=True,
                         )
-                        canonical_session_id = bound_session_id
+                        return (
+                            "⚠️ I could not verify the bound Telegram session "
+                            "safely. Your message was not processed. Please try again."
+                        )
                     if (
                         canonical_session_id
                         and canonical_session_id != bound_session_id
                     ):
+                        try:
+                            canonical_row = await self._session_db.get_session(
+                                canonical_session_id
+                            )
+                        except Exception:
+                            canonical_row = None
+                        if not (
+                            isinstance(canonical_row, dict)
+                            and str(canonical_row.get("id") or "")
+                            == canonical_session_id
+                            and not (
+                                canonical_row.get("ended_at")
+                                and canonical_row.get("end_reason") == "session_reset"
+                            )
+                            and canonical_session_id not in blocked_predecessor_ids
+                        ):
+                            logger.warning(
+                                "Refusing unverifiable Telegram compression tip %s",
+                                canonical_session_id,
+                            )
+                            return (
+                                "⚠️ I could not verify the bound Telegram session "
+                                "safely. Your message was not processed. Please try again."
+                            )
                         bound_session_id = canonical_session_id
                 if bound_session_id and bound_session_id != session_entry.session_id:
                     # Route the override through SessionStore so the session_key
@@ -19467,9 +19582,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     # lane session is ended cleanly. Mutating session_entry in
                     # place here created a split-brain state where the JSON
                     # index pointed at one id but code downstream used another.
-                    switched = await self.async_session_store.switch_session(session_key, bound_session_id)
-                    if switched is not None:
-                        session_entry = switched
+                    switched = await self.async_session_store.switch_session(
+                        session_key, bound_session_id
+                    )
+                    if switched is None:
+                        return (
+                            "⚠️ I could not switch to the bound Telegram session "
+                            "safely. Your message was not processed. Please try again."
+                        )
+                    session_entry = switched
                 # If the stored binding pointed at a parent, rewrite it to the
                 # canonical descendant now that we've followed the chain.
                 if (
@@ -19481,10 +19602,36 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         source, session_entry, reason="compression-tip-walk",
                     )
             else:
-                try:
-                    await asyncio.to_thread(self._record_telegram_topic_binding, source, session_entry)
-                except Exception:
-                    logger.debug("Failed to record Telegram topic binding", exc_info=True)
+                if blocked_predecessor_ids:
+                    try:
+                        await asyncio.to_thread(
+                            self._sync_telegram_topic_binding,
+                            source,
+                            session_entry,
+                            reason="hygiene-replacement-no-binding",
+                            strict=True,
+                        )
+                    except Exception:
+                        logger.warning(
+                            "Could not durably bind verified hygiene replacement",
+                            exc_info=True,
+                        )
+                        return (
+                            "⚠️ This conversation was retired, but its Telegram "
+                            "route could not be established safely. Your message was "
+                            "not processed. Please use /reset and resend it."
+                        )
+                else:
+                    try:
+                        await asyncio.to_thread(
+                            self._record_telegram_topic_binding,
+                            source,
+                            session_entry,
+                        )
+                    except Exception:
+                        logger.debug(
+                            "Failed to record Telegram topic binding", exc_info=True
+                        )
         # Capture and immediately consume was_auto_reset so it does not
         # re-fire on subsequent messages — preventing the cleanup from
         # wiping model/reasoning overrides set between turns (Closes #48031).
@@ -19762,7 +19909,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         #    by 30-50% on code/JSON-heavy sessions, but that just
         #    means hygiene fires a bit early — safe and harmless.
         # -----------------------------------------------------------------
-        if history and len(history) >= 4:
+        if history:
             from agent.model_metadata import (
                 estimate_messages_tokens_rough,
                 get_model_context_length_async,
@@ -19782,7 +19929,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _hyg_hard_msg_limit = 5000
             _hyg_timeout_seconds = 30.0
             _hyg_total_ceiling_seconds = 600.0
-            _hyg_failure_cooldown_seconds = 300.0
             _hyg_config_context_length = None
             _hyg_provider = None
             _hyg_base_url = None
@@ -19849,14 +19995,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         _hyg_total_ceiling_seconds = max(
                             _hyg_total_ceiling_seconds, _hyg_timeout_seconds,
                         )
-                        _raw_cooldown = _comp_cfg.get("hygiene_failure_cooldown_seconds")
-                        if _raw_cooldown is not None:
-                            try:
-                                _parsed = float(_raw_cooldown)
-                                if _parsed >= 0:
-                                    _hyg_failure_cooldown_seconds = _parsed
-                            except (TypeError, ValueError):
-                                pass
 
                 _hyg_configured_model = _hyg_model
                 _hyg_configured_provider = _hyg_provider
@@ -19968,30 +20106,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
 
                 if _needs_compress:
-                    # Use the persistent DB-backed cooldown (same as the
-                    # in-conversation compression path in context_compressor.py)
-                    # so the cooldown survives gateway restarts. The in-memory
-                    # dict was reset on every restart, re-triggering the same
-                    # failing compression and wedging session storage (#74136).
-                    _session_db = getattr(self, "_session_db", None)
-                    if _session_db is not None:
-                        _session_db = getattr(_session_db, "_db", _session_db)
-                        _getter = getattr(_session_db, "get_compression_failure_cooldown", None)
-                        if _getter is not None:
-                            try:
-                                _cooldown_state = _getter(session_entry.session_id)
-                            except Exception:
-                                _cooldown_state = None
-                            if _cooldown_state and _cooldown_state.get("remaining_seconds", 0) > 0:
-                                logger.info(
-                                    "Session hygiene: skipping compression for %s; "
-                                    "previous failure cooldown active for %.1fs",
-                                    session_entry.session_id,
-                                    _cooldown_state["remaining_seconds"],
-                                )
-                                _needs_compress = False
-
-                if _needs_compress:
                     logger.info(
                         "Session hygiene: %s messages, ~%s tokens (%s) — auto-compressing "
                         "(threshold: %s%% of %s = %s tokens)",
@@ -20012,7 +20126,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             session_key=session_key,
                             user_config=_hyg_data if isinstance(_hyg_data, dict) else None,
                         )
-                        if _hyg_runtime.get("api_key"):
+                        # Runtime authentication may be supplied by OAuth or
+                        # another provider mechanism; api_key presence is not an
+                        # admission test for the compression attempt.
+                        if not isinstance(_hyg_runtime, dict):
+                            raise RuntimeError(
+                                "session hygiene compression runtime was unavailable"
+                            )
+                        if isinstance(_hyg_runtime, dict):
                             # Pass the FULL transcript (tool results included).
                             # Filtering to user/assistant-only starved the
                             # compressor: tool results are usually the bulk of
@@ -20027,6 +20148,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 if m.get("role") in {"user", "assistant", "tool"}
                             ]
 
+                            if len(_hyg_msgs) < 4:
+                                raise RuntimeError(
+                                    "session hygiene compression had too few messages "
+                                    "for an admitted attempt"
+                                )
                             if len(_hyg_msgs) >= 4:
                                 try:
                                     _hyg_session_row = await self._session_db.get_session(
@@ -20205,20 +20331,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                                 context="session hygiene timeout",
                                             )
                                             _hyg_cleanup_deferred = True
-                                            if _hyg_failure_cooldown_seconds >= 0:
-                                                _hyg_cooldown = await asyncio.to_thread(
-                                                    _hygiene_cooldown_for_failure,
-                                                    self,
-                                                    session_key,
-                                                    _hyg_failure_cooldown_seconds,
-                                                )
-                                                _record_hygiene_cooldown(
-                                                    self, session_entry.session_id,
-                                                    _hyg_cooldown,
-                                                    "session hygiene compression "
-                                                    "timed out with no output from "
-                                                    "the summary model",
-                                                )
                                             from agent.session_activity import (
                                                 ActivityProvenance,
                                             )
@@ -20233,35 +20345,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                                 "Session hygiene compression for session %s "
                                                 "made no progress for %.1fs "
                                                 "(total wait %.1fs, ceiling %.1fs); "
-                                                "continuing without compression",
+                                                "retiring the oversized session",
                                                 session_entry.session_id,
                                                 _hyg_commit_fence.seconds_since_progress(),
                                                 time.monotonic() - _hyg_wait_started,
                                                 _hyg_total_ceiling_seconds,
                                             )
-                                            _timeout_msg = (
-                                                "⚠️ Context compression timed out "
-                                                f"after {_hyg_timeout_seconds:.1f}s "
-                                                "with no output from the summary model. "
-                                                "No messages were dropped — continuing without "
-                                                "compression. Run /compress to retry, /reset for "
-                                                "a clean session, or check your "
-                                                "auxiliary.compression model configuration."
-                                            )
-                                            try:
-                                                _adapter = self._adapter_for_source(source)
-                                                if _adapter and source.chat_id:
-                                                    await _adapter.send(
-                                                        source.chat_id,
-                                                        _timeout_msg,
-                                                        metadata=_hyg_meta,
-                                                    )
-                                            except Exception as _werr:
-                                                logger.warning(
-                                                    "Failed to deliver compression-timeout "
-                                                    "warning to user: %s",
-                                                    _werr,
-                                                )
                                             raise
                                     except BaseException:
                                         # #76354 F2: non-timeout unwind while the
@@ -20353,14 +20442,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                             _hyg_rotated = False
                                             _hyg_in_place = False
                                         else:
+                                            # The held turn lease must follow the
+                                            # rotation before the live route moves;
+                                            # otherwise an alias can race this turn.
+                                            if not self._rebind_turn_lease(
+                                                _quick_key,
+                                                run_generation,
+                                                _hyg_new_sid,
+                                            ):
+                                                raise RuntimeError(
+                                                    "active turn lease could not follow "
+                                                    "compressed session"
+                                                )
                                             session_entry.session_id = _hyg_new_sid
-                                            # The held turn lease follows the
-                                            # rotation so an alias key resolving
-                                            # the fresh child still serializes
-                                            # against this turn (#64934).
-                                            self._rebind_turn_lease(
-                                                _quick_key, run_generation, _hyg_new_sid
-                                            )
                                             await self.async_session_store._save()
                                             await asyncio.to_thread(
                                                 self._sync_telegram_topic_binding,
@@ -20428,44 +20522,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                     _hyg_aborted = _comp is not None and getattr(
                                         _comp, "_last_compress_aborted", False
                                     )
-                                    if not _hyg_aborted:
-                                        # Recovery decision lives in the
-                                        # extracted, unit-tested predicate — the
-                                        # degenerate "did not rotate or compact
-                                        # in place" path (#21301) sets both flags
-                                        # False and reuses the pre-compression
-                                        # counts, so a numbers-only check would
-                                        # read a no-op as success and clear the
-                                        # streak on every wedged run (#79624).
-                                        if hygiene_compaction_recovered(
-                                            aborted=_hyg_aborted,
-                                            rotated=_hyg_rotated,
-                                            in_place=_hyg_in_place,
-                                            msg_count=_msg_count,
-                                            new_count=_new_count,
-                                            approx_tokens=_approx_tokens,
-                                            new_tokens=_new_tokens,
-                                        ):
-                                            await asyncio.to_thread(
-                                                _reset_hygiene_failure_streak,
-                                                self,
-                                                session_key,
-                                            )
                                     if _hyg_aborted:
-                                        if _hyg_failure_cooldown_seconds >= 0:
-                                            _hyg_cooldown = await asyncio.to_thread(
-                                                _hygiene_cooldown_for_failure,
-                                                self,
-                                                session_key,
-                                                _hyg_failure_cooldown_seconds,
-                                            )
-                                            _record_hygiene_cooldown(
-                                                self, session_entry.session_id,
-                                                _hyg_cooldown,
-                                                getattr(
-                                                    _comp, "_last_summary_error", None
-                                                ),
-                                            )
                                         from agent.session_activity import (
                                             ActivityProvenance,
                                         )
@@ -20476,29 +20533,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                             "hygiene compression abort "
                                             "activity stamp failed",
                                         )
-                                        _err = getattr(_comp, "_last_summary_error", None) or "unknown error"
-                                        # Force-redact: provider exception text
-                                        # may contain credentials; this message
-                                        # reaches gateway users directly.
-                                        from agent.redact import redact_sensitive_text
-                                        _err = redact_sensitive_text(_err, force=True)
-                                        _warn_msg = (
-                                            "⚠️ Context compression aborted "
-                                            f"({_err}). No messages were dropped — "
-                                            "conversation is unchanged. Run /compress "
-                                            "to retry, /reset for a clean session, or "
-                                            "check your auxiliary.compression model "
-                                            "configuration."
+                                        raise RuntimeError(
+                                            "session hygiene compression produced no summary"
                                         )
-                                        try:
-                                            _adapter = self._adapter_for_source(source)
-                                            if _adapter and source.chat_id:
-                                                await _adapter.send(source.chat_id, _warn_msg, metadata=_hyg_meta)
-                                        except Exception as _werr:
-                                            logger.warning(
-                                                "Failed to deliver compression-failure warning to user: %s",
-                                                _werr,
-                                            )
+                                    if not hygiene_compaction_recovered(
+                                        aborted=False,
+                                        rotated=_hyg_rotated,
+                                        in_place=_hyg_in_place,
+                                        msg_count=_msg_count,
+                                        new_count=_new_count,
+                                        approx_tokens=_approx_tokens,
+                                        new_tokens=_new_tokens,
+                                    ):
+                                        raise RuntimeError(
+                                            "session hygiene compression made no durable progress"
+                                        )
                                     # Separately: if the user's CONFIGURED aux
                                     # model failed and we recovered by falling
                                     # back to the main model, tell them — a
@@ -20533,10 +20582,100 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                             _hyg_agent, context="session hygiene"
                                         )
 
-                    except Exception as e:
+                    except asyncio.CancelledError:
+                        old_session_id = session_entry.session_id
                         logger.warning(
-                            "Session hygiene auto-compress failed: %s", e
+                            "Session hygiene compression was cancelled for %s; "
+                            "retiring the oversized session before propagating cancellation",
+                            old_session_id,
                         )
+                        try:
+                            await self._finish_hygiene_retirement_despite_cancellation(
+                                source=source,
+                                session_key=session_key,
+                                session_entry=session_entry,
+                                quick_key=_quick_key,
+                                run_generation=run_generation,
+                            )
+                        except Exception as reset_error:
+                            logger.error(
+                                "Could not retire cancelled uncompressible session %s: %s",
+                                old_session_id,
+                                reset_error,
+                                exc_info=True,
+                            )
+                        raise
+                    except Exception as e:
+                        old_session_id = session_entry.session_id
+                        logger.warning(
+                            "Session hygiene auto-compress failed for %s: %s",
+                            old_session_id,
+                            e,
+                        )
+                        try:
+                            session_entry = await self._retire_session_after_hygiene_failure(
+                                source=source,
+                                session_key=session_key,
+                                session_entry=session_entry,
+                                quick_key=_quick_key,
+                                run_generation=run_generation,
+                            )
+                        except Exception as reset_error:
+                            logger.error(
+                                "Could not retire uncompressible session %s: %s",
+                                old_session_id,
+                                reset_error,
+                                exc_info=True,
+                            )
+                            return (
+                                "⚠️ This conversation became too large to compress, and "
+                                "I could not start a clean replacement safely. Your "
+                                "message was not processed. Please use /reset and resend it."
+                            )
+
+                        # The current genuine user turn continues, but the failed
+                        # transcript never reaches the provider again.
+                        history = []
+                        session_entry.is_fresh_reset = False
+                        self._clear_session_env(_session_env_tokens)
+                        context = build_session_context(source, self.config, session_entry)
+                        _session_env_tokens = self._set_session_env(context)
+                        context_prompt = self._pinned_session_context_prompt(
+                            context, _redact_pii, session_key
+                        )
+                        await self.hooks.emit(
+                            "session:start",
+                            {
+                                "platform": source.platform.value if source.platform else "",
+                                "user_id": source.user_id,
+                                "session_id": session_entry.session_id,
+                                "session_key": session_key,
+                            },
+                        )
+                        _retired_notice = (
+                            "🔄 The previous conversation was retired because automatic "
+                            "compression failed. It remains searchable, but this message "
+                            "is continuing in a clean session."
+                        )
+                        if persist_user_display_kind == "internal_notification":
+                            return (
+                                "🔄 The previous conversation was retired because automatic "
+                                "compression failed. It remains searchable. The internal "
+                                "notification that encountered the failure was not processed."
+                            )
+                        try:
+                            _adapter = self._adapter_for_source(source)
+                            if _adapter and source.chat_id:
+                                await _adapter.send(
+                                    source.chat_id,
+                                    _retired_notice,
+                                    metadata=_hyg_meta,
+                                )
+                        except Exception as notice_error:
+                            logger.warning(
+                                "Failed to deliver session-retirement notice: %s",
+                                notice_error,
+                            )
 
         # First-message onboarding -- only on the very first interaction ever.
         # Delivered on the current user message (sidecar), NOT the ephemeral
