@@ -172,6 +172,7 @@ async def test_planned_service_exit_issues_no_restart_of_its_own(monkeypatch):
 async def test_in_chat_restart_skips_home_shutdown_even_with_active_session():
     runner, adapter = make_restart_runner()
     source = make_restart_source(thread_id="42")
+    source.message_id = "stale-session-origin"
     session_key = build_session_key(source)
     runner._running_agents = {session_key: MagicMock()}
     runner._cache_session_source(session_key, source)

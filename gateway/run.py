@@ -406,6 +406,16 @@ def _gateway_platform_value(platform: Any) -> str:
     return str(getattr(platform, "value", platform) or "").strip().lower()
 
 
+def _source_for_event_context(
+    source: "SessionSource",
+    event_message_id: Optional[str],
+) -> "SessionSource":
+    """Bind tool-context reply authority to the current event, not session history."""
+    if source.message_id == event_message_id:
+        return source
+    return dataclasses.replace(source, message_id=event_message_id)
+
+
 def _non_conversational_metadata(
     metadata: Optional[Dict[str, Any]] = None,
     *,
@@ -10821,8 +10831,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     )
                     continue
 
-                reply_to_message_id = getattr(source, "message_id", None) if source is not None else None
-                if reply_to_message_id is None and restart_source is not None:
+                # Persisted/cached sources identify the destination, not a
+                # current Telegram reply target: their message ID may be the
+                # session origin from days ago.  Only the live restart command
+                # can authorise a reply anchor for this notification.
+                reply_to_message_id = None
+                if restart_source is not None:
                     try:
                         restart_platform = restart_source.platform.value
                         restart_chat_id = str(restart_source.chat_id)
@@ -19672,7 +19686,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             })
         
         # Build session context
-        context = build_session_context(source, self.config, session_entry)
+        context = build_session_context(
+            _source_for_event_context(source, event.message_id),
+            self.config,
+            session_entry,
+        )
         
         # Set session context variables for tools (task-local, concurrency-safe)
         _session_env_tokens = self._set_session_env(context)
@@ -24387,7 +24405,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             getattr(source, "chat_id", None),
             getattr(source, "thread_id", None),
             chat_type=getattr(source, "chat_type", None),
-            reply_to_message_id=reply_to_message_id or getattr(source, "message_id", None),
+            # Synthetic/resumed sources retain the session-origin message ID.
+            # Only an explicit event-local anchor may be quoted.
+            reply_to_message_id=reply_to_message_id,
         )
         if getattr(source, "platform", None) == Platform.SLACK:
             # Per-turn egress identity (R3-5, connector PR gateway-gateway#210).

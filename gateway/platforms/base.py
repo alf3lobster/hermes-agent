@@ -119,9 +119,11 @@ def _thread_metadata_for_source(source, reply_to_message_id: str | None = None) 
         tid = str(thread_id)
         if tid and tid not in {"", "1"}:
             metadata["direct_messages_topic_id"] = tid
-        anchor = reply_to_message_id or getattr(source, "message_id", None)
-        if anchor is not None:
-            metadata["telegram_reply_to_message_id"] = str(anchor)
+        # A source reconstructed for a synthetic/resumed turn can carry the
+        # session's original message ID for days.  Only the caller's explicit
+        # event-local anchor is safe to quote; otherwise route by topic alone.
+        if reply_to_message_id is not None:
+            metadata["telegram_reply_to_message_id"] = str(reply_to_message_id)
     return metadata
 
 
