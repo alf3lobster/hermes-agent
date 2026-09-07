@@ -558,7 +558,10 @@ async def test_session_hygiene_timeout_retires_session_before_current_turn(monke
     runner._pending_approvals = {}
     runner._session_db = SimpleNamespace(_db=fake_db)
     runner._is_user_authorized = lambda _source: True
-    runner._set_session_env = lambda _context: None
+    session_env_message_ids = []
+    runner._set_session_env = lambda context: session_env_message_ids.append(
+        context.source.message_id
+    )
     runner._evict_cached_agent = MagicMock()
     runner._clear_conversation_scope = MagicMock()
     runner._rebind_turn_lease = MagicMock(return_value=True)
@@ -587,6 +590,7 @@ async def test_session_hygiene_timeout_retires_session_before_current_turn(monke
             chat_id="12345",
             chat_type="dm",
             user_id="12345",
+            message_id="stale-session-origin",
         ),
         message_id="1",
     )
@@ -614,6 +618,7 @@ async def test_session_hygiene_timeout_retires_session_before_current_turn(monke
         s for s in adapter.sent if "retired" in s["content"].lower()
     ]
     assert len(retirement_notices) == 1
+    assert session_env_message_ids == ["1", "1"]
     fake_db.archive_and_compact.assert_not_called()
     SlowCompressAgent.last_instance.close.assert_not_called()
 
