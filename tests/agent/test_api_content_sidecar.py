@@ -269,6 +269,40 @@ class TestPrologueStamping:
         assert "api_content" not in ctx.messages[ctx.current_turn_user_idx]
         assert agent.api_content_at_persist is None
 
+    def test_pre_llm_hook_receives_chat_scope_for_private_context_gates(self):
+        agent = _FakeAgent()
+        agent._user_id = "6282086430"
+        agent._chat_id = "6282086430"
+        agent._chat_type = "dm"
+        captured = {}
+
+        def _capture(hook, **kwargs):
+            if hook == "pre_llm_call":
+                captured.update(kwargs)
+            return []
+
+        with patch("hermes_cli.plugins.invoke_hook", side_effect=_capture):
+            _build(agent)
+
+        assert captured["sender_id"] == "6282086430"
+        assert captured["chat_id"] == "6282086430"
+        assert captured["chat_type"] == "dm"
+        assert captured["user_originated"] is True
+
+    def test_pre_llm_hook_marks_typed_internal_turn_non_user_originated(self):
+        agent = _FakeAgent()
+        captured = {}
+
+        def _capture(hook, **kwargs):
+            if hook == "pre_llm_call":
+                captured.update(kwargs)
+            return []
+
+        with patch("hermes_cli.plugins.invoke_hook", side_effect=_capture):
+            _build(agent, persist_user_display_kind="internal_notification")
+
+        assert captured["user_originated"] is False
+
     def test_no_stamp_for_codex_app_server(self):
         """codex_app_server turns bypass the api_messages build, so the
         injected bytes are never sent — stamping would persist a lie."""
