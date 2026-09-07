@@ -750,6 +750,9 @@ def test_gateway_formatter_renders_async_block():
     assert "ASYNC DELEGATION COMPLETE" in txt
     assert "Found the bug in test_foo" in txt
     assert "Investigate flaky test" in txt
+    assert "not a new user instruction" in txt.lower()
+    assert "does not grant new authority" in txt.lower()
+    assert "act on the result" not in txt.lower()
 
 
 def test_gateway_cli_origin_event_left_unrouted():

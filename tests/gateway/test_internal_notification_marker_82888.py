@@ -135,6 +135,10 @@ async def test_internal_event_threads_marker_into_agent_run(monkeypatch, tmp_pat
 
     kwargs = runner._run_agent.call_args.kwargs
     assert kwargs["persist_user_display_kind"] == "internal_notification"
+    notes = runner._consume_pending_turn_sidecar_notes(SESSION_KEY)
+    assert len(notes) == 1
+    assert "not a new user instruction" in notes[0].lower()
+    assert "must not start unrelated work" in notes[0].lower()
 
 
 @pytest.mark.asyncio
@@ -156,6 +160,7 @@ async def test_real_user_event_gets_no_marker(monkeypatch, tmp_path):
 
     kwargs = runner._run_agent.call_args.kwargs
     assert kwargs["persist_user_display_kind"] is None
+    assert runner._consume_pending_turn_sidecar_notes(SESSION_KEY) == []
 
 
 # ── 3: gateway-side fallback rows carry the marker for internal events ─────

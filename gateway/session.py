@@ -1211,6 +1211,14 @@ def build_session_key(
     return ":".join(str(part) for part in key_parts)
 
 
+class SessionResetPersistenceError(RuntimeError):
+    """A reset changed the route but did not complete its DB lifecycle."""
+
+    def __init__(self, message: str, replacement_entry: SessionEntry) -> None:
+        super().__init__(message)
+        self.replacement_entry = replacement_entry
+
+
 class _SessionFlight:
     def __init__(self) -> None:
         self.event = threading.Event()
@@ -1637,10 +1645,12 @@ class SessionStore:
         if stale_keys or recovered_keys:
             self._save()
 
-    def _save(self) -> None:
+    def _save(self, *, strict_primary: bool = False) -> None:
         """Persist the routing index while the caller holds ``_lock``."""
         data, generation = self._snapshot_routing_locked()
-        self._persist_routing_data(data, generation)
+        self._persist_routing_data(
+            data, generation, strict_primary=strict_primary
+        )
 
     def _next_routing_generation_locked(self) -> int:
         """Bump and return the shared routing counter. Caller holds ``_lock``.
@@ -1705,7 +1715,13 @@ class SessionStore:
             self._next_routing_generation_locked(),
         )
 
-    def _persist_routing_data(self, data: Dict[str, Any], generation: int) -> None:
+    def _persist_routing_data(
+        self,
+        data: Dict[str, Any],
+        generation: int,
+        *,
+        strict_primary: bool = False,
+    ) -> None:
         """Serialize all whole-index writers through one durable write lock."""
         save_lock = getattr(self, "_save_lock", None)
         if save_lock is None:
@@ -1736,9 +1752,15 @@ class SessionStore:
                         )
                         db_saved = True
                     except Exception as exc:
+                        if strict_primary:
+                            raise RuntimeError(
+                                "authoritative state.db routing save failed"
+                            ) from exc
                         logger.warning(
                             "gateway.session: state.db routing save failed: %s", exc
                         )
+            if strict_primary and not db_saved:
+                raise RuntimeError("authoritative state.db routing store unavailable")
             if getattr(self, "_write_sessions_json", True) or not db_saved:
                 try:
                     self._save_sessions_json(data)
@@ -3398,8 +3420,19 @@ class SessionStore:
                 self._save()
         return count
 
-    def reset_session(self, session_key: str, display_name: Optional[str] = None) -> Optional[SessionEntry]:
-        """Force reset a session, creating a new session ID."""
+    def reset_session(
+        self,
+        session_key: str,
+        display_name: Optional[str] = None,
+        *,
+        strict_persistence: bool = False,
+    ) -> Optional[SessionEntry]:
+        """Force reset a session, creating a new session ID.
+
+        ``strict_persistence`` is for fail-closed automatic retirement: any
+        durable predecessor/new-row failure is surfaced before a model turn can
+        continue on the replacement.
+        """
         db_end_session_id = None
         db_create_kwargs = None
         new_entry = None
@@ -3427,9 +3460,47 @@ class SessionStore:
                 chat_type=old_entry.chat_type,
                 is_fresh_reset=True,
             )
+            old_metadata = old_entry.metadata or {}
+            blocked_hygiene_predecessor = str(
+                old_metadata.get("hygiene_retired_predecessor_id", "")
+            )
+            raw_blocked_hygiene_predecessors = old_metadata.get(
+                "hygiene_retired_predecessor_ids", []
+            )
+            blocked_hygiene_predecessors = [
+                str(session_id)
+                for session_id in (
+                    raw_blocked_hygiene_predecessors
+                    if isinstance(raw_blocked_hygiene_predecessors, list)
+                    else []
+                )
+                if session_id
+            ]
+            if (
+                blocked_hygiene_predecessor
+                and blocked_hygiene_predecessor not in blocked_hygiene_predecessors
+            ):
+                blocked_hygiene_predecessors.insert(
+                    0, blocked_hygiene_predecessor
+                )
+            if strict_persistence and db_end_session_id not in blocked_hygiene_predecessors:
+                blocked_hygiene_predecessors.append(db_end_session_id)
+            if blocked_hygiene_predecessors:
+                new_entry.metadata["hygiene_retired_predecessor_id"] = (
+                    blocked_hygiene_predecessors[0]
+                )
+                new_entry.metadata["hygiene_retired_predecessor_ids"] = (
+                    blocked_hygiene_predecessors
+                )
 
             self._entries[session_key] = new_entry
-            self._save()
+            try:
+                self._save(strict_primary=strict_persistence)
+            except Exception as e:
+                self._entries[session_key] = old_entry
+                raise RuntimeError(
+                    "failed to persist replacement route durably"
+                ) from e
             _reset_origin_json = None
             if old_entry.origin is not None:
                 try:
@@ -3452,6 +3523,52 @@ class SessionStore:
                 "parent_session_id": db_end_session_id,
                 "model_config": {"_reset_from": db_end_session_id},
             }
+
+        if strict_persistence and self._db:
+            # Fail-closed retirement creates the replacement first. That gives
+            # Telegram a valid FK target even when predecessor promotion later
+            # fails, while a create failure leaves the predecessor untouched.
+            try:
+                self._db.create_session(**db_create_kwargs)
+                self._record_gateway_session_peer(
+                    session_id,
+                    session_key,
+                    old_entry.origin,
+                    display_name=new_entry.display_name if new_entry else None,
+                )
+            except Exception as e:
+                logger.warning(
+                    "Failed to create session row %s for %s during strict reset: %s",
+                    session_id,
+                    session_key,
+                    e,
+                )
+                raise SessionResetPersistenceError(
+                    "failed to create replacement session durably",
+                    new_entry,
+                ) from e
+
+            try:
+                _promote = getattr(self._db, "promote_to_session_reset", None)
+                if callable(_promote):
+                    promoted = _promote(db_end_session_id, "session_reset")
+                    if not promoted:
+                        raise RuntimeError("predecessor reset promotion returned false")
+                else:
+                    self._db.end_session(db_end_session_id, "session_reset")
+            except Exception as e:
+                logger.warning(
+                    "Failed to end predecessor session row %s for %s during "
+                    "strict reset: %s",
+                    db_end_session_id,
+                    session_key,
+                    e,
+                )
+                raise SessionResetPersistenceError(
+                    "failed to retire predecessor session durably",
+                    new_entry,
+                ) from e
+            return new_entry
 
         if self._db and db_end_session_id:
             try:
