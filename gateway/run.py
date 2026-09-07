@@ -20656,7 +20656,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         history = []
                         session_entry.is_fresh_reset = False
                         self._clear_session_env(_session_env_tokens)
-                        context = build_session_context(source, self.config, session_entry)
+                        context = build_session_context(
+                            _source_for_event_context(source, event.message_id),
+                            self.config,
+                            session_entry,
+                        )
                         _session_env_tokens = self._set_session_env(context)
                         context_prompt = self._pinned_session_context_prompt(
                             context, _redact_pii, session_key
