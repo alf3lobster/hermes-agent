@@ -5151,7 +5151,14 @@ This compaction should PRIORITISE preserving all information related to the focu
             # transient network events; treat them like a timeout so we fall
             # back to the main model instead of entering a 60-second cooldown.
             # See issue #18458.
-            _is_streaming_closed = _is_connection_error(e)
+            #
+            # The shared connection detector deliberately includes timeout
+            # exceptions for provider failover, but a spent summary deadline is
+            # not a connection outage here.  Timeout has its own escalating
+            # cooldown and, when abort_on_summary_failure is false, must reach
+            # the deterministic fallback instead of freezing the oversized
+            # transcript forever.
+            _is_streaming_closed = _is_connection_error(e) and not _is_timeout
             # Provider returned HTTP 200 with empty or whitespace body (e.g.
             # degraded proxy channel / upstream provider fault; #94448).
             _is_empty_content = isinstance(e, RuntimeError) and (
