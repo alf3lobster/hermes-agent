@@ -7594,6 +7594,7 @@ def run_conversation(
                 if (
                     agent.compression_enabled
                     and compression_attempts < max_compression_attempts
+                    and not _preflight_compression_blocked
                     and _compressor.should_compress(_real_tokens)
                 ):
                     compression_attempts += 1

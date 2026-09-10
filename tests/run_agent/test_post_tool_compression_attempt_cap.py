@@ -189,6 +189,18 @@ class TestPostToolCompressionAttemptCap:
             f"attempt budget, got {len(compress_calls)} total compactions"
         )
 
+    def test_pre_api_no_progress_blocks_post_tool_retries_for_same_turn(self, agent):
+        """One failed automatic pass must not trigger two more ten-minute passes."""
+        agent.context_compressor.threshold_tokens = 100
+        agent.context_compressor.should_defer_preflight_to_real_usage.return_value = False
+        result, compress_calls = _run_tool_loop(agent, n_tool_iterations=3)
+
+        assert result["completed"] is True
+        assert len(compress_calls) == 2, (
+            "once the pre-API pass proves insufficient progress, later post-tool "
+            f"retries must stop; got {len(compress_calls)} total attempts"
+        )
+
     def test_cap_is_per_turn_not_per_session(self, agent):
         """A fresh turn gets a fresh attempt budget."""
         _result, first = _run_tool_loop(agent, n_tool_iterations=5)
