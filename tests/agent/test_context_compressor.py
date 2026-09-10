@@ -930,6 +930,35 @@ class TestAuthFailureAborts:
         assert c._last_summary_network_failure is True
         assert c._last_summary_auth_failure is False
 
+    def test_timeout_uses_deterministic_fallback_instead_of_aborting(self):
+        """A spent summary deadline is not a connection outage.
+
+        TimeoutError is also an OSError/connection-shaped exception, but the
+        configured default is to compact with a deterministic handoff after a
+        summary timeout rather than preserve an oversized session forever.
+        """
+        with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+            c = ContextCompressor(
+                model="test",
+                quiet_mode=True,
+                protect_first_n=2,
+                protect_last_n=2,
+                abort_on_summary_failure=False,
+            )
+        msgs = self._msgs(12)
+        timeout = TimeoutError(
+            "Codex auxiliary Responses stream exceeded 300.0s total timeout"
+        )
+
+        with patch("agent.context_compressor.call_llm", side_effect=timeout):
+            result = c.compress(msgs, current_tokens=999999, force=True)
+
+        assert result != msgs
+        assert c._last_summary_network_failure is False
+        assert c._last_compress_aborted is False
+        assert c._last_summary_fallback_used is True
+        assert c._last_summary_dropped_count > 0
+
     def test_generate_summary_flags_empty_content_failure(self):
         """An empty-content response on the summary call flags
         _last_summary_empty_content_failure (#94448)."""
