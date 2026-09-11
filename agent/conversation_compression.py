@@ -1186,6 +1186,38 @@ def _session_was_rotated_by_compression(session_db: Any, session_id: str) -> boo
     )
 
 
+_COMPRESSION_HEALTH_SLOW_MS = 60_000
+
+
+def _compression_health_alarm_reasons(payload: dict[str, Any]) -> list[str]:
+    """Return bounded, content-free health violations for one attempt."""
+    reasons: list[str] = []
+    aux_calls = payload.get("aux_call_count")
+    if isinstance(aux_calls, int) and not isinstance(aux_calls, bool) and aux_calls > 1:
+        reasons.append(f"auxiliary_calls={aux_calls}>1")
+    duration_ms = payload.get("total_duration_ms")
+    if (
+        isinstance(duration_ms, int)
+        and not isinstance(duration_ms, bool)
+        and duration_ms > _COMPRESSION_HEALTH_SLOW_MS
+    ):
+        reasons.append(
+            f"duration_ms={duration_ms}>{_COMPRESSION_HEALTH_SLOW_MS}"
+        )
+    pre_tokens = payload.get("pre_message_tokens")
+    post_tokens = payload.get("post_message_tokens")
+    if (
+        payload.get("commit_status") == "committed"
+        and isinstance(pre_tokens, int)
+        and not isinstance(pre_tokens, bool)
+        and isinstance(post_tokens, int)
+        and not isinstance(post_tokens, bool)
+        and post_tokens >= pre_tokens
+    ):
+        reasons.append(f"token_reduction={pre_tokens - post_tokens}<=0")
+    return reasons
+
+
 def _emit_compression_attempt_telemetry(
     agent: Any,
     *,
@@ -1193,15 +1225,45 @@ def _emit_compression_attempt_telemetry(
     commit_status: str,
     split_status: str,
     failure_class: str | None = None,
+    attempt_id: str | None = None,
+    committed_pre_message_tokens: int | None = None,
+    committed_post_message_tokens: int | None = None,
 ) -> None:
     """Emit one content-free JSON log line for a compression attempt."""
     try:
-        telemetry = getattr(agent.context_compressor, "_last_compression_telemetry", None)
-        if not isinstance(telemetry, dict):
+        current_attempt_id = str(
+            attempt_id
+            or getattr(agent, "_compression_attempt_id", "")
+            or uuid.uuid4().hex
+        )
+        current_reader = getattr(
+            agent.context_compressor, "_current_compression_telemetry", None
+        )
+        telemetry = (
+            current_reader(current_attempt_id)
+            if callable(current_reader)
+            else getattr(
+                agent.context_compressor, "_last_compression_telemetry", None
+            )
+        )
+        if (
+            not isinstance(telemetry, dict)
+            or str(telemetry.get("attempt_id") or "") != current_attempt_id
+        ):
             telemetry = {}
         payload = dict(telemetry)
+        if (
+            commit_status == "committed"
+            and committed_pre_message_tokens is not None
+            and committed_post_message_tokens is not None
+        ):
+            pre_tokens = max(0, int(committed_pre_message_tokens))
+            post_tokens = max(0, int(committed_post_message_tokens))
+            payload["pre_message_tokens"] = pre_tokens
+            payload["post_message_tokens"] = post_tokens
+            payload["message_tokens_reclaimed"] = pre_tokens - post_tokens
         payload.setdefault("event", "compression_attempt")
-        payload.setdefault("attempt_id", getattr(agent, "_compression_attempt_id", "") or uuid.uuid4().hex)
+        payload.setdefault("attempt_id", current_attempt_id)
         payload.setdefault("session_id", getattr(agent, "session_id", "") or "")
         payload["total_duration_ms"] = int((time.monotonic() - started_at) * 1000)
         payload["commit_status"] = commit_status
@@ -1215,6 +1277,25 @@ def _emit_compression_attempt_telemetry(
             or getattr(agent.context_compressor, "_last_summary_fallback_used", False)
             or getattr(agent.context_compressor, "_last_aux_model_failure_model", None)
         )
+        health_alarms = _compression_health_alarm_reasons(payload)
+        payload["health_alarms"] = health_alarms
+        if health_alarms:
+            logger.warning(
+                "compression health alarm: attempt_id=%s session_id=%s %s",
+                payload.get("attempt_id") or "unknown",
+                payload.get("session_id") or "unknown",
+                " ".join(health_alarms),
+            )
+            emit_warning = getattr(agent, "_emit_warning", None)
+            if callable(emit_warning):
+                try:
+                    emit_warning(
+                        "⚠ Compression health alarm: " + " ".join(health_alarms)
+                    )
+                except Exception as exc:
+                    logger.debug(
+                        "failed to surface compression health alarm: %s", exc
+                    )
         logger.info(
             "context compression attempt telemetry: %s",
             json.dumps(payload, sort_keys=True, separators=(",", ":")),
@@ -2372,11 +2453,21 @@ def compress_context(
     _trigger_source = "manual" if force else "auto"
     try:
         agent._compression_attempt_id = _attempt_id
-        setattr(agent.context_compressor, "_compression_telemetry_seed", {
-            "attempt_id": _attempt_id,
-            "session_id": agent.session_id or "",
-            "trigger_source": _trigger_source,
-        })
+        seed_telemetry = getattr(
+            agent.context_compressor, "_seed_compression_telemetry", None
+        )
+        if callable(seed_telemetry):
+            seed_telemetry(
+                attempt_id=_attempt_id,
+                session_id=agent.session_id or "",
+                trigger_source=_trigger_source,
+            )
+        else:
+            setattr(agent.context_compressor, "_compression_telemetry_seed", {
+                "attempt_id": _attempt_id,
+                "session_id": agent.session_id or "",
+                "trigger_source": _trigger_source,
+            })
     except Exception:
         pass
 
@@ -2639,6 +2730,7 @@ def compress_context(
                     _emit_compression_attempt_telemetry(
                         agent,
                         started_at=_attempt_started_at,
+                        attempt_id=_attempt_id,
                         commit_status="aborted",
                         split_status="aborted",
                         failure_class="commit_fence_cancelled",
@@ -2731,6 +2823,7 @@ def compress_context(
             _emit_compression_attempt_telemetry(
                 agent,
                 started_at=_attempt_started_at,
+                attempt_id=_attempt_id,
                 commit_status="aborted",
                 split_status="aborted",
                 failure_class="lock_contended",
@@ -2805,6 +2898,7 @@ def compress_context(
             _emit_compression_attempt_telemetry(
                 agent,
                 started_at=_attempt_started_at,
+                attempt_id=_attempt_id,
                 commit_status="aborted",
                 split_status="aborted",
                 failure_class="commit_fence_cancelled",
@@ -3202,6 +3296,7 @@ def compress_context(
             _emit_compression_attempt_telemetry(
                 agent,
                 started_at=_attempt_started_at,
+                attempt_id=_attempt_id,
                 commit_status="aborted",
                 split_status="aborted",
                 failure_class=f"rollback:{type(_rollback_exc).__name__}",
@@ -3219,6 +3314,7 @@ def compress_context(
         _emit_compression_attempt_telemetry(
             agent,
             started_at=_attempt_started_at,
+            attempt_id=_attempt_id,
             commit_status="aborted",
             split_status="aborted",
             failure_class="explicit_interrupt",
@@ -3238,6 +3334,7 @@ def compress_context(
         _emit_compression_attempt_telemetry(
             agent,
             started_at=_attempt_started_at,
+            attempt_id=_attempt_id,
             commit_status="aborted",
             split_status="aborted",
             failure_class=f"exception:{type(_compress_exc).__name__}",
@@ -3284,6 +3381,7 @@ def compress_context(
                 _emit_compression_attempt_telemetry(
                     agent,
                     started_at=_attempt_started_at,
+                    attempt_id=_attempt_id,
                     commit_status="aborted",
                     split_status="aborted",
                     failure_class=(
@@ -3319,6 +3417,7 @@ def compress_context(
             _emit_compression_attempt_telemetry(
                 agent,
                 started_at=_attempt_started_at,
+                attempt_id=_attempt_id,
                 commit_status="aborted",
                 split_status="aborted",
                 failure_class="no_progress",
@@ -3371,6 +3470,7 @@ def compress_context(
                 _emit_compression_attempt_telemetry(
                     agent,
                     started_at=_attempt_started_at,
+                    attempt_id=_attempt_id,
                     commit_status="aborted",
                     split_status="aborted",
                     failure_class="commit_fence_cancelled",
@@ -3584,6 +3684,7 @@ def compress_context(
                     _emit_compression_attempt_telemetry(
                         agent,
                         started_at=_attempt_started_at,
+                        attempt_id=_attempt_id,
                         commit_status="aborted",
                         split_status="aborted",
                         failure_class="would_grow",
@@ -4114,6 +4215,7 @@ def compress_context(
         _emit_compression_attempt_telemetry(
             agent,
             started_at=_attempt_started_at,
+            attempt_id=_attempt_id,
             commit_status=_commit_status,
             split_status=split_status,
             failure_class=(
@@ -4121,6 +4223,8 @@ def compress_context(
                 if split_status in {"failed_not_indexed", "aborted"}
                 else None
             ),
+            committed_pre_message_tokens=estimate_messages_tokens_rough(messages),
+            committed_post_message_tokens=estimate_messages_tokens_rough(compressed),
         )
         return compressed, new_system_prompt
     finally:

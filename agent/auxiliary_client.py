@@ -3322,6 +3322,7 @@ def _relay_auxiliary_call(callback):
     @functools.wraps(callback)
     def wrapped(*args, **kwargs):
         task = args[0] if args else kwargs.get("task")
+        route_info = kwargs.get("route_info")
         token = _RELAY_AUX_CALL_CONTEXT.set({
             "task": str(task or "unknown"),
             "request_id": f"aux-{uuid.uuid4().hex}",
@@ -3330,6 +3331,7 @@ def _relay_auxiliary_call(callback):
             "model": "",
             "response_model": None,
             "api_mode": "chat_completions",
+            "route_info": route_info if isinstance(route_info, dict) else None,
         })
         try:
             return callback(*args, **kwargs)
@@ -3403,6 +3405,9 @@ def _relay_auxiliary_metadata(
         return None
     attempt_count = int(context.get("attempt_count") or 0)
     context["attempt_count"] = attempt_count + 1
+    route_info = context.get("route_info")
+    if isinstance(route_info, dict):
+        route_info["physical_request_count"] = attempt_count + 1
     provider_name = str(provider or context.get("provider") or "auxiliary")
     model_name = str(context.get("model") or "unknown")
     return provider_name, model_name, {
