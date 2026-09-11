@@ -16,6 +16,7 @@ Improvements over v2:
   - Richer tool call/result detail in summarizer input
 """
 
+import contextvars
 import copy
 import hashlib
 import json
@@ -46,6 +47,15 @@ from agent.turn_context import drop_stale_api_content
 from tools.todo_tool import TODO_INJECTION_HEADER
 
 logger = logging.getLogger(__name__)
+
+_COMPRESSION_TELEMETRY_CONTEXT: contextvars.ContextVar[
+    tuple[Any, Dict[str, Any]] | None
+] = (
+    contextvars.ContextVar("compression_attempt_telemetry", default=None)
+)
+_COMPRESSION_TELEMETRY_SEED_CONTEXT: contextvars.ContextVar[
+    tuple[Any, Dict[str, str]] | None
+] = contextvars.ContextVar("compression_attempt_telemetry_seed", default=None)
 
 
 def _safe_int(value: Any) -> int | None:
@@ -2076,7 +2086,12 @@ class ContextCompressor(ContextEngine):
         trigger_source: str | None = None,
     ) -> Dict[str, Any]:
         """Initialize content-free per-attempt compression telemetry."""
-        seed = getattr(self, "_compression_telemetry_seed", None)
+        context_seed = _COMPRESSION_TELEMETRY_SEED_CONTEXT.get()
+        seed = (
+            context_seed[1]
+            if isinstance(context_seed, tuple) and context_seed[0] is self
+            else None
+        )
         if isinstance(seed, dict):
             attempt_id = attempt_id or seed.get("attempt_id")
             session_id = session_id or seed.get("session_id")
@@ -2104,7 +2119,11 @@ class ContextCompressor(ContextEngine):
             "chunking": False,
             "chunk_count": 0,
             "total_duration_ms": None,
+            "aux_call_count": 0,
             "aux_call_duration_ms": None,
+            "pre_message_tokens": None,
+            "post_message_tokens": None,
+            "message_tokens_reclaimed": None,
             "fallback_used": False,
             "commit_status": "unknown",
             "split_status": "unknown",
@@ -2112,6 +2131,30 @@ class ContextCompressor(ContextEngine):
         }
         self._active_compression_telemetry = telemetry
         self._last_compression_telemetry = telemetry
+        _COMPRESSION_TELEMETRY_CONTEXT.set((self, telemetry))
+        return telemetry
+
+    def _seed_compression_telemetry(
+        self, *, attempt_id: str, session_id: str, trigger_source: str
+    ) -> None:
+        """Bind an orchestration seed to this execution context only."""
+        seed = {
+            "attempt_id": attempt_id,
+            "session_id": session_id,
+            "trigger_source": trigger_source,
+        }
+        _COMPRESSION_TELEMETRY_SEED_CONTEXT.set((self, seed))
+
+    def _current_compression_telemetry(
+        self, attempt_id: str | None = None
+    ) -> Dict[str, Any] | None:
+        """Return telemetry owned by this execution context and attempt."""
+        context_value = _COMPRESSION_TELEMETRY_CONTEXT.get()
+        if not isinstance(context_value, tuple) or context_value[0] is not self:
+            return None
+        telemetry = context_value[1]
+        if attempt_id and telemetry.get("attempt_id") != attempt_id:
+            return None
         return telemetry
 
     def _record_compression_regions(
@@ -2121,7 +2164,7 @@ class ContextCompressor(ContextEngine):
         middle_messages: List[Dict[str, Any]],
         tail_messages: List[Dict[str, Any]],
     ) -> None:
-        telemetry = getattr(self, "_active_compression_telemetry", None)
+        telemetry = self._current_compression_telemetry()
         if not isinstance(telemetry, dict):
             return
         telemetry["protected_head_tokens"] = estimate_messages_tokens_rough(head_messages)
@@ -2137,8 +2180,10 @@ class ContextCompressor(ContextEngine):
         aux_provider: str | None = None,
         aux_model: str | None = None,
         effective_aux_context: int | None = None,
+        attempt_id: str | None = None,
+        call_count: int = 1,
     ) -> None:
-        telemetry = getattr(self, "_active_compression_telemetry", None)
+        telemetry = self._current_compression_telemetry(attempt_id)
         if not isinstance(telemetry, dict):
             return
         telemetry["aux_prompt_tokens"] = estimate_messages_tokens_rough(prompt_messages)
@@ -2160,6 +2205,25 @@ class ContextCompressor(ContextEngine):
             )
         previous = telemetry.get("aux_call_duration_ms") or 0
         telemetry["aux_call_duration_ms"] = previous + max(0, int(duration_ms))
+        telemetry["aux_call_count"] = (
+            int(telemetry.get("aux_call_count") or 0) + max(0, int(call_count))
+        )
+
+    def _record_compression_result(
+        self,
+        *,
+        pre_message_tokens: int,
+        post_message_tokens: int,
+    ) -> None:
+        """Record content-free token reduction for one compression attempt."""
+        telemetry = self._current_compression_telemetry()
+        if not isinstance(telemetry, dict):
+            return
+        pre_tokens = max(0, int(pre_message_tokens))
+        post_tokens = max(0, int(post_message_tokens))
+        telemetry["pre_message_tokens"] = pre_tokens
+        telemetry["post_message_tokens"] = post_tokens
+        telemetry["message_tokens_reclaimed"] = pre_tokens - post_tokens
 
     def _emit_init_summary_once(self) -> None:
         """Emit the informative startup line once, on first resolution.
@@ -4574,7 +4638,7 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
             _err_text = _err_text[:217].rstrip() + "..."
         self._last_aux_model_failure_error = _err_text
         self._last_aux_model_failure_model = self.summary_model
-        telemetry = getattr(self, "_active_compression_telemetry", None)
+        telemetry = self._current_compression_telemetry()
         if isinstance(telemetry, dict):
             telemetry["fallback_used"] = True
             telemetry["failure_class"] = telemetry.get("failure_class") or "aux_model_fallback"
@@ -4933,6 +4997,7 @@ This compaction should PRIORITISE preserving all information related to the focu
                 # summaries and compaction loops. Omitting lets the adapter
                 # fall back to the model's native output ceiling.
                 # timeout resolved from auxiliary.compression.timeout config by call_llm
+                "route_info": {},
             }
             if self.summary_model:
                 call_kwargs["model"] = self.summary_model
@@ -4958,6 +5023,12 @@ This compaction should PRIORITISE preserving all information related to the focu
             # marker, losing the real handoff (#23975). Re-entrant: a main-model
             # retry (_generate_summary recursion) re-enters harmlessly.
             _aux_call_start = time.monotonic()
+            _telemetry = self._current_compression_telemetry()
+            _telemetry_attempt_id = (
+                str(_telemetry.get("attempt_id"))
+                if isinstance(_telemetry, dict) and _telemetry.get("attempt_id")
+                else None
+            )
             try:
                 with aux_interrupt_protection():
                     response = call_llm(**call_kwargs)
@@ -4972,6 +5043,11 @@ This compaction should PRIORITISE preserving all information related to the focu
                     aux_provider=_aux_provider,
                     aux_model=_aux_model,
                     effective_aux_context=_aux_context,
+                    attempt_id=_telemetry_attempt_id,
+                    call_count=int(
+                        call_kwargs["route_info"].get("physical_request_count")
+                        or 0
+                    ),
                 )
             # ``_validate_llm_response`` only guarantees ``choices[0].message``
             # exists, not that it's an object with ``.content``. Some
@@ -7999,6 +8075,10 @@ This compaction should PRIORITISE preserving all information related to the focu
         saved_estimate = pre_estimate - new_estimate
         savings_pct = (saved_estimate / pre_estimate * 100) if pre_estimate > 0 else 0
         self._last_compression_savings_pct = savings_pct
+        self._record_compression_result(
+            pre_message_tokens=pre_estimate,
+            post_message_tokens=new_estimate,
+        )
 
         # Message-only savings are diagnostic. The anti-thrashing verdict is
         # owned by the next provider-reported prompt count, which answers the
