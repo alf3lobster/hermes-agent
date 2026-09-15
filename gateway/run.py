@@ -198,6 +198,79 @@ def hygiene_compaction_recovered(
     )
 
 
+def _hygiene_compression_health_key(session_key: str, session_id: str) -> str:
+    """Namespace a health strike to one live route generation."""
+    return f"compression-health:{session_key}:{session_id}"
+
+
+class _UnhealthyCompressionRegrowth(RuntimeError):
+    """The session crossed hygiene again after an unhealthy successful pass."""
+
+
+_HYGIENE_UNHEALTHY_REGROWTH_THRESHOLD = 0.55
+
+
+def _session_hygiene_action(
+    *,
+    normal_hygiene_due: bool,
+    approx_tokens: int,
+    regrowth_token_threshold: int,
+    health_strike: int,
+) -> str:
+    """Choose normal compression or unhealthy-regrowth retirement."""
+    if health_strike > 0 and approx_tokens >= regrowth_token_threshold:
+        return "retire"
+    if normal_hygiene_due:
+        return "compress"
+    return "none"
+
+
+def _get_hygiene_compression_health_strike(session_db: Any, key: str) -> int:
+    """Read a durable unhealthy-compression strike, failing open on uncertainty."""
+    getter = getattr(session_db, "get_hygiene_failure_streak", None)
+    if not callable(getter):
+        return 0
+    try:
+        value = getter(key)
+    except Exception as exc:
+        logger.debug("compression health strike lookup failed: %s", exc)
+        return 0
+    if isinstance(value, int) and not isinstance(value, bool):
+        return max(0, value)
+    return 0
+
+
+def _persist_hygiene_compression_health_verdict(
+    session_db: Any,
+    key: str,
+    payload: Any,
+    *,
+    expected_attempt_id: str,
+) -> None:
+    """Arm on one unhealthy committed attempt; clear after a healthy one."""
+    if not isinstance(payload, dict):
+        return
+    if payload.get("commit_status") != "committed":
+        return
+    if not expected_attempt_id or payload.get("attempt_id") != expected_attempt_id:
+        return
+    alarms = payload.get("health_alarms")
+    if not isinstance(alarms, list):
+        return
+    method_name = (
+        "increment_hygiene_failure_streak"
+        if alarms
+        else "reset_hygiene_failure_streak"
+    )
+    writer = getattr(session_db, method_name, None)
+    if not callable(writer):
+        return
+    try:
+        writer(key)
+    except Exception as exc:
+        logger.debug("compression health strike persist failed: %s", exc)
+
+
 def _status_template_to_regex(template: str) -> str:
     """Compile a compression status template constant into a regex source.
 
@@ -20118,26 +20191,69 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # compression.hygiene_hard_message_limit.
                 # (#2153)
                 _HARD_MSG_LIMIT = _hyg_hard_msg_limit
-                _needs_compress = (
+                _normal_hygiene_due = (
                     _approx_tokens >= _compress_token_threshold
                     or _msg_count >= _HARD_MSG_LIMIT
                 )
+                _regrowth_token_threshold = int(
+                    _hyg_context_length
+                    * _HYGIENE_UNHEALTHY_REGROWTH_THRESHOLD
+                )
+                _hyg_session_db = getattr(
+                    self._session_db, "_db", self._session_db
+                )
+                _hyg_health_key = _hygiene_compression_health_key(
+                    session_key, session_entry.session_id
+                )
+                _hyg_health_strike = 0
+                if _approx_tokens >= _regrowth_token_threshold:
+                    _hyg_health_strike = await asyncio.to_thread(
+                        _get_hygiene_compression_health_strike,
+                        _hyg_session_db,
+                        _hyg_health_key,
+                    )
+                _hygiene_action = _session_hygiene_action(
+                    normal_hygiene_due=_normal_hygiene_due,
+                    approx_tokens=_approx_tokens,
+                    regrowth_token_threshold=_regrowth_token_threshold,
+                    health_strike=_hyg_health_strike,
+                )
+                _needs_compress = _hygiene_action != "none"
 
                 if _needs_compress:
-                    logger.info(
-                        "Session hygiene: %s messages, ~%s tokens (%s) — auto-compressing "
-                        "(threshold: %s%% of %s = %s tokens)",
-                        _msg_count, f"{_approx_tokens:,}", _token_source,
-                        int(_hyg_threshold_pct * 100),
-                        f"{_hyg_context_length:,}",
-                        f"{_compress_token_threshold:,}",
-                    )
+                    if _hygiene_action == "retire":
+                        logger.info(
+                            "Session hygiene: %s messages, ~%s tokens (%s) — "
+                            "retiring after unhealthy compression regrowth "
+                            "(practical threshold: %s%% of %s = %s tokens)",
+                            _msg_count,
+                            f"{_approx_tokens:,}",
+                            _token_source,
+                            int(_HYGIENE_UNHEALTHY_REGROWTH_THRESHOLD * 100),
+                            f"{_hyg_context_length:,}",
+                            f"{_regrowth_token_threshold:,}",
+                        )
+                    else:
+                        logger.info(
+                            "Session hygiene: %s messages, ~%s tokens (%s) — auto-compressing "
+                            "(threshold: %s%% of %s = %s tokens)",
+                            _msg_count, f"{_approx_tokens:,}", _token_source,
+                            int(_hyg_threshold_pct * 100),
+                            f"{_hyg_context_length:,}",
+                            f"{_compress_token_threshold:,}",
+                        )
 
                     _hyg_meta = self._thread_metadata_for_source(source, self._reply_anchor_for_event(event))
 
                     try:
                         from agent.conversation_compression import CompressionCommitFence
                         from run_agent import AIAgent
+
+                        if _hygiene_action == "retire":
+                            raise _UnhealthyCompressionRegrowth(
+                                "previous unhealthy hygiene compression regrew "
+                                "past the threshold"
+                            )
 
                         _hyg_model, _hyg_runtime = self._resolve_session_agent_runtime(
                             source=source,
@@ -20187,7 +20303,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                         exc,
                                         exc_info=True,
                                     )
-                                _hyg_session_db = getattr(self._session_db, "_db", self._session_db)
                                 # Hygiene performs the same lossy rewrite as
                                 # normal compression. When the operator enabled
                                 # compression.checkpoint_required, the memory
@@ -20590,6 +20705,40 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                                 "Failed to deliver aux-model-fallback notice to user: %s",
                                                 _werr,
                                             )
+                                    # The strike must never become durable while
+                                    # the pre-compression token estimate is still
+                                    # persisted. A crash in that ordering would
+                                    # make the first post-restart turn look like
+                                    # regrowth and retire a freshly compacted session.
+                                    await asyncio.to_thread(
+                                        self.session_store.update_session,
+                                        session_key,
+                                        last_prompt_tokens=0,
+                                        touch_activity=False,
+                                    )
+                                    _live_hyg_health_key = (
+                                        _hygiene_compression_health_key(
+                                            session_key, session_entry.session_id
+                                        )
+                                    )
+                                    await asyncio.to_thread(
+                                        _persist_hygiene_compression_health_verdict,
+                                        _hyg_session_db,
+                                        _live_hyg_health_key,
+                                        getattr(
+                                            _hyg_agent,
+                                            "_last_compression_attempt_telemetry",
+                                            None,
+                                        ),
+                                        expected_attempt_id=str(
+                                            getattr(
+                                                _hyg_agent,
+                                                "_compression_attempt_id",
+                                                "",
+                                            )
+                                            or ""
+                                        ),
+                                    )
                                 finally:
                                     # Evict the cached agent so the next turn
                                     # rebuilds its system prompt from current
@@ -20625,8 +20774,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         raise
                     except Exception as e:
                         old_session_id = session_entry.session_id
+                        _unhealthy_regrowth = isinstance(
+                            e, _UnhealthyCompressionRegrowth
+                        )
                         logger.warning(
-                            "Session hygiene auto-compress failed for %s: %s",
+                            "Session hygiene %s for %s: %s",
+                            (
+                                "retiring after unhealthy compression regrowth"
+                                if _unhealthy_regrowth
+                                else "auto-compress failed"
+                            ),
                             old_session_id,
                             e,
                         )
@@ -20645,6 +20802,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 reset_error,
                                 exc_info=True,
                             )
+                            if _unhealthy_regrowth:
+                                return (
+                                    "⚠️ This conversation grew too large again after an "
+                                    "unhealthy automatic compression, and I could not start "
+                                    "a clean replacement safely. Your message was not "
+                                    "processed. Please use /reset and resend it."
+                                )
                             return (
                                 "⚠️ This conversation became too large to compress, and "
                                 "I could not start a clean replacement safely. Your "
@@ -20674,15 +20838,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 "session_key": session_key,
                             },
                         )
+                        if _unhealthy_regrowth:
+                            _retired_reason = (
+                                "it grew too large again after an unhealthy automatic "
+                                "compression"
+                            )
+                        else:
+                            _retired_reason = "automatic compression failed"
                         _retired_notice = (
-                            "🔄 The previous conversation was retired because automatic "
-                            "compression failed. It remains searchable, but this message "
+                            "🔄 The previous conversation was retired because "
+                            f"{_retired_reason}. It remains searchable, but this message "
                             "is continuing in a clean session."
                         )
                         if persist_user_display_kind == "internal_notification":
                             return (
-                                "🔄 The previous conversation was retired because automatic "
-                                "compression failed. It remains searchable. The internal "
+                                "🔄 The previous conversation was retired because "
+                                f"{_retired_reason}. It remains searchable. The internal "
                                 "notification that encountered the failure was not processed."
                             )
                         try:

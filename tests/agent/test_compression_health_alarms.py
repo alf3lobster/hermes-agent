@@ -132,6 +132,47 @@ def test_health_alarm_reaches_user_warning_channel():
     ]
 
 
+def test_finalized_health_payload_is_retained_on_agent():
+    agent = _agent({
+        "aux_call_count": 2,
+        "pre_message_tokens": 10_000,
+        "post_message_tokens": 2_000,
+    })
+
+    with patch(
+        "agent.conversation_compression.time.monotonic",
+        return_value=161.0,
+    ):
+        _emit_compression_attempt_telemetry(
+            agent,
+            started_at=100.0,
+            commit_status="committed",
+            split_status="committed",
+            committed_pre_message_tokens=10_000,
+            committed_post_message_tokens=2_000,
+        )
+
+    assert agent._last_compression_attempt_telemetry == {
+        "attempt_id": "attempt-health",
+        "aux_call_count": 2,
+        "pre_message_tokens": 10_000,
+        "post_message_tokens": 2_000,
+        "message_tokens_reclaimed": 8_000,
+        "event": "compression_attempt",
+        "session_id": "session-health",
+        "total_duration_ms": 61_000,
+        "commit_status": "committed",
+        "split_status": "committed",
+        "chunking": False,
+        "chunk_count": 0,
+        "fallback_used": False,
+        "health_alarms": [
+            "auxiliary_calls=2>1",
+            "duration_ms=61000>60000",
+        ],
+    }
+
+
 def test_healthy_compression_emits_no_health_warning(caplog):
     telemetry = {
         "aux_call_count": 1,

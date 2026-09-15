@@ -7293,6 +7293,26 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
         self._execute_write(_do)
 
+    def get_hygiene_failure_streak(self, session_key: str) -> int:
+        """Return the persisted session-hygiene strike count for one key."""
+        if not session_key:
+            return 0
+        with self._lock:
+            conn = self._conn
+            if conn is None:
+                return 0
+            row = conn.execute(
+                "SELECT failure_streak FROM gateway_hygiene_state WHERE session_key = ?",
+                (session_key,),
+            ).fetchone()
+        if row is None:
+            return 0
+        value = row["failure_streak"] if isinstance(row, sqlite3.Row) else row[0]
+        try:
+            return max(0, int(value or 0))
+        except (TypeError, ValueError):
+            return 0
+
     def increment_hygiene_failure_streak(self, session_key: str) -> int:
         """Atomically increment the session-hygiene failure streak for one chat."""
         if not session_key:

@@ -1279,6 +1279,11 @@ def _emit_compression_attempt_telemetry(
         )
         health_alarms = _compression_health_alarm_reasons(payload)
         payload["health_alarms"] = health_alarms
+        # Publish the finalized, content-free attempt verdict for gateway hygiene.
+        # This is the same payload logged below, after authoritative duration and
+        # commit-boundary token counts have been applied.  Consumers must still
+        # validate attempt_id and commit_status before acting on it.
+        agent._last_compression_attempt_telemetry = dict(payload)
         if health_alarms:
             logger.warning(
                 "compression health alarm: attempt_id=%s session_id=%s %s",
