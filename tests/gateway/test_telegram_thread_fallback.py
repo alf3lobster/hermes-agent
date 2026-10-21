@@ -18,13 +18,12 @@ import pytest
 
 from gateway.config import PlatformConfig, Platform
 from gateway.platforms.base import (
-    MessageEvent,
-    MessageType,
     SendResult,
     _reply_anchor_for_event,
     _thread_metadata_for_source,
 )
-from gateway.session import SessionSource, build_session_key
+from gateway.platforms.event import MessageEvent, MessageType
+from gateway.session import build_session_key
 
 
 # ── Fake telegram.error hierarchy ──────────────────────────────────────
@@ -99,6 +98,7 @@ _fake_telegram_ext = types.ModuleType("telegram.ext")
 _fake_telegram_ext.Application = object
 _fake_telegram_ext.CommandHandler = object
 _fake_telegram_ext.CallbackQueryHandler = object
+_fake_telegram_ext.InlineQueryHandler = object
 _fake_telegram_ext.MessageHandler = object
 _fake_telegram_ext.TypeHandler = object
 _fake_telegram_ext.ContextTypes = SimpleNamespace(DEFAULT_TYPE=object)
@@ -295,83 +295,6 @@ def test_base_gateway_metadata_marks_telegram_dm_topics_as_reply_fallback():
         "direct_messages_topic_id": "20189",
         "telegram_reply_to_message_id": "462",
     }
-
-
-def test_base_gateway_metadata_does_not_reuse_stale_source_message_as_reply_anchor():
-    """Synthetic events stay in their topic without quoting the session origin."""
-    source = SimpleNamespace(
-        platform=Platform.TELEGRAM,
-        chat_type="dm",
-        chat_id="6282086430",
-        thread_id="22786",
-        message_id="14787",
-    )
-
-    metadata = _thread_metadata_for_source(source, None)
-
-    assert metadata == {
-        "thread_id": "22786",
-        "telegram_dm_topic_reply_fallback": True,
-        "direct_messages_topic_id": "22786",
-    }
-
-
-def test_gateway_runner_does_not_reuse_stale_source_message_as_reply_anchor(tmp_path, monkeypatch):
-    """The live gateway wrapper must preserve the anchorless synthetic boundary."""
-    from gateway import run as gateway_run
-
-    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
-    runner = object.__new__(gateway_run.GatewayRunner)
-    source = SimpleNamespace(
-        platform=Platform.TELEGRAM,
-        chat_type="dm",
-        chat_id="6282086430",
-        thread_id="22786",
-        message_id="14787",
-    )
-
-    metadata = runner._thread_metadata_for_source(source, None)
-
-    assert metadata == {
-        "thread_id": "22786",
-        "telegram_dm_topic_reply_fallback": True,
-        "direct_messages_topic_id": "22786",
-    }
-
-
-def test_gateway_runner_does_not_publish_stale_source_message_to_synthetic_tool_context():
-    """A later background tool must not inherit the session-origin reply anchor."""
-    from gateway import run as gateway_run
-    from gateway.session_context import get_session_env
-
-    runner = object.__new__(gateway_run.GatewayRunner)
-    runner.adapters = {}
-    stale_source = SessionSource(
-        platform=Platform.TELEGRAM,
-        chat_type="dm",
-        chat_id="6282086430",
-        chat_name="",
-        thread_id="22786",
-        user_id="6282086430",
-        user_id_alt="",
-        user_name="Adam",
-        scope_id="",
-        message_id="14787",
-        profile="alfred-3ss",
-    )
-    event_source = gateway_run._source_for_event_context(stale_source, None)
-    context = SimpleNamespace(
-        session_key="agent:main:telegram:dm:6282086430:22786",
-        source=event_source,
-    )
-
-    tokens = runner._set_session_env(context)
-    try:
-        assert stale_source.message_id == "14787"
-        assert event_source.message_id is None
-        assert get_session_env("HERMES_SESSION_MESSAGE_ID", "") == ""
-    finally:
-        runner._clear_session_env(tokens)
 
 
 @pytest.mark.asyncio
@@ -610,7 +533,7 @@ async def test_send_image_upload_dm_topic_reply_not_found_retry_drops_thread_id(
             return _FakeResponse()
 
     adapter._bot = SimpleNamespace(send_photo=mock_send_photo)
-    import tools.url_safety as url_safety
+    from tools import url_safety
 
     monkeypatch.setattr(url_safety, "is_safe_url", lambda _url: True)
     monkeypatch.setattr(

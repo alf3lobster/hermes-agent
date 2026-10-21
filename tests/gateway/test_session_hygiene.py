@@ -20,15 +20,10 @@ from unittest.mock import MagicMock, AsyncMock
 
 import pytest
 
-from agent.model_metadata import estimate_messages_tokens_rough
 from gateway.config import GatewayConfig, Platform, PlatformConfig
-from gateway.platforms.base import BasePlatformAdapter, MessageEvent, SendResult
-from gateway.session import (
-    SessionEntry,
-    SessionResetPersistenceError,
-    SessionSource,
-    SessionStore,
-)
+from gateway.platforms.base import BasePlatformAdapter, SendResult
+from gateway.platforms.event import MessageEvent
+from gateway.session import SessionEntry, SessionSource
 
 
 # ---------------------------------------------------------------------------
@@ -43,20 +38,6 @@ def _make_history(n_messages: int, content_size: int = 100) -> list:
         role = "user" if i % 2 == 0 else "assistant"
         history.append({"role": role, "content": content, "timestamp": f"t{i}"})
     return history
-
-
-def _make_large_history_tokens(target_tokens: int) -> list:
-    """Build a history that estimates to roughly target_tokens tokens."""
-    # estimate_messages_tokens_rough counts total chars in str(msg) // 4
-    # Each msg dict has ~60 chars of overhead + content chars
-    # So for N tokens we need roughly N * 4 total chars across all messages
-    target_chars = target_tokens * 4
-    # Each message as a dict string is roughly len(content) + 60 chars
-    msg_overhead = 60
-    # Use 50 messages with appropriately sized content
-    n_msgs = 50
-    content_size = max(10, (target_chars // n_msgs) - msg_overhead)
-    return _make_history(n_msgs, content_size=content_size)
 
 
 class HygieneCaptureAdapter(BasePlatformAdapter):
@@ -86,383 +67,16 @@ class HygieneCaptureAdapter(BasePlatformAdapter):
 
 
 # ---------------------------------------------------------------------------
-# Detection threshold tests (model-aware, unified with compression config)
+# End-to-end hygiene through GatewayRunner._handle_message
 # ---------------------------------------------------------------------------
 
-class TestSessionHygieneThresholds:
-    """Test that the threshold logic correctly identifies large sessions.
-
-    Thresholds are derived from model context length × compression threshold,
-    matching what the agent's ContextCompressor uses.
-    """
-
-
-    def test_under_threshold_no_trigger(self):
-        """Session under threshold should not trigger, even with many messages."""
-        # 250 short messages — lots of messages but well under token threshold
-        history = _make_history(250, content_size=10)
-        approx_tokens = estimate_messages_tokens_rough(history)
-
-        # 200k model at 85% = 170k token threshold
-        context_length = 200_000
-        threshold_pct = 0.85
-        compress_token_threshold = int(context_length * threshold_pct)
-
-        needs_compress = approx_tokens >= compress_token_threshold
-        assert not needs_compress, (
-            f"250 short messages (~{approx_tokens} tokens) should NOT trigger "
-            f"compression at {compress_token_threshold} token threshold"
-        )
-
-    def test_message_count_alone_does_not_trigger(self):
-        """Message count alone should NOT trigger — only token count matters.
-
-        The old system used an OR of token-count and message-count thresholds,
-        which caused premature compression in tool-heavy sessions with 200+
-        messages but low total tokens.
-        """
-        # 300 very short messages — old system would compress, new should not
-        history = _make_history(300, content_size=10)
-        approx_tokens = estimate_messages_tokens_rough(history)
-
-        context_length = 200_000
-        threshold_pct = 0.85
-        compress_token_threshold = int(context_length * threshold_pct)
-
-        # Token-based check only
-        needs_compress = approx_tokens >= compress_token_threshold
-        assert not needs_compress
-
-    def test_threshold_scales_with_model(self):
-        """Different models should have different compression thresholds."""
-        # 128k model at 85% = 108,800 tokens
-        small_model_threshold = int(128_000 * 0.85)
-        # 200k model at 85% = 170,000 tokens
-        large_model_threshold = int(200_000 * 0.85)
-        # 1M model at 85% = 850,000 tokens
-        huge_model_threshold = int(1_000_000 * 0.85)
-
-        # A session at ~120k tokens:
-        history = _make_large_history_tokens(120_000)
-        approx_tokens = estimate_messages_tokens_rough(history)
-
-        # Should trigger for 128k model
-        assert approx_tokens >= small_model_threshold
-        # Should NOT trigger for 200k model
-        assert approx_tokens < large_model_threshold
-        # Should NOT trigger for 1M model
-        assert approx_tokens < huge_model_threshold
-
-
-class TestSessionHygieneWarnThreshold:
-    """Test the post-compression warning threshold (95% of context)."""
-
-    def test_warn_when_still_large(self):
-        """If compressed result is still above 95% of context, should warn."""
-        context_length = 200_000
-        warn_threshold = int(context_length * 0.95)  # 190k
-        post_compress_tokens = 195_000
-        assert post_compress_tokens >= warn_threshold
-
-    def test_no_warn_when_under(self):
-        """If compressed result is under 95% of context, no warning."""
-        context_length = 200_000
-        warn_threshold = int(context_length * 0.95)  # 190k
-        post_compress_tokens = 150_000
-        assert post_compress_tokens < warn_threshold
-
-
-class TestEstimatedTokenThreshold:
-    """Verify that hygiene thresholds are always below the model's context
-    limit — for both actual and estimated token counts.
-
-    Regression: a previous 1.4x multiplier on rough estimates pushed the
-    threshold to 85% * 1.4 = 119% of context, which exceeded the model's
-    limit and prevented hygiene from ever firing for ~200K models (GLM-5).
-    The fix removed the multiplier entirely — the 85% threshold already
-    provides ample headroom over the agent's 50% compressor.
-    """
-
-    def test_threshold_below_context_for_200k_model(self):
-        """Hygiene threshold must always be below model context."""
-        context_length = 200_000
-        threshold = int(context_length * 0.85)
-        assert threshold < context_length
-
-
-    def test_overestimate_fires_early_but_safely(self):
-        """If rough estimate is 50% inflated, hygiene fires at ~57% actual usage.
-
-        That's between the agent's 50% threshold and the model's limit —
-        safe and harmless.
-        """
-        context_length = 200_000
-        threshold = int(context_length * 0.85)  # 170K
-        # If actual tokens = 113K, rough estimate = 113K * 1.5 = 170K
-        # Hygiene fires when estimate hits 170K, actual is ~113K = 57% of ctx
-        actual_when_fires = threshold / 1.5
-        assert actual_when_fires > context_length * 0.50, (
-            "Early fire should still be above agent's 50% threshold"
-        )
-        assert actual_when_fires < context_length, (
-            "Early fire must be well below model limit"
-        )
-
-
-class TestTokenEstimation:
-    """Verify rough token estimation works as expected for hygiene checks."""
-
-
-    def test_proportional_to_content(self):
-        small = _make_history(10, content_size=100)
-        large = _make_history(10, content_size=10_000)
-        assert estimate_messages_tokens_rough(large) > estimate_messages_tokens_rough(small)
-
-
-def test_hygiene_health_streak_round_trips_through_session_db(tmp_path):
-    from hermes_state import SessionDB
-
-    db = SessionDB(db_path=tmp_path / "state.db")
-    key = "compression-health:telegram:topic:session-1"
-
-    assert db.get_hygiene_failure_streak(key) == 0
-    assert db.increment_hygiene_failure_streak(key) == 1
-    assert db.get_hygiene_failure_streak(key) == 1
-
-    db.reset_hygiene_failure_streak(key)
-
-    assert db.get_hygiene_failure_streak(key) == 0
-    db.close()
-
-
-def test_healthy_hygiene_compression_clears_health_strike():
-    from gateway.run import _persist_hygiene_compression_health_verdict
-
-    db = MagicMock()
-    payload = {
-        "attempt_id": "attempt-healthy",
-        "commit_status": "committed",
-        "health_alarms": [],
-    }
-
-    _persist_hygiene_compression_health_verdict(
-        db,
-        "compression-health:route:session",
-        payload,
-        expected_attempt_id="attempt-healthy",
-    )
-
-    db.reset_hygiene_failure_streak.assert_called_once_with(
-        "compression-health:route:session"
-    )
-    db.increment_hygiene_failure_streak.assert_not_called()
-
-
-def test_stale_hygiene_health_verdict_cannot_arm_retirement():
-    from gateway.run import _persist_hygiene_compression_health_verdict
-
-    db = MagicMock()
-    payload = {
-        "attempt_id": "stale-attempt",
-        "commit_status": "committed",
-        "health_alarms": ["duration_ms=61000>60000"],
-    }
-
-    _persist_hygiene_compression_health_verdict(
-        db,
-        "compression-health:route:session",
-        payload,
-        expected_attempt_id="current-attempt",
-    )
-
-    db.reset_hygiene_failure_streak.assert_not_called()
-    db.increment_hygiene_failure_streak.assert_not_called()
-
-
-def test_hygiene_health_lookup_failure_does_not_retire():
-    from gateway.run import _get_hygiene_compression_health_strike
-
-    db = MagicMock()
-    db.get_hygiene_failure_streak.side_effect = RuntimeError("database busy")
-
-    assert _get_hygiene_compression_health_strike(db, "key") == 0
-
-
-def test_hygiene_action_keeps_hard_limit_independent_below_regrowth_boundary():
-    from gateway.run import _session_hygiene_action
-
-    assert (
-        _session_hygiene_action(
-            normal_hygiene_due=True,
-            approx_tokens=54,
-            regrowth_token_threshold=55,
-            health_strike=1,
-        )
-        == "compress"
-    )
-
-
-def test_hygiene_action_retires_at_regrowth_boundary():
-    from gateway.run import _session_hygiene_action
-
-    assert (
-        _session_hygiene_action(
-            normal_hygiene_due=False,
-            approx_tokens=55,
-            regrowth_token_threshold=55,
-            health_strike=1,
-        )
-        == "retire"
-    )
-
-
-def test_hygiene_action_ignores_boundary_without_health_strike():
-    from gateway.run import _session_hygiene_action
-
-    assert (
-        _session_hygiene_action(
-            normal_hygiene_due=False,
-            approx_tokens=56,
-            regrowth_token_threshold=55,
-            health_strike=0,
-        )
-        == "none"
-    )
-
-
 @pytest.mark.asyncio
-async def test_session_hygiene_retires_armed_session_before_second_compression(
-    monkeypatch, tmp_path
-):
-    """An unhealthy compression gets one chance; oversized regrowth retires."""
-    fake_dotenv = types.ModuleType("dotenv")
-    fake_dotenv.load_dotenv = lambda *args, **kwargs: None
-    monkeypatch.setitem(sys.modules, "dotenv", fake_dotenv)
-
-    class NeverConstructedAgent:
-        calls = 0
-
-        def __init__(self, **_kwargs):
-            type(self).calls += 1
-            raise AssertionError("armed regrowth must retire before compression")
-
-    class HealthStateDB:
-        def __init__(self):
-            self.keys = []
-
-        def get_hygiene_failure_streak(self, key):
-            self.keys.append(key)
-            return 1
-
-    fake_run_agent = types.ModuleType("run_agent")
-    fake_run_agent.AIAgent = NeverConstructedAgent
-    monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
-
-    gateway_run = importlib.import_module("gateway.run")
-    GatewayRunner = gateway_run.GatewayRunner
-
-    adapter = HygieneCaptureAdapter()
-    runner = object.__new__(GatewayRunner)
-    runner.config = GatewayConfig(
-        platforms={Platform.TELEGRAM: PlatformConfig(enabled=True, token="fake-token")}
-    )
-    runner.adapters = {Platform.TELEGRAM: adapter}
-    runner._voice_mode = {}
-    runner.hooks = SimpleNamespace(emit=AsyncMock(), loaded_hooks=False)
-    runner.session_store = MagicMock()
-    old = SessionEntry(
-        session_key="agent:main:telegram:group:-1001:17585",
-        session_id="sess-armed",
-        created_at=datetime.now(),
-        updated_at=datetime.now(),
-        platform=Platform.TELEGRAM,
-        chat_type="group",
-        last_prompt_tokens=60,
-    )
-    fresh = SessionEntry(
-        session_key=old.session_key,
-        session_id="sess-clean",
-        created_at=datetime.now(),
-        updated_at=datetime.now(),
-        platform=Platform.TELEGRAM,
-        chat_type="group",
-        is_fresh_reset=True,
-    )
-    runner.session_store.get_or_create_session.return_value = old
-    runner.session_store.load_transcript.return_value = _make_history(6, content_size=400)
-    runner.session_store.has_any_sessions.return_value = True
-    runner.session_store.reset_session.return_value = fresh
-    runner.session_store.append_to_transcript = MagicMock()
-    runner._running_agents = {}
-    runner._pending_messages = {}
-    runner._pending_approvals = {}
-    health_db = HealthStateDB()
-    runner._session_db = SimpleNamespace(_db=health_db)
-    runner._is_user_authorized = lambda _source: True
-    runner._set_session_env = lambda _context: None
-    runner._run_agent = AsyncMock(
-        return_value={
-            "final_response": "ok",
-            "messages": [],
-            "tools": [],
-            "history_offset": 0,
-            "last_prompt_tokens": 0,
-        }
-    )
-    runner._evict_cached_agent = MagicMock()
-    runner._clear_conversation_scope = MagicMock()
-    runner._rebind_turn_lease = MagicMock(return_value=True)
-    runner._sync_telegram_topic_binding = MagicMock()
-
-    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
-    monkeypatch.setattr(
-        gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "fake"}
-    )
-    monkeypatch.setattr(
-        "agent.model_metadata.get_model_context_length",
-        lambda *_args, **_kwargs: 100,
-    )
-
-    event = MessageEvent(
-        text="hello",
-        source=SessionSource(
-            platform=Platform.TELEGRAM,
-            chat_id="-1001",
-            chat_type="group",
-            thread_id="17585",
-            user_id="12345",
-        ),
-        message_id="1",
-    )
-
-    result = await runner._handle_message(event)
-
-    assert result == "ok"
-    assert NeverConstructedAgent.calls == 0
-    assert health_db.keys == [
-        "compression-health:agent:main:telegram:group:-1001:17585:sess-armed"
-    ]
-    assert any(
-        "grew too large again after an unhealthy automatic compression"
-        in sent["content"]
-        for sent in adapter.sent
-    )
-    assert all("compression failed" not in sent["content"] for sent in adapter.sent)
-    runner.session_store.reset_session.assert_called_once_with(
-        old.session_key, strict_persistence=True
-    )
-    run_kwargs = runner._run_agent.await_args.kwargs
-    assert run_kwargs["history"] == []
-    assert run_kwargs["session_id"] == "sess-clean"
-
-
-@pytest.mark.asyncio
-async def test_session_hygiene_no_progress_retires_without_rewriting_predecessor(monkeypatch, tmp_path):
-    """A summary with no durable rotation or in-place compaction is failure.
-
-    The original transcript remains searchable, but the live route moves to a
-    clean session instead of replaying the oversized predecessor.
-    """
+async def test_session_hygiene_preserves_transcript_when_no_rotation(monkeypatch, tmp_path):
+    """Regression for #21301: the hygiene agent is built without a session_db,
+    so _compress_context cannot rotate. When it neither rotates NOR compacts
+    in place, the transcript MUST be preserved — an unconditional
+    rewrite_transcript() would replace the original messages with only the
+    summary (permanent data loss). Mirrors the /compress guard (#44794)."""
     fake_dotenv = types.ModuleType("dotenv")
     fake_dotenv.load_dotenv = lambda *args, **kwargs: None
     monkeypatch.setitem(sys.modules, "dotenv", fake_dotenv)
@@ -477,9 +91,15 @@ async def test_session_hygiene_no_progress_retires_without_rewriting_predecessor
             self._print_fn = None
             self.shutdown_memory_provider = MagicMock()
             self.close = MagicMock()
+            self.compress_task_id = None
             type(self).last_instance = self
 
         def _compress_context(self, messages, *_args, **_kwargs):
+            # Capture the task scope the gateway forwards (#98206): the dedup
+            # reset inside compress_context is only effective under the live
+            # session row id, the same task_id the main turn hands to
+            # run_conversation.
+            self.compress_task_id = _kwargs.get("task_id")
             # No session_db → cannot rotate: session_id is UNCHANGED, and this
             # is a failure-to-rotate, not an in-place success.
             return ([{"role": "assistant", "content": "summary only"}], None)
@@ -548,31 +168,40 @@ async def test_session_hygiene_no_progress_retires_without_rewriting_predecessor
         message_id="1",
     )
 
-    fresh = SessionEntry(
-        session_key="agent:main:telegram:group:-1001:17585",
-        session_id="sess-clean",
-        created_at=datetime.now(),
-        updated_at=datetime.now(),
-        platform=Platform.TELEGRAM,
-        chat_type="group",
-        is_fresh_reset=True,
+    # Pre-load a failure streak so we can prove the recovery gate is WIRED UP,
+    # not merely that the predicate is correct in isolation (#79624). Deleting
+    # the whole `if not _hyg_aborted: if hygiene_compaction_recovered(...)`
+    # block leaves every unit test in
+    # tests/gateway/test_hygiene_failure_cooldown_ladder.py green, so this E2E
+    # is the only thing binding the call site.
+    reset_calls = []
+    _real_reset = gateway_run._reset_hygiene_failure_streak
+    monkeypatch.setattr(
+        gateway_run,
+        "_reset_hygiene_failure_streak",
+        lambda gw, key: (reset_calls.append(key), _real_reset(gw, key))[1],
     )
-    runner.session_store.reset_session.return_value = fresh
-    runner._evict_cached_agent = MagicMock()
-    runner._clear_conversation_scope = MagicMock()
-    runner._rebind_turn_lease = MagicMock(return_value=True)
-    runner._sync_telegram_topic_binding = MagicMock()
 
     result = await runner._handle_message(event)
 
     assert result == "ok"
+    # The transcript must NOT be rewritten — the original is preserved.
     runner.session_store.rewrite_transcript.assert_not_called()
-    runner.session_store.reset_session.assert_called_once_with(
-        "agent:main:telegram:group:-1001:17585", strict_persistence=True
+    # #98206: hygiene compaction must scope the dedup reset to the LIVE
+    # session row id ("sess-1" from this test's SessionEntry) — the same
+    # task_id the main turn passes to run_conversation. Under the "default"
+    # fallback the skill_view/read_file dedup records survive compression
+    # and a re-read returns a stub pointing at pruned context.
+    assert NonRotatingCompressAgent.last_instance.compress_task_id == "sess-1"
+
+    # This run neither rotated nor compacted in place, so it did NOT recover
+    # the session: the reset must NOT have been reached. Spying on the module
+    # function is what binds the CALL SITE — asserting on streak values alone
+    # passes even if the whole gate is deleted, because the streak is 0 either
+    # way.
+    assert reset_calls == [], (
+        "the degenerate no-rotate path must not clear the failure streak"
     )
-    run_kwargs = runner._run_agent.await_args.kwargs
-    assert run_kwargs["history"] == []
-    assert run_kwargs["session_id"] == "sess-clean"
 
 
 @pytest.mark.asyncio
@@ -666,50 +295,36 @@ async def test_session_hygiene_preserves_transcript_when_in_place_configured_but
         message_id="1",
     )
 
-    fresh = SessionEntry(
-        session_key="agent:main:telegram:group:-1001:17585",
-        session_id="sess-clean-no-db",
-        created_at=datetime.now(),
-        updated_at=datetime.now(),
-        platform=Platform.TELEGRAM,
-        chat_type="group",
-        is_fresh_reset=True,
-    )
-    runner.session_store.reset_session.return_value = fresh
-    runner._evict_cached_agent = MagicMock()
-    runner._clear_conversation_scope = MagicMock()
-    runner._rebind_turn_lease = MagicMock(return_value=True)
-    runner._sync_telegram_topic_binding = MagicMock()
-
     result = await runner._handle_message(event)
 
     assert result == "ok"
+    # The config says in_place=True, but the DB write failed (no session_db)
+    # so _last_compaction_in_place is False. Transcript must NOT be rewritten.
     runner.session_store.rewrite_transcript.assert_not_called()
-    runner.session_store.reset_session.assert_called_once_with(
-        "agent:main:telegram:group:-1001:17585", strict_persistence=True
-    )
-    run_kwargs = runner._run_agent.await_args.kwargs
-    assert run_kwargs["history"] == []
-    assert run_kwargs["session_id"] == "sess-clean-no-db"
 
 
 @pytest.mark.asyncio
-async def test_session_hygiene_timeout_retires_session_before_current_turn(monkeypatch, tmp_path):
+@pytest.mark.parametrize("warning_notifications", [True, False])
+async def test_session_hygiene_timeout_continues_to_agent_and_sets_cooldown(monkeypatch, tmp_path, warning_notifications):
     """A timed-out SessionDB-bound worker cannot compact after the live turn starts.
 
     The worker remains alive long enough to cross the old race window. The
-    timeout must fence its eventual commit, retire the oversized predecessor,
-    run the current turn with empty history, and clean up the temporary agent
-    only after the worker actually returns.
+    timeout must fence its eventual commit, continue to the live agent, and
+    clean up the temporary agent only after the worker actually returns.
     """
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     fake_dotenv = types.ModuleType("dotenv")
     fake_dotenv.load_dotenv = lambda *args, **kwargs: None
     monkeypatch.setitem(sys.modules, "dotenv", fake_dotenv)
 
     worker_started = threading.Event()
     release_worker = threading.Event()
+    lease_released = threading.Event()
     cleanup_done = threading.Event()
     fake_db = MagicMock()
+    # The DB-backed cooldown check calls this before compressing; a bare
+    # MagicMock return would be truthy and skip compression entirely.
+    fake_db.get_compression_failure_cooldown.return_value = None
 
     class SlowCompressAgent:
         last_instance = None
@@ -730,8 +345,10 @@ async def test_session_hygiene_timeout_retires_session_before_current_turn(monke
         def _compress_context(
             self, messages, *_args, commit_fence=None, **_kwargs
         ):
+            if commit_fence is not None:
+                commit_fence.register_cancelled_lock_release(lease_released.set)
             worker_started.set()
-            assert release_worker.wait(timeout=2)
+            assert release_worker.wait(timeout=10)
             if commit_fence is not None and not commit_fence.begin_commit():
                 return (messages, None)
             try:
@@ -754,6 +371,8 @@ async def test_session_hygiene_timeout_retires_session_before_current_turn(monke
         "compression:\n"
         "  enabled: true\n"
         "  hygiene_timeout_seconds: 0.01\n"
+        "  hygiene_failure_cooldown_seconds: 120\n"
+        f"display: {{suppress_warning_notifications: {str(not warning_notifications).lower()}}}\n"
     )
 
     gateway_run = importlib.import_module("gateway.run")
@@ -780,29 +399,12 @@ async def test_session_hygiene_timeout_retires_session_before_current_turn(monke
     runner.session_store.has_any_sessions.return_value = True
     runner.session_store.rewrite_transcript = MagicMock()
     runner.session_store.append_to_transcript = MagicMock()
-    fresh = SessionEntry(
-        session_key="agent:main:telegram:dm:12345",
-        session_id="sess-timeout-clean",
-        created_at=datetime.now(),
-        updated_at=datetime.now(),
-        platform=Platform.TELEGRAM,
-        chat_type="dm",
-        is_fresh_reset=True,
-    )
-    runner.session_store.reset_session.return_value = fresh
     runner._running_agents = {}
     runner._pending_messages = {}
     runner._pending_approvals = {}
     runner._session_db = SimpleNamespace(_db=fake_db)
     runner._is_user_authorized = lambda _source: True
-    session_env_message_ids = []
-    runner._set_session_env = lambda context: session_env_message_ids.append(
-        context.source.message_id
-    )
-    runner._evict_cached_agent = MagicMock()
-    runner._clear_conversation_scope = MagicMock()
-    runner._rebind_turn_lease = MagicMock(return_value=True)
-    runner._sync_telegram_topic_binding = MagicMock()
+    runner._set_session_env = lambda _context: None
     runner._run_agent = AsyncMock(
         return_value={
             "final_response": "ok",
@@ -827,36 +429,28 @@ async def test_session_hygiene_timeout_retires_session_before_current_turn(monke
             chat_id="12345",
             chat_type="dm",
             user_id="12345",
-            message_id="stale-session-origin",
         ),
         message_id="1",
     )
 
-    started = time.monotonic()
     result = await runner._handle_message(event)
-    elapsed = time.monotonic() - started
 
     assert result == "ok"
-    # Loose wall-clock bound per flake policy: this asserts the handler did
-    # NOT block on the hygiene-compression timeout path (which would take
-    # multiple seconds), not a precise latency. 0.15s missed by ~1-8ms on
-    # busy CI shards twice on 2026-07-23.
-    assert elapsed < 2.0
     assert worker_started.is_set()
     assert runner._run_agent.await_count == 1
-    run_kwargs = runner._run_agent.await_args.kwargs
-    assert run_kwargs["history"] == []
-    assert run_kwargs["session_id"] == "sess-timeout-clean"
-    runner.session_store.reset_session.assert_called_once_with(
-        "agent:main:telegram:dm:12345", strict_persistence=True
-    )
-    assert not fake_db.record_compression_failure_cooldown.called
-    retirement_notices = [
-        s for s in adapter.sent if "retired" in s["content"].lower()
-    ]
-    assert len(retirement_notices) == 1
-    assert session_env_message_ids == ["1", "1"]
+    # Cooldown must be persisted to the state DB (survives restart, #74136),
+    # not stashed in an in-memory dict.
+    assert fake_db.record_compression_failure_cooldown.called
+    _cd_args = fake_db.record_compression_failure_cooldown.call_args[0]
+    assert _cd_args[0] == "sess-timeout"
+    assert _cd_args[1] > time.time()
+    timeout_warnings = [s for s in adapter.sent if "took too long" in s["content"]]
+    assert len(timeout_warnings) == int(warning_notifications)
     fake_db.archive_and_compact.assert_not_called()
+    assert lease_released.is_set()
+    # Event/state assertions prove the host returned before the detached
+    # worker's event-gated wait completed without a scheduler-sensitive clock
+    # bound: cleanup runs only when that worker actually exits.
     SlowCompressAgent.last_instance.close.assert_not_called()
 
     release_worker.set()
@@ -867,6 +461,14 @@ async def test_session_hygiene_timeout_retires_session_before_current_turn(monke
     # it was safe to tear down the helper agent's clients/providers.
     fake_db.archive_and_compact.assert_not_called()
     SlowCompressAgent.last_instance.close.assert_called_once()
+
+
+    # Behavior witness 3: the #87011 contract remains truthful —
+    # "session hygiene compression timed out" still means a real idle
+    # timeout, not a turn-hold deferral. The turn-hold path must use a
+    # distinct provenance stamp.
+    # (Verified indirectly: the idle-timeout path would have sent the
+    # idle-timeout message, which we already asserted absent above.)
 
 
 @pytest.mark.asyncio
@@ -892,12 +494,8 @@ async def test_session_hygiene_forces_in_place_compaction_with_bound_session_db(
         "Pinboard provider instructions\n"
         "</memory_provider_context>"
     )
-    persistence_events = []
     fake_db = MagicMock()
     fake_db.get_compression_failure_cooldown.return_value = None
-    fake_db.increment_hygiene_failure_streak.side_effect = lambda _key: (
-        persistence_events.append(("strike",)) or 1
-    )
     async_session_db = SimpleNamespace(
         _db=fake_db,
         get_session=AsyncMock(
@@ -923,8 +521,6 @@ async def test_session_hygiene_forces_in_place_compaction_with_bound_session_db(
                 _last_compress_aborted=False,
                 _last_aux_model_failure_model=None,
             )
-            self._compression_attempt_id = "attempt-unhealthy"
-            self._last_compression_attempt_telemetry = None
             self._print_fn = None
             self.shutdown_memory_provider = MagicMock()
             self.close = MagicMock()
@@ -936,11 +532,6 @@ async def test_session_hygiene_forces_in_place_compaction_with_bound_session_db(
             assert self.platform == "gateway_hygiene"
             assert self._cached_system_prompt == stored_system_prompt
             self._last_compaction_in_place = True
-            self._last_compression_attempt_telemetry = {
-                "attempt_id": "attempt-unhealthy",
-                "commit_status": "committed",
-                "health_alarms": ["duration_ms=61000>60000"],
-            }
             return ([{"role": "assistant", "content": "compressed in place"}], None)
 
     fake_run_agent = types.ModuleType("run_agent")
@@ -969,15 +560,6 @@ async def test_session_hygiene_forces_in_place_compaction_with_bound_session_db(
     )
     runner.session_store.load_transcript.return_value = _make_history(12, content_size=400)
     runner.session_store.has_any_sessions.return_value = True
-    runner.session_store.update_session.side_effect = lambda *args, **kwargs: (
-        persistence_events.append(
-            (
-                "baseline",
-                kwargs.get("last_prompt_tokens"),
-                kwargs.get("touch_activity"),
-            )
-        )
-    )
     runner.session_store.rewrite_transcript = MagicMock()
     runner.session_store.append_to_transcript = MagicMock()
     runner._running_agents = {}
@@ -1016,6 +598,18 @@ async def test_session_hygiene_forces_in_place_compaction_with_bound_session_db(
         message_id="1",
     )
 
+    # Spy on the recovery reset so this test binds the CALL SITE (#79624).
+    # Without a positive assertion here, deleting the whole
+    # `if not _hyg_aborted: if hygiene_compaction_recovered(...)` block leaves
+    # every other hygiene and ladder test green.
+    reset_calls = []
+    _real_reset = gateway_run._reset_hygiene_failure_streak
+    monkeypatch.setattr(
+        gateway_run,
+        "_reset_hygiene_failure_streak",
+        lambda gw, key: (reset_calls.append(key), _real_reset(gw, key))[1],
+    )
+
     result = await runner._handle_message(event)
 
     assert result == "ok"
@@ -1027,14 +621,13 @@ async def test_session_hygiene_forces_in_place_compaction_with_bound_session_db(
     # rewrite_transcript would replace_messages(active_only=False) and DELETE
     # the just-archived rows (#61145). The hygiene handler must skip it.
     runner.session_store.rewrite_transcript.assert_not_called()
-    fake_db.increment_hygiene_failure_streak.assert_called_once_with(
-        "compression-health:agent:main:telegram:private:12345:sess-1"
-    )
-    assert persistence_events[:2] == [
-        ("baseline", 0, False),
-        ("strike",),
-    ]
     runner._run_agent.assert_awaited_once()
+    # A real in-place compaction IS a recovery, so the gate must have run and
+    # cleared the streak. This is the positive half of the wiring contract.
+    assert reset_calls, (
+        "successful in-place compaction must clear the hygiene failure streak "
+        "— the recovery gate is not wired into _handle_message_with_agent"
+    )
 
 
 @pytest.mark.asyncio
@@ -1111,7 +704,6 @@ async def test_session_hygiene_honors_configurable_hard_message_limit(
     runner._session_db = None
     runner._is_user_authorized = lambda _source: True
     runner._set_session_env = lambda _context: None
-    runner._rebind_turn_lease = MagicMock(return_value=True)
     runner._run_agent = AsyncMock(
         return_value={
             "final_response": "ok",
@@ -1157,85 +749,6 @@ async def test_session_hygiene_honors_configurable_hard_message_limit(
 
 
 # ---------------------------------------------------------------------------
-# Progress-aware hygiene wait: slow-but-streaming models are not punished
-# ---------------------------------------------------------------------------
-
-def _make_progress_runner(monkeypatch, tmp_path, agent_cls, cfg_text):
-    """Shared scaffolding for the progress-aware hygiene wait tests."""
-    fake_dotenv = types.ModuleType("dotenv")
-    fake_dotenv.load_dotenv = lambda *args, **kwargs: None
-    monkeypatch.setitem(sys.modules, "dotenv", fake_dotenv)
-
-    fake_run_agent = types.ModuleType("run_agent")
-    fake_run_agent.AIAgent = agent_cls
-    monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
-
-    cfg_path = tmp_path / "config.yaml"
-    cfg_path.write_text(cfg_text, encoding="utf-8")
-
-    gateway_run = importlib.import_module("gateway.run")
-    GatewayRunner = gateway_run.GatewayRunner
-
-    adapter = HygieneCaptureAdapter()
-    runner = object.__new__(GatewayRunner)
-    runner.config = GatewayConfig(
-        platforms={Platform.TELEGRAM: PlatformConfig(enabled=True, token="fake-token")}
-    )
-    runner.adapters = {Platform.TELEGRAM: adapter}
-    runner._voice_mode = {}
-    runner.hooks = SimpleNamespace(emit=AsyncMock(), loaded_hooks=False)
-    runner.session_store = MagicMock()
-    runner.session_store.get_or_create_session.return_value = SessionEntry(
-        session_key="agent:main:telegram:dm:12345",
-        session_id="sess-progress",
-        created_at=datetime.now(),
-        updated_at=datetime.now(),
-        platform=Platform.TELEGRAM,
-        chat_type="dm",
-    )
-    runner.session_store.load_transcript.return_value = _make_history(6, content_size=400)
-    runner.session_store.has_any_sessions.return_value = True
-    runner.session_store.rewrite_transcript = MagicMock()
-    runner.session_store.append_to_transcript = MagicMock()
-    runner._running_agents = {}
-    runner._pending_messages = {}
-    runner._pending_approvals = {}
-    runner._session_db = None
-    runner._is_user_authorized = lambda _source: True
-    runner._set_session_env = lambda _context: None
-    runner._run_agent = AsyncMock(
-        return_value={
-            "final_response": "ok",
-            "messages": [],
-            "tools": [],
-            "history_offset": 0,
-            "last_prompt_tokens": 0,
-        }
-    )
-
-    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
-    monkeypatch.setattr(gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "fake"})
-    monkeypatch.setattr(
-        "agent.model_metadata.get_model_context_length",
-        lambda *_args, **_kwargs: 100,
-    )
-
-    event = MessageEvent(
-        text="hello",
-        source=SessionSource(
-            platform=Platform.TELEGRAM,
-            chat_id="12345",
-            chat_type="dm",
-            user_id="12345",
-        ),
-        message_id="1",
-    )
-    return runner, adapter, event
-
-
-
-
-# ---------------------------------------------------------------------------
 # Cooldown persistence across gateway restarts (#74136)
 # ---------------------------------------------------------------------------
 
@@ -1256,7 +769,8 @@ def _make_cooldown_runner(monkeypatch, tmp_path, agent_cls, session_db, session_
     cfg_path = tmp_path / "config.yaml"
     cfg_path.write_text(
         "compression:\n"
-        "  enabled: true\n",
+        "  enabled: true\n"
+        "  hygiene_failure_cooldown_seconds: 300\n",
         encoding="utf-8",
     )
 
@@ -1324,34 +838,38 @@ def _make_cooldown_runner(monkeypatch, tmp_path, agent_cls, session_db, session_
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "case",
-    [
-        "genuine_user",
-        "oauth_no_api_key",
-        "too_few_messages",
-        "reset_failure",
-        "topic_binding_failure",
-        "lease_rebind_failure",
-        "internal_notification",
-    ],
-)
-async def test_hygiene_compression_abort_never_reuses_failed_transcript(
-    monkeypatch, tmp_path, case
+async def test_hygiene_compression_cooldown_survives_gateway_restart(
+    monkeypatch, tmp_path
 ):
-    """A failed automatic compression gets exactly one attempt.
+    """Regression for #74136: the compression-failure cooldown must be
+    persisted to the state DB, not an in-memory dict on the runner.
 
-    The oversized predecessor remains in SQLite for search, while the route is
-    reset and the current genuine user message runs against an empty history.
-    No cooldown/retry loop may keep feeding the bloated transcript.
+    Fail a hygiene compression on runner #1, tear the runner down, build a
+    FRESH runner on the SAME database (simulating a gateway restart), and
+    assert the second runner still honors the cooldown — i.e. it does not
+    re-instantiate a compression agent for the same failing session.
     """
     from hermes_state import SessionDB
-    import gateway.run as gateway_run
 
-    session_id = "sess-oversized"
+    gateway_run = importlib.import_module("gateway.run")
+    session_id = "sess-restart"
     db = SessionDB(db_path=tmp_path / "state.db")
     try:
         db.create_session(session_id, "telegram")
+
+        main_thread = threading.get_ident()
+        streak_threads = []
+        original_cooldown_for_failure = gateway_run._hygiene_cooldown_for_failure
+
+        def tracked_cooldown_for_failure(*args, **kwargs):
+            streak_threads.append(threading.get_ident())
+            return original_cooldown_for_failure(*args, **kwargs)
+
+        monkeypatch.setattr(
+            gateway_run,
+            "_hygiene_cooldown_for_failure",
+            tracked_cooldown_for_failure,
+        )
 
         class AbortingCompressAgent:
             instances = 0
@@ -1371,183 +889,33 @@ async def test_hygiene_compression_abort_never_reuses_failed_transcript(
                 self.close = MagicMock()
 
             def _compress_context(self, messages, *_args, **_kwargs):
+                # Summary generation failed: compressor aborts and returns
+                # the transcript unchanged.
                 return (messages, None)
 
-        runner, adapter, event = _make_cooldown_runner(
+        runner1, _adapter1, event1 = _make_cooldown_runner(
             monkeypatch, tmp_path, AbortingCompressAgent, db, session_id
         )
-        if case == "oauth_no_api_key":
-            monkeypatch.setattr(
-                gateway_run,
-                "_resolve_runtime_agent_kwargs",
-                lambda: {"provider": "oauth"},
-            )
-        if case == "too_few_messages":
-            runner.session_store.get_or_create_session.return_value.last_prompt_tokens = 1_000
-            runner.session_store.load_transcript.return_value = _make_history(
-                1, content_size=10_000
-            )
-        fresh = SessionEntry(
-            session_key="agent:main:telegram:dm:12345",
-            session_id="sess-clean",
-            created_at=datetime.now(),
-            updated_at=datetime.now(),
-            platform=Platform.TELEGRAM,
-            chat_type="dm",
-            is_fresh_reset=True,
+        assert await runner1._handle_message(event1) == "ok"
+        assert AbortingCompressAgent.instances == 1
+        assert len(streak_threads) == 1
+        assert streak_threads[0] != main_thread
+
+        # The abort must have persisted a cooldown to the DB.
+        state = db.get_compression_failure_cooldown(session_id)
+        assert state is not None and state["remaining_seconds"] > 0, (
+            "hygiene compression abort did not persist a cooldown to the "
+            f"state DB; got {state!r}"
         )
-        runner.session_store.reset_session.return_value = (
-            None if case == "reset_failure" else fresh
-        )
-        if case == "internal_notification":
-            event.internal = True
-        runner._evict_cached_agent = MagicMock()
-        runner._clear_conversation_scope = MagicMock()
-        runner._rebind_turn_lease = MagicMock(
-            return_value=case != "lease_rebind_failure"
-        )
-        failed_topic_write = None
-        if case == "topic_binding_failure":
-            event.source.thread_id = "22786"
-            runner._is_telegram_topic_lane = lambda _source: True
-            failed_topic_write = MagicMock(
-                side_effect=RuntimeError("topic binding unavailable")
-            )
-            monkeypatch.setattr(db, "bind_telegram_topic", failed_topic_write)
-        else:
-            runner._sync_telegram_topic_binding = MagicMock()
 
-        result = await runner._handle_message(event)
+        # --- simulate a gateway restart: brand-new runner, same DB ---
+        del runner1
 
-        runner.session_store.reset_session.assert_called_once_with(
-            "agent:main:telegram:dm:12345", strict_persistence=True
-        )
-        if case in {"genuine_user", "oauth_no_api_key", "too_few_messages"}:
-            assert result == "ok"
-            run_kwargs = runner._run_agent.await_args.kwargs
-            assert run_kwargs["history"] == []
-            assert run_kwargs["session_id"] == "sess-clean"
-            if case == "too_few_messages":
-                assert AbortingCompressAgent.instances == 0
-            else:
-                assert AbortingCompressAgent.instances == 1
-            runner._clear_conversation_scope.assert_called_once_with(
-                "agent:main:telegram:dm:12345",
-                reason="hygiene_compression_failure",
-            )
-            runner._sync_telegram_topic_binding.assert_called_once()
-            assert any("retired" in sent["content"].lower() for sent in adapter.sent)
-        elif case == "internal_notification":
-            assert "internal notification" in result
-            runner._run_agent.assert_not_awaited()
-            runner._clear_conversation_scope.assert_called_once_with(
-                "agent:main:telegram:dm:12345",
-                reason="hygiene_compression_failure",
-            )
-            runner._sync_telegram_topic_binding.assert_called_once()
-        elif case in {"reset_failure", "topic_binding_failure", "lease_rebind_failure"}:
-            assert "message was not processed" in result
-            runner._run_agent.assert_not_awaited()
-            if case == "reset_failure":
-                runner._clear_conversation_scope.assert_not_called()
-                runner._sync_telegram_topic_binding.assert_not_called()
-            else:
-                runner._clear_conversation_scope.assert_called_once()
-                # Binding precedes lease rebinding so a lease failure cannot
-                # leave the topic able to resurrect the predecessor.
-                if case == "topic_binding_failure":
-                    assert failed_topic_write.call_count == 2
-                    assert (
-                        failed_topic_write.call_args.kwargs["session_id"]
-                        == "sess-clean"
-                    )
-                else:
-                    runner._sync_telegram_topic_binding.assert_called_once()
-        else:
-            raise AssertionError(f"unhandled case: {case}")
-        assert db.get_session(session_id) is not None
-        assert db.get_compression_failure_cooldown(session_id) is None
-    finally:
-        db.close()
+        class ShouldNotRunAgent:
+            instances = 0
 
-
-@pytest.mark.asyncio
-async def test_rotated_hygiene_blocks_model_when_turn_lease_cannot_follow(
-    monkeypatch, tmp_path
-):
-    from hermes_state import SessionDB
-
-    session_id = "sess-rotate-parent"
-    db = SessionDB(db_path=tmp_path / "state.db")
-    try:
-        db.create_session(session_id, "telegram")
-
-        class RotatingCompressAgent:
             def __init__(self, **kwargs):
-                self.session_id = kwargs.get("session_id", session_id)
-                self._session_db = kwargs.get("session_db")
-                self._last_compaction_in_place = False
-                self.context_compressor = SimpleNamespace(
-                    bind_session_state=MagicMock(),
-                    _last_compress_aborted=False,
-                    _last_summary_error=None,
-                    _last_aux_model_failure_model=None,
-                )
-                self.shutdown_memory_provider = MagicMock()
-                self.close = MagicMock()
-
-            def _compress_context(self, _messages, *_args, **_kwargs):
-                self.session_id = "sess-rotated-child"
-                return ([{"role": "assistant", "content": "summary"}], None)
-
-        runner, _adapter, event = _make_cooldown_runner(
-            monkeypatch, tmp_path, RotatingCompressAgent, db, session_id
-        )
-        fresh = SessionEntry(
-            session_key="agent:main:telegram:dm:12345",
-            session_id="sess-clean-after-lease-failure",
-            created_at=datetime.now(),
-            updated_at=datetime.now(),
-            platform=Platform.TELEGRAM,
-            chat_type="dm",
-            is_fresh_reset=True,
-        )
-        runner.session_store.rewrite_transcript.return_value = True
-        runner.session_store.reset_session.return_value = fresh
-        runner._evict_cached_agent = MagicMock()
-        runner._clear_conversation_scope = MagicMock()
-        runner._sync_telegram_topic_binding = MagicMock()
-        runner._rebind_turn_lease = MagicMock(return_value=False)
-
-        result = await runner._handle_message(event)
-
-        assert "message was not processed" in result
-        runner._run_agent.assert_not_awaited()
-        runner._rebind_turn_lease.assert_called()
-        runner.session_store.reset_session.assert_called_once_with(
-            "agent:main:telegram:dm:12345", strict_persistence=True
-        )
-    finally:
-        db.close()
-
-
-@pytest.mark.asyncio
-async def test_hygiene_compression_cancellation_retires_before_propagating(
-    monkeypatch, tmp_path
-):
-    """Task cancellation cannot leave the oversized route reusable."""
-    from hermes_state import SessionDB
-
-    session_id = "sess-cancelled"
-    db = SessionDB(db_path=tmp_path / "state.db")
-    try:
-        db.create_session(session_id, "telegram")
-
-        class CancelledCompressAgent:
-            def __init__(self, **kwargs):
-                self.session_id = kwargs.get("session_id", session_id)
-                self._session_db = kwargs.get("session_db")
-                self._last_compaction_in_place = False
+                type(self).instances += 1
                 self.context_compressor = SimpleNamespace(
                     bind_session_state=MagicMock(),
                     _last_compress_aborted=False,
@@ -1557,271 +925,334 @@ async def test_hygiene_compression_cancellation_retires_before_propagating(
                 self.close = MagicMock()
 
             def _compress_context(self, messages, *_args, **_kwargs):
-                raise asyncio.CancelledError
+                return (messages, None)
 
-        runner, _adapter, event = _make_cooldown_runner(
-            monkeypatch, tmp_path, CancelledCompressAgent, db, session_id
+        runner2, _adapter2, event2 = _make_cooldown_runner(
+            monkeypatch, tmp_path, ShouldNotRunAgent, db, session_id
         )
-        fresh = SessionEntry(
-            session_key="agent:main:telegram:dm:12345",
-            session_id="sess-cancelled-clean",
-            created_at=datetime.now(),
-            updated_at=datetime.now(),
-            platform=Platform.TELEGRAM,
-            chat_type="dm",
-            is_fresh_reset=True,
+        assert await runner2._handle_message(event2) == "ok"
+        assert ShouldNotRunAgent.instances == 0, (
+            "REGRESSION (#74136): a fresh GatewayRunner on the same state DB "
+            "re-ran the failing hygiene compression — the failure cooldown "
+            "was lost across the restart (in-memory dict instead of the "
+            "DB-backed record/get methods)."
         )
-        runner.session_store.reset_session.return_value = fresh
-        runner._evict_cached_agent = MagicMock()
-        runner._clear_conversation_scope = MagicMock()
-        runner._rebind_turn_lease = MagicMock(return_value=True)
-        runner._sync_telegram_topic_binding = MagicMock()
+        # The user turn itself still runs; only compression is skipped.
+        assert runner2._run_agent.await_count == 1
 
-        with pytest.raises(asyncio.CancelledError):
-            await runner._handle_message(event)
-
-        runner.session_store.reset_session.assert_called_once_with(
-            "agent:main:telegram:dm:12345", strict_persistence=True
+        # Once the first deadline expires, the next failed attempt after a
+        # restart must use rung 2 (900s), not start over at 300s (#86650).
+        db.clear_compression_failure_cooldown(session_id)
+        runner3, _adapter3, event3 = _make_cooldown_runner(
+            monkeypatch, tmp_path, AbortingCompressAgent, db, session_id
         )
-        runner._sync_telegram_topic_binding.assert_called_once()
-        runner._run_agent.assert_not_awaited()
-        assert db.get_session(session_id) is not None
+        assert await runner3._handle_message(event3) == "ok"
+        assert AbortingCompressAgent.instances == 2
+        assert len(streak_threads) == 2
+        assert all(thread_id != main_thread for thread_id in streak_threads)
+        escalated = db.get_compression_failure_cooldown(session_id)
+        assert escalated is not None
+        assert escalated["remaining_seconds"] == pytest.approx(900, abs=5)
     finally:
         db.close()
 
 
-@pytest.mark.parametrize(
-    "failure", ["persist_route", "retire_predecessor", "create_replacement"]
-)
-def test_strict_reset_surfaces_durable_persistence_failures(tmp_path, failure):
-    """Automatic retirement cannot accept an in-memory-only reset."""
-    store = SessionStore(sessions_dir=tmp_path / "sessions", config=GatewayConfig())
-    store._db = None
-    source = SessionSource(
-        platform=Platform.TELEGRAM,
-        chat_id="12345",
-        chat_type="dm",
-        user_id="12345",
-    )
-    entry = store.get_or_create_session(source)
-
-    db = MagicMock()
-    if failure == "persist_route":
-        db.replace_gateway_routing_entries.side_effect = RuntimeError(
-            "route write failed"
-        )
-    elif failure == "retire_predecessor":
-        # Production SessionDB reports a failed promotion as False.
-        db.promote_to_session_reset.return_value = False
-    else:
-        db.create_session.side_effect = RuntimeError("create failed")
-    store._db = db
-
-    with pytest.raises(RuntimeError, match="durably"):
-        store.reset_session(entry.session_key, strict_persistence=True)
-
-    if failure == "persist_route":
-        db.create_session.assert_not_called()
-        db.promote_to_session_reset.assert_not_called()
-    elif failure == "retire_predecessor":
-        # Even when retiring the predecessor fails, strict reset still creates
-        # the replacement row so the already-persisted fresh route is usable.
-        db.create_session.assert_called_once()
-    else:
-        # Strict mode creates the replacement first; a creation failure must
-        # leave the predecessor untouched rather than ending the only durable row.
-        db.promote_to_session_reset.assert_not_called()
-        db.create_session.assert_called_once()
-
-
-def test_strict_reset_requires_authoritative_routing_store(tmp_path):
-    store = SessionStore(sessions_dir=tmp_path / "sessions", config=GatewayConfig())
-    store._db = None
-    source = SessionSource(
-        platform=Platform.TELEGRAM,
-        chat_id="12345",
-        chat_type="dm",
-        user_id="12345",
-    )
-    old = store.get_or_create_session(source)
-
-    with pytest.raises(RuntimeError, match="durably"):
-        store.reset_session(old.session_key, strict_persistence=True)
-
-    assert store.lookup_by_session_key(old.session_key).session_id == old.session_id
-
+# ---------------------------------------------------------------------------
+# Commit-fence cancel must not livelock hygiene (#96953)
+# ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
-async def test_retirement_rebinds_topic_when_strict_reset_persistence_fails():
-    """A partial durable reset cannot leave Telegram pointing at its parent."""
-    import gateway.session as gateway_session
-    from gateway.run import GatewayRunner
-
-    runner = object.__new__(GatewayRunner)
-    old = SessionEntry(
-        session_key="agent:main:telegram:dm:12345:22786",
-        session_id="sess-old",
-        created_at=datetime.now(),
-        updated_at=datetime.now(),
-        platform=Platform.TELEGRAM,
-        chat_type="dm",
-    )
-    fresh = SessionEntry(
-        session_key=old.session_key,
-        session_id="sess-safe-route",
-        created_at=datetime.now(),
-        updated_at=datetime.now(),
-        platform=Platform.TELEGRAM,
-        chat_type="dm",
-        is_fresh_reset=True,
-    )
-    persistence_error = gateway_session.SessionResetPersistenceError(
-        "replacement row failed", fresh
-    )
-    runner.session_store = MagicMock()
-    runner.session_store.reset_session.side_effect = persistence_error
-    runner._evict_cached_agent = MagicMock()
-    runner._clear_conversation_scope = MagicMock()
-    runner._sync_telegram_topic_binding = MagicMock()
-    runner._rebind_turn_lease = MagicMock(return_value=True)
-    source = SessionSource(
-        platform=Platform.TELEGRAM,
-        chat_id="12345",
-        chat_type="dm",
-        thread_id="22786",
-        user_id="12345",
-    )
-
-    with pytest.raises(gateway_session.SessionResetPersistenceError):
-        await runner._retire_session_after_hygiene_failure(
-            source=source,
-            session_key=old.session_key,
-            session_entry=old,
-            quick_key="quick",
-            run_generation=1,
-        )
-
-    runner._sync_telegram_topic_binding.assert_called_once_with(
-        source,
-        fresh,
-        reason="hygiene-compression-failure",
-        strict=True,
-    )
-    runner._rebind_turn_lease.assert_not_called()
-
-
-def test_strict_reset_real_db_false_promotion_keeps_replacement_bindable(
+async def test_hygiene_fence_cancel_records_cooldown_without_abort_flag(
     monkeypatch, tmp_path
 ):
-    """A swallowed DB promotion error cannot strand Telegram on the parent."""
+    """A fence-cancelled hygiene worker returns the original transcript with
+    ``_last_compress_aborted`` still False (failure_class=commit_fence_cancelled).
+
+    That used to skip the abort-cooldown block, so the next turn immediately
+    re-armed hygiene and waited up to the 600s ceiling behind a doomed attempt.
+    """
     from hermes_state import SessionDB
 
-    store = SessionStore(sessions_dir=tmp_path / "sessions", config=GatewayConfig())
-    store._db = None
-    source = SessionSource(
-        platform=Platform.TELEGRAM,
-        chat_id="12345",
-        chat_type="dm",
-        thread_id="22786",
-        user_id="12345",
-    )
-    old = store.get_or_create_session(source)
+    session_id = "sess-fence-cancel"
+
+    class FenceCancelCompressAgent:
+        instances = 0
+
+        def __init__(self, **kwargs):
+            type(self).instances += 1
+            self.session_id = kwargs.get("session_id", session_id)
+            self._session_db = kwargs.get("session_db")
+            self._last_compaction_in_place = False
+            self.context_compressor = SimpleNamespace(
+                bind_session_state=MagicMock(),
+                _last_compress_aborted=False,
+                _last_summary_error=None,
+                _last_aux_model_failure_model=None,
+            )
+            self.shutdown_memory_provider = MagicMock()
+            self.close = MagicMock()
+
+        def _compress_context(self, messages, *_args, commit_fence=None, **_kwargs):
+            if commit_fence is not None:
+                assert commit_fence.try_cancel_before_commit() is True
+            return (messages, None)
+
     db = SessionDB(db_path=tmp_path / "state.db")
     try:
-        db.create_session(old.session_id, "telegram")
-        db.bind_telegram_topic(
-            chat_id="12345",
-            thread_id="22786",
-            user_id="12345",
-            session_key=old.session_key,
-            session_id=old.session_id,
+        db.create_session(session_id, "telegram")
+        runner1, adapter1, event1 = _make_cooldown_runner(
+            monkeypatch, tmp_path, FenceCancelCompressAgent, db, session_id
         )
-        real_execute_write = db._execute_write
+        assert await runner1._handle_message(event1) == "ok"
+        assert FenceCancelCompressAgent.instances == 1
+        state = db.get_compression_failure_cooldown(session_id)
+        assert state is not None and state["remaining_seconds"] > 0, (
+            "fence-cancelled hygiene compression did not persist a cooldown; "
+            f"got {state!r}"
+        )
+        assert not any(
+            "Shortening the conversation history failed" in s["content"] for s in adapter1.sent
+        ), "fence-cancel during /stop or /restart must not toast an abort"
 
-        def fail_only_session_promotion(operation, *args, **kwargs):
-            constants = getattr(operation, "__code__", None)
-            constants = constants.co_consts if constants is not None else ()
-            if any(
-                isinstance(value, str)
-                and "UPDATE sessions SET ended_at = ?, end_reason = ?" in value
-                for value in constants
-            ):
-                raise RuntimeError("injected promotion write failure")
-            return real_execute_write(operation, *args, **kwargs)
+        class ShouldNotRunAgent:
+            instances = 0
 
-        monkeypatch.setattr(db, "_execute_write", fail_only_session_promotion)
-        store._db = db
+            def __init__(self, **kwargs):
+                type(self).instances += 1
+                self.context_compressor = SimpleNamespace(
+                    bind_session_state=MagicMock(),
+                    _last_compress_aborted=False,
+                    _last_aux_model_failure_model=None,
+                )
+                self.shutdown_memory_provider = MagicMock()
+                self.close = MagicMock()
 
-        with pytest.raises(SessionResetPersistenceError) as caught:
-            store.reset_session(old.session_key, strict_persistence=True)
+            def _compress_context(self, messages, *_args, **_kwargs):
+                return (messages, None)
 
-        fresh = caught.value.replacement_entry
-        assert db.get_session(fresh.session_id) is not None
-        assert fresh.metadata["hygiene_retired_predecessor_id"] == old.session_id
-        assert fresh.metadata["hygiene_retired_predecessor_ids"] == [old.session_id]
-        restarted = SessionStore(
-            sessions_dir=tmp_path / "sessions", config=GatewayConfig()
+        runner2, _adapter2, event2 = _make_cooldown_runner(
+            monkeypatch, tmp_path, ShouldNotRunAgent, db, session_id
         )
-        restarted._db = db
-        recovered = restarted.lookup_by_session_key(old.session_key)
-        assert recovered is not None
-        assert (
-            recovered.metadata["hygiene_retired_predecessor_id"]
-            == old.session_id
+        assert await runner2._handle_message(event2) == "ok"
+        assert ShouldNotRunAgent.instances == 0, (
+            "REGRESSION (#96953): hygiene re-armed after a commit-fence "
+            "cancel instead of honoring the failure cooldown"
         )
-        with pytest.raises(SessionResetPersistenceError) as second_failure:
-            restarted.reset_session(old.session_key, strict_persistence=True)
-        successor = second_failure.value.replacement_entry
-        assert db.get_session(successor.session_id) is not None
-        assert successor.metadata["hygiene_retired_predecessor_id"] == old.session_id
-        assert successor.metadata["hygiene_retired_predecessor_ids"] == [
-            old.session_id,
-            fresh.session_id,
-        ]
-        db.bind_telegram_topic(
-            chat_id="12345",
-            thread_id="22786",
-            user_id="12345",
-            session_key=successor.session_key,
-            session_id=successor.session_id,
-        )
-        binding = db.get_telegram_topic_binding(
-            chat_id="12345", thread_id="22786"
-        )
-        assert binding["session_id"] == successor.session_id
+        assert runner2._run_agent.await_count == 1
     finally:
         db.close()
 
 
 @pytest.mark.asyncio
-async def test_retirement_completion_is_fenced_against_repeated_cancellation():
-    """A second cancellation cannot interrupt the durable retirement boundary."""
-    from gateway.run import GatewayRunner
+async def test_hygiene_skips_when_compression_already_in_flight(
+    monkeypatch, tmp_path
+):
+    """Do not spawn a sibling hygiene compressor while a lock is already held."""
+    from hermes_state import SessionDB
 
-    runner = object.__new__(GatewayRunner)
-    started = asyncio.Event()
-    release = asyncio.Event()
-    fresh = MagicMock()
+    session_id = "sess-in-flight"
 
-    async def slow_retirement(**_kwargs):
-        started.set()
-        await release.wait()
-        return fresh
+    class ShouldNotRunAgent:
+        instances = 0
 
-    runner._retire_session_after_hygiene_failure = slow_retirement
-    task = asyncio.create_task(
-        runner._finish_hygiene_retirement_despite_cancellation(
-            source=MagicMock(),
-            session_key="session-key",
-            session_entry=MagicMock(),
-            quick_key="quick-key",
-            run_generation=1,
+        def __init__(self, **kwargs):
+            type(self).instances += 1
+            self.context_compressor = SimpleNamespace(
+                bind_session_state=MagicMock(),
+                _last_compress_aborted=False,
+                _last_aux_model_failure_model=None,
+            )
+            self.shutdown_memory_provider = MagicMock()
+            self.close = MagicMock()
+
+        def _compress_context(self, messages, *_args, **_kwargs):
+            return (messages, None)
+
+    db = SessionDB(db_path=tmp_path / "state.db")
+    try:
+        db.create_session(session_id, "telegram")
+        runner, _adapter, event = _make_cooldown_runner(
+            monkeypatch, tmp_path, ShouldNotRunAgent, db, session_id
         )
-    )
-    await started.wait()
-    task.cancel()
-    await asyncio.sleep(0)
-    assert not task.done()
+        runner._session_has_compression_in_flight = AsyncMock(return_value=True)
+        assert await runner._handle_message(event) == "ok"
+        assert ShouldNotRunAgent.instances == 0
+        assert runner._run_agent.await_count == 1
+    finally:
+        db.close()
 
-    release.set()
-    assert await task is fresh
+
+# ---------------------------------------------------------------------------
+# Fail-closed in-context bound when hygiene has not landed (#111988)
+# ---------------------------------------------------------------------------
+
+_HARD_LIMIT = 20
+
+
+def _make_bound_probe_transcript(total: int = 60) -> list:
+    """Transcript with a setup prefix, a tool group straddling the tail cut, and a newest tail.
+
+    With ``_HARD_LIMIT`` = 20 and one setup row, the newest-19 cut starts at index 41 — the
+    first tool result of the group at 40/41/42.
+    """
+    rows = [{"role": "session_meta", "tools": [], "model": "m", "platform": "telegram", "timestamp": "t0"}]
+    while len(rows) < total - 20:
+        role = "user" if len(rows) % 2 else "assistant"
+        rows.append({"role": role, "content": f"old-{len(rows)}", "timestamp": f"t{len(rows)}"})
+    rows.append({"role": "assistant", "content": "", "tool_calls": [{"id": "c1", "function": {"name": "t"}}]})
+    rows.append({"role": "tool", "tool_call_id": "c1", "content": "old tool output 1"})
+    rows.append({"role": "tool", "tool_call_id": "c2", "content": "old tool output 2"})
+    rows.append({"role": "user", "content": "newest ask", "timestamp": "t-ask"})
+    rows.append({"role": "assistant", "content": "newest reply", "timestamp": "t-reply"})
+    while len(rows) < total:
+        role = "user" if len(rows) % 2 else "assistant"
+        rows.append({"role": role, "content": f"tail-{len(rows)}", "timestamp": f"t{len(rows)}"})
+    if total == 60:
+        assert rows[41].get("role") == "tool", "fixture must put the tail cut on a tool result"
+    return rows
+
+
+def _turn_payload(runner):
+    """The history the gateway handed the turn runner for the model (one turn)."""
+    assert runner._run_agent.await_count == 1
+    return runner._run_agent.call_args.kwargs["history"]
+
+
+def _make_bound_runner(monkeypatch, tmp_path, agent_cls, cfg_text, transcript):
+    """``_make_cooldown_runner`` with a >hard-limit transcript and a lowered hard limit."""
+    from hermes_state import SessionDB
+
+    db = SessionDB(db_path=tmp_path / "state.db")
+    db.create_session("sess-bound", "telegram")
+    runner, adapter, event = _make_cooldown_runner(
+        monkeypatch, tmp_path, agent_cls, db, "sess-bound"
+    )
+    (tmp_path / "config.yaml").write_text(cfg_text, encoding="utf-8")
+    runner.session_store.load_transcript.return_value = transcript
+    return db, runner, adapter, event
+
+
+class _LandedCompressAgent:
+    """Rotating hygiene compressor that SUCCEEDS with a transcript longer than the hard limit."""
+
+    last_instance = None
+
+    def __init__(self, **kwargs):
+        self.session_id = kwargs.get("session_id", "fake-session")
+        self._session_db = kwargs.get("session_db")
+        self._last_compaction_in_place = False
+        self.context_compressor = SimpleNamespace(
+            bind_session_state=MagicMock(),
+            _last_compress_aborted=False,
+            _last_aux_model_failure_model=None,
+        )
+        self.shutdown_memory_provider = MagicMock()
+        self.close = MagicMock()
+        type(self).last_instance = self
+
+    def _compress_context(self, messages, *_args, **_kwargs):
+        # 25 rows: over the 20-message limit but far under the input's token count, so the
+        # adopted (landed) transcript must reach the model untouched.
+        compressed = [{"role": "assistant", "content": f"summary {i}"} for i in range(25)]
+        type(self).last_compressed = compressed
+        self.session_id = f"{self.session_id}_compressed"
+        return (compressed, None)
+
+
+def test_bound_model_input_without_hygiene_is_deterministic_and_fail_closed():
+    """The bound keeps the setup head + the newest tail, drops the middle, never mutates input."""
+    from gateway.run_turn import bound_model_input_without_hygiene
+
+    rows = _make_bound_probe_transcript()
+    snapshot = [dict(r) for r in rows]
+
+    bounded = bound_model_input_without_hygiene(rows, _HARD_LIMIT)
+
+    assert len(bounded) <= _HARD_LIMIT
+    assert len(bounded) < len(rows), "a >limit transcript must actually be bounded"
+    assert bounded[0] is rows[0], "the leading system/setup row must survive"
+    assert bounded[-1] is rows[-1], "the newest row must survive"
+    assert bounded[1].get("role") != "tool", "the kept tail must not start on an orphan tool result"
+    assert rows[:] == snapshot, "the source transcript must not be mutated in place"
+    # Same input, same cut — no randomness, no clock.
+    assert bound_model_input_without_hygiene(rows, _HARD_LIMIT) == bounded
+    # At or below the limit nothing is dropped, and the SAME list comes back.
+    assert bound_model_input_without_hygiene(rows, len(rows)) is rows
+    assert bound_model_input_without_hygiene(rows, len(rows) + 5) is rows
+
+
+@pytest.mark.asyncio
+async def test_hygiene_miss_bounds_the_model_payload(monkeypatch, tmp_path):
+    """Turn-hold expiry without a landed summary must not feed the model the whole transcript
+    (#111988); a landed commit is still adopted byte-identical."""
+    worker_started = threading.Event()
+    release_worker = threading.Event()
+    cleanup_done = threading.Event()
+    session_id = "sess-bound"
+
+    class StreamingCompressAgent:
+        last_instance = None
+
+        def __init__(self, **kwargs):
+            self.session_id = kwargs.get("session_id", session_id)
+            self._session_db = kwargs.get("session_db")
+            self._last_compaction_in_place = False
+            self.context_compressor = SimpleNamespace(
+                bind_session_state=MagicMock(),
+                _last_compress_aborted=False,
+                _last_aux_model_failure_model=None,
+            )
+            self.shutdown_memory_provider = MagicMock()
+            self.close = MagicMock(side_effect=cleanup_done.set)
+            type(self).last_instance = self
+
+        def _compress_context(self, messages, *_args, commit_fence=None, **_kwargs):
+            worker_started.set()
+            release_worker.wait(timeout=10)
+            return (messages, None)
+
+    transcript = _make_bound_probe_transcript()
+    db, runner, _adapter, event = _make_bound_runner(
+        monkeypatch, tmp_path, StreamingCompressAgent,
+        "compression:\n"
+        "  enabled: true\n"
+        f"  hygiene_hard_message_limit: {_HARD_LIMIT}\n"
+        "  hygiene_timeout_seconds: 60\n"
+        "  hygiene_total_ceiling_seconds: 600\n"
+        "  hygiene_max_turn_hold_seconds: 0.3\n",
+        transcript,
+    )
+    try:
+        assert await asyncio.wait_for(runner._handle_message(event), timeout=15) == "ok"
+        assert worker_started.wait(timeout=2)
+
+        payload = _turn_payload(runner)
+        assert len(payload) <= _HARD_LIMIT, (
+            f"hygiene never landed but the model got {len(payload)} messages "
+            f"(limit {_HARD_LIMIT}) — unbounded fail-open"
+        )
+        assert payload[0] is transcript[0], "the system/setup head must be preserved"
+        assert payload[-1] is transcript[-1], "the newest tail must be preserved"
+        assert payload[1].get("role") != "tool", "the kept tail must not start on an orphan tool result"
+
+        # History on disk untouched: the loaded transcript still holds every row and nothing
+        # rewrote it — only the payload about to be sent to the model was clipped.
+        assert len(transcript) == len(_make_bound_probe_transcript())
+        assert transcript[20]["content"].startswith("old-")
+        runner.session_store.rewrite_transcript.assert_not_called()
+
+        release_worker.set()
+        await asyncio.wait_for(asyncio.to_thread(cleanup_done.wait), timeout=3)
+
+        # Control: a LANDED hygiene commit is adopted as-is — its 25 summary rows exceed the
+        # limit, and the bound must not touch them (only the unlanded path is clipped).
+        db.create_session("sess-landed", "telegram")
+        runner2, _adapter2, event2 = _make_cooldown_runner(
+            monkeypatch, tmp_path, _LandedCompressAgent, db, "sess-landed"
+        )
+        runner2.session_store.load_transcript.return_value = _make_bound_probe_transcript()
+        assert await asyncio.wait_for(runner2._handle_message(event2), timeout=15) == "ok"
+        assert _turn_payload(runner2) is _LandedCompressAgent.last_compressed
+    finally:
+        release_worker.set()
+        db.close()

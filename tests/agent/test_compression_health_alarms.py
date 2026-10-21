@@ -159,6 +159,7 @@ def test_finalized_health_payload_is_retained_on_agent():
         "post_message_tokens": 2_000,
         "message_tokens_reclaimed": 8_000,
         "event": "compression_attempt",
+        "route": "hermes",
         "session_id": "session-health",
         "total_duration_ms": 61_000,
         "commit_status": "committed",

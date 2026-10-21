@@ -20,7 +20,6 @@ from __future__ import annotations
 import json
 import logging
 import re
-import threading
 from collections import deque
 from pathlib import Path
 from typing import Any, Dict, List
@@ -159,20 +158,17 @@ class HolographicMemoryProvider(MemoryProvider):
 
     def save_config(self, values, hermes_home):
         """Write config to config.yaml under plugins.hermes-memory-store."""
-        from pathlib import Path
         config_path = Path(hermes_home) / "config.yaml"
         try:
-            import yaml
             # Write-back round-trip: raw read is correct (merged defaults
             # must not be persisted back into the user's file).
-            from hermes_cli.config import read_user_config_raw
+            from hermes_cli.config import atomic_config_write, read_user_config_raw
             existing = read_user_config_raw(config_path)
             existing.setdefault("plugins", {})
             existing["plugins"]["hermes-memory-store"] = values
-            with open(config_path, "w", encoding="utf-8") as f:
-                yaml.dump(existing, f, default_flow_style=False)
-        except Exception:
-            pass
+            atomic_config_write(config_path, existing)
+        except Exception as exc:
+            logger.warning("Holographic config write failed: %s", exc)
 
     def get_config_schema(self):
         from hermes_constants import display_hermes_home
@@ -275,12 +271,13 @@ class HolographicMemoryProvider(MemoryProvider):
 
         if count % every_n == 0 and sid not in self._extracting_sessions:
             messages_snapshot = list(buf)
-            t = threading.Thread(
-                target=self._auto_extract_from_buffer,
+            from agent.memory_provider import spawn_context_thread
+
+            spawn_context_thread(
+                self._auto_extract_from_buffer,
                 args=(sid, messages_snapshot),
-                daemon=True,
-            )
-            t.start()
+                name=f"holographic-extract-{sid}",
+            ).start()
 
     def _auto_extract_from_buffer(self, session_id: str, messages: list) -> None:
         """Daemon-thread extraction from the per-session sliding window buffer."""
@@ -560,9 +557,12 @@ Output only FACT lines. No preamble, no explanation."""
 
         max_turns=0 means include all turns.
         """
+        from agent.context_compressor import is_compaction_summary_message
+
         relevant = [
             m for m in messages
             if m.get("role") in ("user", "assistant")
+            and not is_compaction_summary_message(m)
         ]
         if max_turns > 0:
             relevant = relevant[-max_turns:]
