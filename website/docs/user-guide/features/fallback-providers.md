@@ -35,9 +35,14 @@ If you'd rather edit the YAML directly, add a top-level `fallback_providers` lis
 fallback_providers:
   - provider: openrouter
     model: anthropic/claude-sonnet-4
+    tool_policy: none  # optional: omit tool schemas and reject emitted tool calls
 ```
 
 Each entry requires both `provider` and `model`. Entries missing either field are ignored.
+`tool_policy` defaults to `inherit`, which preserves the session's normal tools. Set it to
+`none` for a response-only fallback: Hermes sends that route no tool schemas and rejects any
+tool call it nevertheless emits before dispatch. Invalid `tool_policy` values fail closed as
+`none`. This is the recommended setting for local or otherwise less-trusted fallback models.
 
 When a rate-limit response names its reset time, the primary is benched until exactly then (a provider that says nothing gets the exponential 60 s → 4 h backoff). Optionally, skip the switch when the primary reopens soon:
 

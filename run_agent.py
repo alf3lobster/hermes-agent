@@ -1315,7 +1315,10 @@ class AIAgent(
         self._executing_tools = True  # allow _vprint during tool execution even with stream consumers
         try:
             with scoped_connection_surface(agent_connection_surface(self)):
-                if len(tool_calls) <= 1:
+                if getattr(self, "_provider_fallback_tool_policy", "inherit") == "none":
+                    from agent.tool_executor import block_fallback_tool_calls
+                    block_fallback_tool_calls(self, assistant_message, messages, effective_task_id)
+                elif len(tool_calls) <= 1:
                     self._execute_tool_calls_sequential(*args)
                 else:
                     from agent.tool_dispatch_helpers import _plan_tool_batch_segments

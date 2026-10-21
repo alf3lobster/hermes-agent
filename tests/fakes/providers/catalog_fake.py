@@ -66,6 +66,7 @@ class CatalogFake:
         models_status: int = 200,
         models_hang_s: float = 0.0,
         fail_status: int | None = None,
+        force_tool_call_without_tools: bool = False,
         routes: dict[str, str] | None = None,
     ) -> None:
         self.routes = dict(routes or {})
@@ -76,6 +77,7 @@ class CatalogFake:
         self.models_status = models_status
         self.models_hang_s = models_hang_s
         self.fail_status = fail_status
+        self.force_tool_call_without_tools = force_tool_call_without_tools
         self.requests: list[Recorded] = []
         # Egress sentinel: when a child process gets ``HTTPS_PROXY``/``HTTP_PROXY`` = ``origin``
         # (see ``proxy_env``), every request aimed at a NON-loopback host lands here instead of
@@ -140,7 +142,7 @@ def _has_tool_result(dialect: str, body: dict[str, Any]) -> bool:
 
 def _plan(fake: CatalogFake, dialect: str, body: dict[str, Any]) -> tuple[str, str | None]:
     """(``text``, ``tool_call_id`` or None) for the next model turn."""
-    if not body.get("tools"):
+    if not body.get("tools") and not fake.force_tool_call_without_tools:
         return "Catalog aux answer", None
     if _has_tool_result(dialect, body):
         return fake.final_text, None

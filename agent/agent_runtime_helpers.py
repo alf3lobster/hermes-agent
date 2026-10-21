@@ -1429,8 +1429,7 @@ def restore_primary_runtime(agent) -> bool:
     """Restore the primary runtime at the start of a new turn so fallback stays turn-scoped
     (long-lived CLI agents and the gateway's cached agents)."""
     if not agent._fallback_activated:
-        # Reset the index even without activation: a failed _try_activate_fallback() can strand
-        # _fallback_index past the chain end and silently block future fallbacks (#20465).
+        # A failed activation may leave the index past the chain end; always reset it.
         agent._fallback_index = 0
         _revert_credential_rotation(agent)
         return False
@@ -1471,6 +1470,9 @@ def restore_primary_runtime(agent) -> bool:
         fallback_route = (getattr(agent, "model", ""), getattr(agent, "provider", ""))
     previous_model, previous_provider = (str(v or "unknown") for v in fallback_route)
     provider_fallback_active = bool(getattr(agent, "_provider_fallback_active", False))
+    fallback_tool_policy = getattr(agent, "_provider_fallback_tool_policy", "inherit")
+    failed_restore_tool_policy = "none" if "none" in (
+        fallback_tool_policy, (rt or {}).get("fallback_tool_policy")) else "inherit"
     try:
         from agent.route_binding import reinstall_primary_runtime
         reinstall_primary_runtime(
@@ -1480,7 +1482,6 @@ def restore_primary_runtime(agent) -> bool:
         agent._provider_fallback_active = False
         agent._provider_fallback_route = None
         if provider_fallback_active:
-            # Notification surfaces are best-effort and must never undo a successful restore.
             with contextlib.suppress(Exception):
                 agent._emit_diagnostic_status(
                     f"✅ Primary model restored: {agent.model} via {agent.provider}; "
@@ -1488,11 +1489,11 @@ def restore_primary_runtime(agent) -> bool:
                 )
         return True
     except Exception as e:
+        agent._provider_fallback_tool_policy = failed_restore_tool_policy
         logger.warning("Failed to restore primary runtime: %s", e)
         return False
 
 
-# Transient transport failures worth one more attempt with a rebuilt client / connection pool.
 _TRANSIENT_TRANSPORT_ERRORS = frozenset({
     "ReadTimeout", "ConnectTimeout", "PoolTimeout", "ConnectError", "ReadError", "RemoteProtocolError",
     "APIConnectionError", "APITimeoutError",
@@ -2378,8 +2379,7 @@ def _update_switch_compressor(agent, custom_providers, effective_context_length,
     except Exception:
         _restore_switch_snapshot(agent, snapshot)
         raise
-    # Outside the rollback guard: a probe hiccup must not undo a good switch. Eager, so the aux
-    # clamp lands before the first compaction on the new window, not after it (#114707).
+    # Outside rollback: a probe hiccup must not undo a good switch; eager so the aux clamp lands first (#114707).
     from agent.conversation_compression import revalidate_compression_feasibility
     revalidate_compression_feasibility(agent)
 
@@ -2389,10 +2389,10 @@ def _finish_switch(agent, new_provider, old_norm, new_norm) -> None:
     agent._fallback_activated = False
     agent._provider_fallback_active = False
     agent._provider_fallback_route = None
+    agent._provider_fallback_tool_policy = "inherit"
     agent._fallback_index = 0
     agent._credential_pool_revert_id = None
-    # On a deliberate provider swap, prune fallback entries targeting the OLD or NEW primary;
-    # otherwise a failed turn silently re-activates the provider the user just rejected.
+    # Prune OLD/NEW primary entries so a failed turn cannot reactivate the rejected provider.
     fallback_chain = list(getattr(agent, "_fallback_chain", []) or [])
     if old_norm and new_norm and old_norm != new_norm:
         fallback_chain = [
@@ -2482,8 +2482,8 @@ def switch_model(
     # short-circuiting the freshly selected healthy provider.
     from agent.chat_completion_helpers import _reset_stale_streak
     _reset_stale_streak(agent)
-    agent._primary_runtime = _build_primary_runtime_snapshot(agent, api_mode)
     _finish_switch(agent, new_provider, old_norm, new_norm)
+    agent._primary_runtime = _build_primary_runtime_snapshot(agent, api_mode)
     logger.info(
         "Model switched in-place: %s (%s) -> %s (%s)",
         old_model, old_provider, new_model, new_provider,

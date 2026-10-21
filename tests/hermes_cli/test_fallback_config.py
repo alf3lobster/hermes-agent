@@ -1,7 +1,19 @@
 """Tests for hermes_cli/fallback_config.py — fallback entry API-key resolution."""
 
 from agent.secret_scope import reset_secret_scope, set_secret_scope
-from hermes_cli.fallback_config import effective_runtime_provider, resolve_entry_api_key
+from hermes_cli.fallback_config import effective_runtime_provider, fallback_tool_policy, resolve_entry_api_key
+
+
+class TestFallbackToolPolicy:
+    def test_absent_policy_preserves_existing_tool_behavior(self):
+        assert fallback_tool_policy({"provider": "openrouter", "model": "glm"}) == "inherit"
+
+    def test_none_policy_disables_tools(self):
+        assert fallback_tool_policy({"tool_policy": " none "}) == "none"
+
+    def test_malformed_policy_fails_closed(self):
+        assert fallback_tool_policy({"tool_policy": "everything"}) == "none"
+        assert fallback_tool_policy({"tool_policy": True}) == "none"
 
 
 class TestResolveEntryApiKey:

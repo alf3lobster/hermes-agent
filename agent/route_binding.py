@@ -1,12 +1,13 @@
-"""Bind a provider route onto a live agent in place, and put the primary route back.
+"""Construct and publish provider routes without exposing partial runtime state.
 
-``bind_route_entry`` is the fallback chain's swap (client, pool, compressor, reasoning,
-extra_body) shared with per-turn routes such as the voice-chat model; ``reinstall_primary_runtime``
-is the inverse that ``restore_primary_runtime`` runs once its gates pass.
+``bind_route_entry`` stages the fallback/voice route (client, pool, compressor, reasoning,
+extra_body, tool policy) and publishes it only after construction succeeds;
+``reinstall_primary_runtime`` applies the same rule when restoring the primary route.
 """
 
 from __future__ import annotations
 
+import copy
 import logging
 from typing import Any, Dict, Optional, Tuple
 
@@ -15,7 +16,29 @@ from utils import base_url_host_matches
 logger = logging.getLogger(__name__)
 
 
-def bind_route_entry(agent: Any, entry: dict[str, Any], provider: str, model: str) -> Optional[tuple[str, str]]:
+def _stage_route_agent(agent: Any) -> Any:
+    """A copy-on-write agent used to construct one complete route before it becomes live."""
+    staged = copy.copy(agent)
+    compressor = getattr(agent, "context_compressor", None)
+    if compressor is not None:
+        staged.context_compressor = copy.copy(compressor)
+    if hasattr(agent, "_transport_cache"):
+        staged._transport_cache = dict(agent._transport_cache)
+    for name in ("request_overrides", "reasoning_config", "runtime_capabilities"):
+        value = getattr(agent, name, None)
+        if isinstance(value, dict):
+            setattr(staged, name, copy.deepcopy(value))
+    return staged
+
+
+def _commit_route_agent(agent: Any, staged: Any) -> None:
+    """Publish the already-built route, including its policy, in one state update."""
+    vars(agent).update(vars(staged))
+
+
+def _bind_route_entry_in_place(
+    agent: Any, entry: dict[str, Any], provider: str, model: str,
+) -> Optional[tuple[str, str]]:
     """Swap ``agent`` onto ``entry`` (a fallback-chain-shaped dict). Returns ``(old_model,
     old_provider)``, or None when the provider has no usable client. Sets ``_fallback_activated``
     so the next turn's ``restore_primary_runtime`` reverts it; raises on a failed swap."""
@@ -93,10 +116,27 @@ def bind_route_entry(agent: Any, entry: dict[str, Any], provider: str, model: st
     return old_model, old_provider
 
 
-def reinstall_runtime_snapshot(agent: Any, rt: dict[str, Any]) -> None:
+def bind_route_entry(agent: Any, entry: dict[str, Any], provider: str, model: str) -> Optional[tuple[str, str]]:
+    """Construct a complete route off-agent and publish it only after every bind step succeeds."""
+    from hermes_cli.fallback_config import fallback_tool_policy
+    staged = _stage_route_agent(agent)
+    staged._provider_fallback_tool_policy = fallback_tool_policy(entry)
+    bound = _bind_route_entry_in_place(staged, entry, provider, model)
+    if bound is not None:
+        _commit_route_agent(agent, staged)
+    return bound
+
+
+def _reinstall_runtime_snapshot_in_place(agent: Any, rt: dict[str, Any]) -> None:
     """Put ``agent`` on the runtime recorded in ``rt`` (a ``_primary_runtime``-shaped snapshot):
     identity, client, caching flags, compressor, reasoning and prompt identity. Credential pool
     and fallback bookkeeping are the caller's. Raises on failure."""
+    target_tool_policy = rt.get("fallback_tool_policy", "inherit")
+    current_tool_policy = getattr(agent, "_provider_fallback_tool_policy", "inherit")
+    # Until the route restore is complete, retain the stricter authority of the two routes.
+    agent._provider_fallback_tool_policy = (
+        "none" if "none" in (current_tool_policy, target_tool_policy) else "inherit"
+    )
     from agent.agent_runtime_helpers import (
         _apply_primary_runtime_fields, _rebuild_primary_client, _restore_runtime_capabilities,
     )
@@ -134,6 +174,22 @@ def reinstall_runtime_snapshot(agent: Any, rt: dict[str, Any]) -> None:
     # Undo the identity rewrite so the prompt is byte-identical to the stored copy again
     # (prefix cache match).
     rewrite_prompt_model_identity(agent, rt["model"], rt["provider"])
+    agent._provider_fallback_tool_policy = target_tool_policy
+
+
+def reinstall_runtime_snapshot(agent: Any, rt: dict[str, Any]) -> None:
+    """Build a restored route off-agent; a failed restore leaves the live identity untouched."""
+    current_tool_policy = getattr(agent, "_provider_fallback_tool_policy", "inherit")
+    target_tool_policy = rt.get("fallback_tool_policy", "inherit")
+    staged = _stage_route_agent(agent)
+    try:
+        _reinstall_runtime_snapshot_in_place(staged, rt)
+    except Exception:
+        agent._provider_fallback_tool_policy = (
+            "none" if "none" in (current_tool_policy, target_tool_policy) else "inherit"
+        )
+        raise
+    _commit_route_agent(agent, staged)
 
 
 def reinstall_primary_runtime(
@@ -142,10 +198,20 @@ def reinstall_primary_runtime(
 ) -> None:
     """Put ``agent`` back on its ``_primary_runtime`` snapshot ``rt`` and clear the fallback state."""
     from agent.agent_runtime_helpers import _rebind_primary_credential_pool
-    reinstall_runtime_snapshot(agent, rt)
-    _rebind_primary_credential_pool(
-        agent, primary_provider, primary_model, matches_primary, load_primary_pool, prefetched_pool, prefetched
-    )
-    agent._fallback_activated = False
-    agent._fallback_index = 0
-    agent._rate_limit_backoff_count = 0
+    current_tool_policy = getattr(agent, "_provider_fallback_tool_policy", "inherit")
+    target_tool_policy = rt.get("fallback_tool_policy", "inherit")
+    staged = _stage_route_agent(agent)
+    try:
+        _reinstall_runtime_snapshot_in_place(staged, rt)
+        _rebind_primary_credential_pool(
+            staged, primary_provider, primary_model, matches_primary, load_primary_pool, prefetched_pool, prefetched
+        )
+        staged._fallback_activated = False
+        staged._fallback_index = 0
+        staged._rate_limit_backoff_count = 0
+    except Exception:
+        agent._provider_fallback_tool_policy = (
+            "none" if "none" in (current_tool_policy, target_tool_policy) else "inherit"
+        )
+        raise
+    _commit_route_agent(agent, staged)

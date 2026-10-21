@@ -103,11 +103,15 @@ def test_mid_voice_turn_reports_the_sessions_own_route(tmp_path, monkeypatch, se
         monkeypatch.setenv("HERMES_HOME", str(home))
         agent = _agent(home, main.base_url)
         agent.reasoning_config = {"enabled": True, "effort": "low"}
+        agent._provider_fallback_tool_policy = "none"
         agent._voice_turn_pending = True
         begin_voice_turn_route(agent, [{"role": "user", "content": "hi"}], "system")
         try:
             assert agent.reasoning_config == {"enabled": False}  # the voice turn itself still runs off
             assert agent.model == ("voice-model" if separate_voice_model else "fake-model")
+            assert agent._provider_fallback_tool_policy == (
+                "inherit" if separate_voice_model else "none"
+            )
             info = _session_info(agent, {})
             persisted = _runtime_model_config(agent)
             assert (info["reasoning_effort"], info["model"]) == ("low", "fake-model")
@@ -115,4 +119,86 @@ def test_mid_voice_turn_reports_the_sessions_own_route(tmp_path, monkeypatch, se
             assert persisted["model"] == "fake-model"
         finally:
             end_voice_turn_route(agent)
+        assert agent._provider_fallback_tool_policy == "none"
         assert _session_info(agent, {})["reasoning_effort"] == "low"
+
+
+def test_failed_voice_bind_leaves_the_complete_session_route_untouched(tmp_path, monkeypatch):
+    """A late voice bind failure must not need a second, fallible restore transition."""
+    from agent import chat_completion_helpers, route_binding
+    from agent.voice_turn_route import begin_voice_turn_route
+
+    with FakeLLMServer([]) as main, FakeLLMServer([]) as voice:
+        home = write_hermes_home(tmp_path / ".hermes", main.base_url, extra_config=(
+            "auxiliary:\n  voice_chat:\n    provider: custom\n"
+            f"    base_url: {voice.base_url}\n    model: voice-model\n    api_key: «redacted:sk-…»\n"
+            "    tool_policy: none\n"
+        ))
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        agent = _agent(home, main.base_url)
+        agent._provider_fallback_tool_policy = "inherit"
+        agent._voice_turn_pending = True
+
+        original_client = agent.client
+        original_compressor = agent.context_compressor
+        original_compressor_state = vars(original_compressor).copy()
+
+        def fail_after_identity_client_and_compressor_mutation(*_args, **_kwargs):
+            raise RuntimeError("injected late bind failure")
+
+        def forbidden_restore(*_args, **_kwargs):
+            raise AssertionError("failed atomic bind must not require runtime restoration")
+
+        monkeypatch.setattr(
+            chat_completion_helpers,
+            "_rescope_fallback_extra_body",
+            fail_after_identity_client_and_compressor_mutation,
+        )
+        monkeypatch.setattr(route_binding, "reinstall_runtime_snapshot", forbidden_restore)
+
+        prompt = begin_voice_turn_route(agent, [{"role": "user", "content": "hi"}], "system")
+
+        assert prompt
+        assert agent.model == "fake-model"
+        assert agent.provider == "custom"
+        assert agent.base_url.rstrip("/") == main.base_url.rstrip("/")
+        assert agent.client is original_client
+        assert agent.context_compressor is original_compressor
+        assert vars(agent.context_compressor) == original_compressor_state
+        assert agent._provider_fallback_tool_policy == "inherit"
+        assert agent._fallback_activated is False
+        assert agent._voice_route_state == {
+            "reasoning_config": agent.reasoning_config,
+        }
+
+
+@pytest.mark.parametrize(("session_policy", "voice_policy"), [
+    ("none", "inherit"),
+    ("inherit", "none"),
+])
+def test_failed_voice_restore_keeps_the_stricter_tool_policy(
+    tmp_path, monkeypatch, session_policy, voice_policy,
+):
+    """A partial route restore must retain the stricter policy until route restoration completes."""
+    from agent import agent_runtime_helpers
+    from agent.voice_turn_route import begin_voice_turn_route, end_voice_turn_route
+
+    with FakeLLMServer([]) as main, FakeLLMServer([]) as voice:
+        home = write_hermes_home(tmp_path / ".hermes", main.base_url, extra_config=(
+            "auxiliary:\n  voice_chat:\n    provider: custom\n"
+            f"    base_url: {voice.base_url}\n    model: voice-model\n    api_key: «redacted:sk-…»\n"
+            f"    tool_policy: {voice_policy}\n"
+        ))
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        agent = _agent(home, main.base_url)
+        agent._provider_fallback_tool_policy = session_policy
+        agent._voice_turn_pending = True
+        begin_voice_turn_route(agent, [{"role": "user", "content": "hi"}], "system")
+        assert agent._provider_fallback_tool_policy == voice_policy
+
+        def fail_after_route_restore_starts(*_args, **_kwargs):
+            raise RuntimeError("injected partial restore")
+
+        monkeypatch.setattr(agent_runtime_helpers, "_apply_primary_runtime_fields", fail_after_route_restore_starts)
+        end_voice_turn_route(agent)
+        assert agent._provider_fallback_tool_policy == "none"

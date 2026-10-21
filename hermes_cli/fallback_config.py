@@ -7,9 +7,23 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
+_FALLBACK_TOOL_POLICIES = frozenset({"inherit", "none"})
+
 
 def _normalized_base_url(value: Any) -> str:
     return value.strip().rstrip("/") if isinstance(value, str) else ""
+
+
+def fallback_tool_policy(entry: dict[str, Any] | None) -> str:
+    """Return the fallback entry's execution policy; malformed values fail closed."""
+    if not isinstance(entry, dict) or "tool_policy" not in entry:
+        return "inherit"
+    raw = entry.get("tool_policy")
+    policy = raw.strip().lower() if isinstance(raw, str) else ""
+    if policy in _FALLBACK_TOOL_POLICIES:
+        return policy
+    logger.warning("Invalid fallback tool_policy %r; disabling tools for this route", raw)
+    return "none"
 
 
 def _normalize_provider_id(value: str) -> str:

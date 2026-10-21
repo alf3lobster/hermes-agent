@@ -91,6 +91,10 @@ def perform_api_call(
                 next_api_kwargs, allow_stream=False, is_github_responses=agent._is_copilot_url(),
                 sanitize_harmony_tokens=agent._is_codex_backend(),
             )
+        if getattr(agent, "_provider_fallback_tool_policy", "inherit") == "none":
+            next_api_kwargs = dict(next_api_kwargs)
+            next_api_kwargs.pop("tools", None)
+            next_api_kwargs.pop("tool_choice", None)
         if _use_streaming:
             return agent._interruptible_streaming_api_call(
                 next_api_kwargs, on_first_delta=_stop_spinner

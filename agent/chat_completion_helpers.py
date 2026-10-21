@@ -2052,9 +2052,8 @@ def _buffer_fallback_notice(agent, notice: str) -> None:
 
 
 def try_activate_fallback(agent, reason: FailoverReason | None = None, reset_at=None) -> bool:
-    """Switch to the next fallback model/provider in the chain; False when exhausted. Swaps client,
-    model slug and provider in place so the retry loop continues on the new backend; client
-    construction goes through resolve_provider_client (no duplicated provider→key mappings)."""
+    """Switch to the next fallback route in place; return False when the chain is exhausted.
+    Client construction still goes through resolve_provider_client."""
     from agent.fallback_cooldown import _arm_rate_limit_cooldown, switch_deferred_by_reset
     if switch_deferred_by_reset(agent, reason, reset_at):
         return False
@@ -2091,15 +2090,11 @@ def try_activate_fallback(agent, reason: FailoverReason | None = None, reset_at=
                 remaining = max(0, math.ceil(agent._rate_limited_until - time.monotonic()))
                 notice += f" Primary retry eligible in ~{remaining} s; recovery is not guaranteed."
             _buffer_fallback_notice(agent, notice)
-            # ``_fallback_activated`` is also reused by `/model --once` restoration; separate
-            # provenance so the restore path only emits a recovery notice after a real fallback.
             agent._provider_fallback_active = True
             agent._provider_fallback_route = (str(fb_model), str(fb_provider))
             _log_fallback_activated(agent, reason, old_model, old_provider, fb_model, fb_provider)
             from hermes_cli.observability.shared_metrics_events import record_fallback
             record_fallback(from_provider=old_provider, to_provider=fb_provider, reason=reason)
-            # The stale-call streak measured the OLD provider; carrying it over would
-            # short-circuit the fresh fallback before its first stream attempt.
             _reset_stale_streak(agent)
             from agent.native_compaction import resolve_native_compaction_capabilities
             agent.runtime_capabilities = resolve_native_compaction_capabilities(
@@ -2112,8 +2107,7 @@ def try_activate_fallback(agent, reason: FailoverReason | None = None, reset_at=
             continue  # try next in chain
 
 
-# Keys outside the Chat Completions schema that strict gateways (Fireworks-backed OpenCode
-# Go, Mistral, Moonshot/Kimi) reject with 422. The transport's convert_messages() drops them
+# Keys strict Chat Completions gateways reject; the transport's convert_messages() drops them
 # in the main loop; the summary path calls chat.completions.create() directly, so mirror it.
 _SUMMARY_FOREIGN_MESSAGE_KEYS = PERSISTENCE_ONLY_MESSAGE_FIELDS | {"reasoning", "finish_reason", "tool_name",
     "codex_reasoning_items", "codex_message_items", "platform_message_id"}

@@ -42,11 +42,15 @@ def test_init_tries_fallback_when_primary_returns_none():
             quiet_mode=True,
             skip_context_files=True,
             skip_memory=True,
-            fallback_model=[{"provider": "tencent-token-plan", "model": "kimi2.5"}],
+            fallback_model=[{
+                "provider": "tencent-token-plan", "model": "kimi2.5", "tool_policy": "none",
+            }],
         )
         assert agent.provider == "tencent-token-plan"
         assert agent.model == "kimi2.5"
         assert agent._fallback_activated is True
+        assert agent._provider_fallback_tool_policy == "none"
+        assert agent._primary_runtime["fallback_tool_policy"] == "none"
 
 
 def test_init_raises_when_no_fallback_configured():

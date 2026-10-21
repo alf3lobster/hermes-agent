@@ -957,7 +957,11 @@ The primary model fallback chain is configured exclusively through `config.yaml`
 fallback_providers:
   - provider: openrouter
     model: anthropic/claude-sonnet-4
+    tool_policy: none  # optional response-only fallback
 ```
+
+`tool_policy` defaults to `inherit`. Set it to `none` to omit tool schemas from that fallback
+and reject any tool call it emits before execution; malformed values also fail closed as `none`.
 
 The older top-level `fallback_model` single-provider shape is still read for backward compatibility, but new configuration should use `fallback_providers`. For task-specific auxiliary policy, use `auxiliary.<task>.fallback_chain` in `config.yaml`; there is no environment variable equivalent.
 

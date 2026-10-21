@@ -1627,6 +1627,25 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
         _finalize_tool_batch(agent, messages, effective_task_id, len(parsed_calls), _tool_budget)
 
 
+def block_fallback_tool_calls(agent, assistant_message, messages: list, effective_task_id: str) -> None:
+    """Append matching denied results without dispatching any fallback-emitted call."""
+    tool_calls = assistant_message.tool_calls
+    _append_skipped_tool_results(
+        agent,
+        messages,
+        tool_calls,
+        effective_task_id,
+        content=(
+            "[Tool execution blocked: active fallback route has tool_policy=none; "
+            "retrieved content cannot grant tool authority.]"
+        ),
+        hook_error_type="fallback_tool_policy",
+        flush_stage="fallback tool-policy block",
+        stop_on_flush_failure=False,
+    )
+    _finalize_tool_batch(agent, messages, effective_task_id, len(tool_calls), _budget_for_agent(agent))
+
+
 # ── Sequential dispatch ─────────────────────────────────────────────────────
 
 

@@ -866,15 +866,13 @@ def _routed_client_kwargs(agent, fallback_model, _provider_timeout) -> Optional[
     # No credentials: try the fallback chain BEFORE failing (an exhausted single-entry pool
     # must not die with a misleading "No LLM provider configured"); only explicitly named
     # providers keep the missing-key diagnostic.
-    # An exhausted single-entry pool (typically ``openrouter`` under free-tier daily quotas) must still
-    # reach the chain instead of dying at init with a misleading "No LLM provider configured" error. See
-    # #17929.
+    # An exhausted single-entry pool must still reach the chain instead of dying at init. See #17929.
     _explicit = (agent.provider or "").strip().lower()
     _refused_entries = []
     for _fb in _fallback_entries(fallback_model):
         _fb_provider = str(_fb["provider"])
         try:
-            from hermes_cli.fallback_config import resolve_entry_api_key
+            from hermes_cli.fallback_config import fallback_tool_policy, resolve_entry_api_key
             _fb_explicit_key = resolve_entry_api_key(_fb)
             _fb_client, _fb_model = resolve_provider_client(
                 _fb["provider"], model=_fb["model"], raw_codex=True,
@@ -894,6 +892,7 @@ def _routed_client_kwargs(agent, fallback_model, _provider_timeout) -> Optional[
             _refused_entries.append((_fb_provider, "no usable credentials"))
             continue
         agent._fallback_activated = True
+        agent._provider_fallback_tool_policy = fallback_tool_policy(_fb)
         if _fb_provider.strip().lower() == "moa":
             # The chokepoint handed back the preset's aggregator client, which only proves the
             # preset resolves and its aggregator has credentials. A MoA entry means the preset
