@@ -172,6 +172,52 @@ def test_failed_voice_bind_leaves_the_complete_session_route_untouched(tmp_path,
         }
 
 
+def test_failed_voice_bind_does_not_write_compressor_session_state(tmp_path, monkeypatch):
+    """Preparing a rejected route must not persist compressor resets for a route that never ran."""
+    from agent import chat_completion_helpers
+    from agent.voice_turn_route import begin_voice_turn_route
+
+    class RecordingStore:
+        def __init__(self):
+            self.writes = []
+
+        def __getattr__(self, name):
+            if name.startswith(("set_", "clear_", "record_", "patch_")):
+                def record(*args):
+                    self.writes.append((name, args))
+                return record
+            raise AttributeError(name)
+
+    with FakeLLMServer([]) as main, FakeLLMServer([]) as voice:
+        home = write_hermes_home(tmp_path / ".hermes", main.base_url, extra_config=(
+            "auxiliary:\n  voice_chat:\n    provider: custom\n"
+            f"    base_url: {voice.base_url}\n    model: voice-model\n    api_key: «redacted:sk-…»\n"
+            "    tool_policy: none\n"
+        ))
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        agent = _agent(home, main.base_url)
+        store = RecordingStore()
+        agent.context_compressor._session_db = store
+        agent.context_compressor._session_id = "session-1"
+        agent.context_compressor._ineffective_compression_count = 3
+        agent._voice_turn_pending = True
+
+        def fail_after_compressor_update(*_args, **_kwargs):
+            raise RuntimeError("injected late bind failure")
+
+        monkeypatch.setattr(
+            chat_completion_helpers,
+            "_rescope_fallback_extra_body",
+            fail_after_compressor_update,
+        )
+
+        begin_voice_turn_route(agent, [{"role": "user", "content": "hi"}], "system")
+
+        assert store.writes == []
+        assert agent.model == "fake-model"
+        assert agent.context_compressor._ineffective_compression_count == 3
+
+
 @pytest.mark.parametrize(("session_policy", "voice_policy"), [
     ("none", "inherit"),
     ("inherit", "none"),

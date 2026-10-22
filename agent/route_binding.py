@@ -12,47 +12,54 @@ import logging
 from typing import Any, Dict, Optional, Tuple
 
 from utils import base_url_host_matches
+from agent.route_binding_state import rebind_primary_credential_pool
 
 logger = logging.getLogger(__name__)
 
 
-class _RouteTransaction:
-    """Rollback state for one synchronous route transition.
+def _stage_route_agent(agent: Any) -> Any:
+    """Copy the live route while detaching objects whose preparation has durable effects."""
+    staged = copy.copy(agent)
+    vars(staged).pop("_route_credential_reservation", None)
+    compressor = getattr(agent, "context_compressor", None)
+    if compressor is not None:
+        staged.context_compressor = copy.copy(compressor)
+        staged.context_compressor._session_db = None
+        staged.context_compressor._session_id = ""
+    if hasattr(agent, "_transport_cache"):
+        staged._transport_cache = dict(agent._transport_cache)
+    for name in ("request_overrides", "reasoning_config", "runtime_capabilities"):
+        value = getattr(agent, name, None)
+        if isinstance(value, dict):
+            setattr(staged, name, copy.deepcopy(value))
+    return staged
 
-    Client/facade builders must receive the real agent (MoA captures it for interrupts and display),
-    so route construction cannot safely run on a copied agent. No turn can observe the agent while
-    this synchronous transaction is open; on failure this restores the complete pre-transition
-    identity, client, policy and mutable compressor/cache state without invoking another route.
-    """
 
-    def __init__(self, agent: Any) -> None:
-        self.agent = agent
-        self.fields = dict(vars(agent))
-        self.compressor = getattr(agent, "context_compressor", None)
-        self.compressor_copy = copy.copy(self.compressor) if self.compressor is not None else None
-        cache = getattr(agent, "_transport_cache", None)
-        self.transport_cache = dict(cache) if isinstance(cache, dict) else None
+def _commit_route_agent(agent: Any, staged: Any) -> None:
+    """Publish one prepared route, then persist its already-decided compressor reset state."""
+    reservation = getattr(staged, "_route_credential_reservation", None)
+    if reservation is not None:
+        from agent.route_binding_state import validate_prepared_credential_pool
 
-    def rollback(self) -> None:
-        live = vars(self.agent)
-        live.clear()
-        live.update(self.fields)
-        if self.compressor is not None and self.compressor_copy is not None:
-            try:
-                original = vars(self.compressor)
-                original.clear()
-                original.update(vars(self.compressor_copy))
-                self.agent.context_compressor = self.compressor
-            except TypeError:
-                self.agent.context_compressor = self.compressor_copy
-        cache = getattr(self.agent, "_transport_cache", None)
-        if isinstance(cache, dict) and self.transport_cache is not None:
-            cache.clear()
-            cache.update(self.transport_cache)
+        validate_prepared_credential_pool(reservation)
+        prepared_pool, _entry = reservation
+        vars(prepared_pool).pop("_route_reservation_source", None)
+        vars(prepared_pool).pop("_route_reservation_snapshot", None)
+        del staged._route_credential_reservation
+    live_compressor = getattr(agent, "context_compressor", None)
+    staged_compressor = getattr(staged, "context_compressor", None)
+    if staged_compressor is not None and live_compressor is not None:
+        staged_compressor._session_db = getattr(live_compressor, "_session_db", None)
+        staged_compressor._session_id = getattr(live_compressor, "_session_id", "")
+    vars(agent).pop("_route_credential_reservation", None)
+    vars(agent).update(vars(staged))
+    if staged_compressor is not None:
+        from agent.route_binding_state import persist_prepared_compressor
+        persist_prepared_compressor(live_compressor, staged_compressor)
 
 
 def _bind_route_entry_in_place(
-    agent: Any, entry: dict[str, Any], provider: str, model: str,
+    agent: Any, entry: dict[str, Any], provider: str, model: str, *, owner: Any = None,
 ) -> Optional[tuple[str, str]]:
     """Swap ``agent`` onto ``entry`` (a fallback-chain-shaped dict). Returns ``(old_model,
     old_provider)``, or None when the provider has no usable client. Sets ``_fallback_activated``
@@ -111,10 +118,10 @@ def _bind_route_entry_in_place(
     reset_codex_reasoning_replay(agent)
     agent._fallback_activated = True
 
-    _rebind_fallback_credential_pool(agent, provider, model)
+    _rebind_fallback_credential_pool(agent, provider, model, load_if_missing=False)
     if provider == "moa":
         from agent.moa_loop import bind_moa_runtime
-        bind_moa_runtime(agent, model)
+        bind_moa_runtime(agent, model, owner=owner)
     else:
         from agent.client_lifecycle import _swap_fallback_clients
         _swap_fallback_clients(agent, client, provider, model, base_url, api_mode)
@@ -132,17 +139,31 @@ def _bind_route_entry_in_place(
 
 
 def bind_route_entry(agent: Any, entry: dict[str, Any], provider: str, model: str) -> Optional[tuple[str, str]]:
-    """Publish a complete route or restore the previous route without a second transition."""
+    """Prepare a complete route without live effects, then publish it once."""
     from hermes_cli.fallback_config import fallback_tool_policy
-    transaction = _RouteTransaction(agent)
-    try:
-        agent._provider_fallback_tool_policy = fallback_tool_policy(entry)
-        bound = _bind_route_entry_in_place(agent, entry, provider, model)
-    except Exception:
-        transaction.rollback()
-        raise
-    if bound is None:
-        transaction.rollback()
+    staged = _stage_route_agent(agent)
+    staged._provider_fallback_tool_policy = fallback_tool_policy(entry)
+    bound = _bind_route_entry_in_place(staged, entry, provider, model, owner=agent)
+    if bound is not None:
+        from agent.chat_completion_helpers import _reset_stale_streak, rewrite_prompt_model_identity
+        from agent.native_compaction import resolve_native_compaction_capabilities
+
+        rewrite_prompt_model_identity(staged, staged.model, provider)
+        staged._provider_fallback_active = True
+        staged._provider_fallback_route = (str(staged.model), str(provider))
+        _reset_stale_streak(staged)
+        staged.runtime_capabilities = resolve_native_compaction_capabilities(
+            model=staged.model,
+            base_url=staged.base_url,
+            provider=provider,
+            is_codex_backend=provider == "openai-codex",
+        )
+        _commit_route_agent(agent, staged)
+        from agent.chat_completion_helpers import _rebind_fallback_credential_pool
+        from agent.agent_runtime_helpers import sync_credential_pool_entry_id
+
+        _rebind_fallback_credential_pool(agent, provider, agent.model)
+        sync_credential_pool_entry_id(agent)
     return bound
 
 
@@ -173,7 +194,9 @@ def _reinstall_runtime_snapshot_in_place(agent: Any, rt: dict[str, Any]) -> None
     if getattr(agent, "_cache_disabled", False):
         agent._use_prompt_caching = False
         agent._use_native_cache_layout = False
-    _rebuild_primary_client(agent, rt, reason="restore_primary")
+    _rebuild_primary_client(
+        agent, rt, reason="restore_primary", owner=getattr(agent, "_route_owner", None)
+    )
     agent.context_compressor.update_model(
         model=rt["compressor_model"], context_length=rt["compressor_context_length"],
         base_url=rt["compressor_base_url"], api_key=rt["compressor_api_key"],
@@ -197,18 +220,20 @@ def _reinstall_runtime_snapshot_in_place(agent: Any, rt: dict[str, Any]) -> None
 
 
 def reinstall_runtime_snapshot(agent: Any, rt: dict[str, Any]) -> None:
-    """Build a restored route off-agent; a failed restore leaves the live identity untouched."""
+    """Prepare a restored route without live effects, then publish it once."""
     current_tool_policy = getattr(agent, "_provider_fallback_tool_policy", "inherit")
     target_tool_policy = rt.get("fallback_tool_policy", "inherit")
-    transaction = _RouteTransaction(agent)
+    staged = _stage_route_agent(agent)
+    staged._route_owner = agent
     try:
-        _reinstall_runtime_snapshot_in_place(agent, rt)
+        _reinstall_runtime_snapshot_in_place(staged, rt)
     except Exception:
-        transaction.rollback()
         agent._provider_fallback_tool_policy = (
             "none" if "none" in (current_tool_policy, target_tool_policy) else "inherit"
         )
         raise
+    del staged._route_owner
+    _commit_route_agent(agent, staged)
 
 
 def reinstall_primary_runtime(
@@ -216,21 +241,24 @@ def reinstall_primary_runtime(
     load_primary_pool, prefetched_pool=None, prefetched: bool = False,
 ) -> None:
     """Put ``agent`` back on its ``_primary_runtime`` snapshot ``rt`` and clear the fallback state."""
-    from agent.agent_runtime_helpers import _rebind_primary_credential_pool
     current_tool_policy = getattr(agent, "_provider_fallback_tool_policy", "inherit")
     target_tool_policy = rt.get("fallback_tool_policy", "inherit")
-    transaction = _RouteTransaction(agent)
+    staged = _stage_route_agent(agent)
+    staged._route_owner = agent
     try:
-        _reinstall_runtime_snapshot_in_place(agent, rt)
-        _rebind_primary_credential_pool(
-            agent, primary_provider, primary_model, matches_primary, load_primary_pool, prefetched_pool, prefetched
+        _reinstall_runtime_snapshot_in_place(staged, rt)
+        rebind_primary_credential_pool(
+            staged, primary_provider, primary_model, matches_primary, load_primary_pool, prefetched_pool, prefetched
         )
-        agent._fallback_activated = False
-        agent._fallback_index = 0
-        agent._rate_limit_backoff_count = 0
+        staged._fallback_activated = False
+        staged._fallback_index = 0
+        staged._rate_limit_backoff_count = 0
+        staged._provider_fallback_active = False
+        staged._provider_fallback_route = None
     except Exception:
-        transaction.rollback()
         agent._provider_fallback_tool_policy = (
             "none" if "none" in (current_tool_policy, target_tool_policy) else "inherit"
         )
         raise
+    del staged._route_owner
+    _commit_route_agent(agent, staged)

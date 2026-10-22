@@ -1873,7 +1873,9 @@ def _fallback_api_mode_resolved(agent, fb_provider: str, fb_model: str, fb_base_
     return "chat_completions"
 
 
-def _rebind_fallback_credential_pool(agent, fb_provider: str, fb_model: str) -> None:
+def _rebind_fallback_credential_pool(
+    agent, fb_provider: str, fb_model: str, *, load_if_missing: bool = True,
+) -> None:
     """Rebind the credential pool when the provider changes (else rate_limit/billing/auth recovery
     mutates the wrong credentials and overwrites the fallback's base_url). Same-provider pool: kept."""
     existing_pool = getattr(agent, "_credential_pool", None)
@@ -1884,7 +1886,7 @@ def _rebind_fallback_credential_pool(agent, fb_provider: str, fb_model: str) -> 
                 "Fallback to %s/%s: clearing primary credential pool (pool_provider=%s) to prevent cross-provider contamination",
                 fb_provider, fb_model, pool_provider)
             agent._credential_pool = agent._credential_pool_entry_id = None
-    if getattr(agent, "_credential_pool", None) is None:
+    if load_if_missing and getattr(agent, "_credential_pool", None) is None:
         try:
             from agent.credential_pool import load_pool
             fallback_pool = load_pool(fb_provider)
@@ -2081,7 +2083,6 @@ def try_activate_fallback(agent, reason: FailoverReason | None = None, reset_at=
                 continue
             old_model, old_provider = bound
             fb_model = agent.model  # normalized by the binder
-            rewrite_prompt_model_identity(agent, fb_model, fb_provider)
 
             notice = (
                 f"⚠️ Model fallback: {old_model} via {old_provider} unavailable "
@@ -2090,17 +2091,18 @@ def try_activate_fallback(agent, reason: FailoverReason | None = None, reset_at=
                 remaining = max(0, math.ceil(agent._rate_limited_until - time.monotonic()))
                 notice += f" Primary retry eligible in ~{remaining} s; recovery is not guaranteed."
             _buffer_fallback_notice(agent, notice)
-            agent._provider_fallback_active = True
-            agent._provider_fallback_route = (str(fb_model), str(fb_provider))
             _log_fallback_activated(agent, reason, old_model, old_provider, fb_model, fb_provider)
             from hermes_cli.observability.shared_metrics_events import record_fallback
             record_fallback(from_provider=old_provider, to_provider=fb_provider, reason=reason)
-            _reset_stale_streak(agent)
-            from agent.native_compaction import resolve_native_compaction_capabilities
-            agent.runtime_capabilities = resolve_native_compaction_capabilities(
-                model=agent.model, base_url=agent.base_url, provider=fb_provider, is_codex_backend=fb_provider == "openai-codex")
             return True
         except Exception as e:
+            if (
+                getattr(agent, "_provider_fallback_active", False)
+                and getattr(agent, "_provider_fallback_route", None)
+                == (str(getattr(agent, "model", "")), str(fb_provider))
+            ):
+                logger.exception("Fallback route is active but post-publication reporting failed")
+                return True
             if fb_provider == "nous":
                 unavailable.add(fb_key)
             logger.error("Failed to activate fallback %s: %s", fb_model, e)

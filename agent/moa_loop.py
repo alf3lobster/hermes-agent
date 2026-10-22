@@ -1533,7 +1533,7 @@ def build_moa_facade(agent, preset_name: Any = None) -> MoAClient:
     return MoAClient(resolved_preset, reference_callback=_moa_reference_relay, agent=agent)
 
 
-def bind_moa_runtime(agent, preset_name: Any, api_key: Any = None) -> None:
+def bind_moa_runtime(agent, preset_name: Any, api_key: Any = None, *, owner: Any = None) -> None:
     """Make ``agent`` act as the MoA preset: pin the virtual runtime fields and install the facade.
 
     Every site that puts an agent onto ``provider: moa`` (init, ``/model`` switch, fallback
@@ -1547,4 +1547,4 @@ def bind_moa_runtime(agent, preset_name: Any, api_key: Any = None) -> None:
     agent.api_key = api_key or "moa-virtual-provider"
     agent.base_url = "moa://local"
     agent._client_kwargs = {}
-    agent.client = build_moa_facade(agent, agent.model)
+    agent.client = build_moa_facade(owner or agent, agent.model)

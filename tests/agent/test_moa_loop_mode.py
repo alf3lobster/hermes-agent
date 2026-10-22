@@ -80,6 +80,19 @@ def test_moa_runtime_provider_uses_virtual_endpoint():
     assert runtime["api_key"] == "moa-virtual-provider"
 
 
+def test_prepared_moa_runtime_keeps_the_live_agent_as_its_owner():
+    from agent.moa_loop import bind_moa_runtime
+
+    live = SimpleNamespace(_interrupt_requested=False, tool_progress_callback=None)
+    staged = SimpleNamespace()
+
+    bind_moa_runtime(staged, "review", owner=live)
+
+    assert staged.client.chat.completions._agent is live
+    live._interrupt_requested = True
+    assert staged.client.chat.completions._agent._interrupt_requested is True
+
+
 def test_moa_primary_restore_rebuilds_virtual_facade(monkeypatch, tmp_path):
     """MoA sessions must restore from fallback without constructing OpenAI().
 

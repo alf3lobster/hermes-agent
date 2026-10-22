@@ -1164,13 +1164,13 @@ def _build_anthropic_client_from_runtime(agent, rt: dict[str, Any]) -> None:
     agent.client = None
 
 
-def _rebuild_primary_client(agent, rt: dict[str, Any], *, reason: str) -> None:
+def _rebuild_primary_client(agent, rt: dict[str, Any], *, reason: str, owner: Any = None) -> None:
     """Rebuild the primary client from a ``_primary_runtime`` snapshot (MoA facade / native Anthropic / OpenAI wire)."""
     if (agent.provider or "").strip().lower() == "moa":
         # MoA has empty client_kwargs; rebuild via the shared facade factory so the
         # reference_callback relay survives recovery.
         from agent.moa_loop import build_moa_facade
-        agent.client = build_moa_facade(agent, agent.model)
+        agent.client = build_moa_facade(owner or agent, agent.model)
         # MoA is a virtual chat-completions provider. It never has real OpenAI client kwargs; restoring it
         # after a fallback must recreate the facade, not call OpenAI() with an empty api_key. Use the shared
         # factory so the restored facade keeps the reference_callback relay wired at init — a bare
@@ -1322,46 +1322,6 @@ def _restore_runtime_capabilities(agent, rt: dict[str, Any]) -> None:
         logger.warning("Ignoring malformed runtime capabilities snapshot")
 
 
-def _rebind_primary_credential_pool(agent, primary_provider, primary_model, matches_primary, load_primary_pool, prefetched_pool, prefetched) -> None:
-    """Rebind and re-select the primary credential pool after a fallback turn. A cross-provider
-    fallback attaches its own pool, which would trip the provider-mismatch guard on the next
-    401/429: reload the primary pool, else clear it. The snapshot api_key may be stale after
-    rotation; re-select the pool's best entry, keeping the snapshot key when none is usable."""
-    pool = getattr(agent, "_credential_pool", None)
-    pool_provider = str(getattr(pool, "provider", "") or "").strip().lower()
-    if pool is not None and pool_provider and not matches_primary(pool):
-        agent._credential_pool = None
-        agent._credential_pool_entry_id = None
-        try:
-            # Reuse the pool the reset-aware gate already loaded (avoids a second auth.json read).
-            agent._credential_pool = prefetched_pool if prefetched else load_primary_pool()
-        except Exception as exc:
-            logger.warning(
-                "Restore could not reload primary credential pool for %s: %s", primary_provider, exc
-            )
-    agent._credential_pool_entry_id = None
-    pool = getattr(agent, "_credential_pool", None)
-    entry = pool.select(model=primary_model or None) if pool is not None and pool.has_available(model=primary_model or None) else None
-    if entry is None or not (getattr(entry, "runtime_api_key", None) or getattr(entry, "access_token", "")):
-        return
-    if matches_primary(entry):
-        # _swap_credential rebuilds the client and reapplies base-url-scoped headers.
-        # ``_swap_credential`` rebuilds the OpenAI/Anthropic client, reapplies base-url-scoped headers, and
-        # carries the accumulated base_url / OAuth-detection fixes (#33163).
-        agent._swap_credential(entry)
-        logger.info(
-            "Restore re-selected pool entry %s (%s)",
-            getattr(entry, "id", "?"), getattr(entry, "label", "?"),
-        )
-    else:
-        logger.info(
-            "Restore skipped pool entry %s (%s): provider %s does not match primary provider %s",
-            getattr(entry, "id", "?"), getattr(entry, "label", "?"),
-            str(getattr(entry, "provider", "") or "").strip().lower() or "?",
-            primary_provider or "?",
-        )
-
-
 def _revert_credential_rotation(agent) -> None:
     """Move a live session back onto the credential a quota bench rotated it off, once the bench
     lifts. New sessions already do this through ``select()``; without it a long-lived (gateway)
@@ -1479,8 +1439,6 @@ def restore_primary_runtime(agent) -> bool:
             agent, rt, primary_provider, primary_model, _matches_primary, _load_primary_pool, prefetched_pool, prefetched,
         )
         logger.info("Primary runtime restored for new turn: %s (%s)", agent.model, agent.provider)
-        agent._provider_fallback_active = False
-        agent._provider_fallback_route = None
         if provider_fallback_active:
             with contextlib.suppress(Exception):
                 agent._emit_diagnostic_status(

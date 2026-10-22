@@ -99,6 +99,135 @@ def test_partial_runtime_fallback_activation_fails_closed():
     assert agent._provider_fallback_tool_policy == "inherit"
 
 
+def test_failed_fallback_capability_resolution_does_not_publish_route(monkeypatch):
+    """All route metadata must resolve before the prepared fallback becomes live."""
+    from agent import route_binding
+
+    agent = SimpleNamespace(
+        model="primary",
+        provider="custom",
+        base_url="https://primary.invalid/v1",
+        _provider_fallback_active=False,
+        _provider_fallback_route=None,
+        _provider_fallback_tool_policy="inherit",
+        context_compressor=None,
+    )
+
+    def prepare_route(staged, *_args, **_kwargs):
+        staged.model = "restricted"
+        staged.provider = "custom"
+        staged.base_url = "https://restricted.invalid/v1"
+        return "primary", "custom"
+
+    monkeypatch.setattr(route_binding, "_bind_route_entry_in_place", prepare_route)
+    monkeypatch.setattr(
+        "agent.native_compaction.resolve_native_compaction_capabilities",
+        MagicMock(side_effect=RuntimeError("injected capability failure")),
+    )
+
+    with pytest.raises(RuntimeError, match="capability failure"):
+        route_binding.bind_route_entry(
+            agent,
+            {"provider": "custom", "model": "restricted", "tool_policy": "none"},
+            "custom",
+            "restricted",
+        )
+
+    assert agent.model == "primary"
+    assert agent.base_url == "https://primary.invalid/v1"
+    assert agent._provider_fallback_active is False
+    assert agent._provider_fallback_route is None
+    assert agent._provider_fallback_tool_policy == "inherit"
+
+
+def test_rejected_fallback_does_not_load_or_heal_credential_pool(monkeypatch):
+    """Credential-store maintenance starts only after the complete fallback route is accepted."""
+    from agent import route_binding
+
+    agent = _agent()
+    agent._credential_pool = None
+    fake_client = SimpleNamespace(
+        base_url="https://restricted.invalid/v1",
+        api_key="fallback-key",
+    )
+    load_pool = MagicMock(return_value=None)
+
+    monkeypatch.setattr(
+        "agent.auxiliary_client.resolve_provider_client",
+        lambda *_args, **_kwargs: (fake_client, "restricted"),
+    )
+    monkeypatch.setattr("agent.credential_pool.load_pool", load_pool)
+    monkeypatch.setattr("agent.client_lifecycle._swap_fallback_clients", lambda *_args: None)
+    monkeypatch.setattr("agent.agent_runtime_helpers.sync_credential_pool_entry_id", lambda *_args: None)
+    monkeypatch.setattr("agent.chat_completion_helpers._update_fallback_context_compressor", lambda *_args: None)
+    monkeypatch.setattr("agent.chat_completion_helpers._reresolve_fallback_reasoning_config", lambda *_args: None)
+    monkeypatch.setattr("agent.chat_completion_helpers._rescope_fallback_extra_body", lambda *_args: None)
+    monkeypatch.setattr(agent, "_ensure_lmstudio_runtime_loaded", lambda: None)
+    monkeypatch.setattr(
+        "agent.native_compaction.resolve_native_compaction_capabilities",
+        MagicMock(side_effect=RuntimeError("injected capability failure")),
+    )
+
+    with pytest.raises(RuntimeError, match="capability failure"):
+        route_binding.bind_route_entry(
+            agent,
+            {
+                "provider": "custom",
+                "model": "restricted",
+                "base_url": "https://restricted.invalid/v1",
+                "api_key": "fallback-key",
+                "tool_policy": "none",
+            },
+            "custom",
+            "restricted",
+        )
+
+    load_pool.assert_not_called()
+
+
+def test_post_publication_notice_failure_keeps_committed_fallback(monkeypatch):
+    """Reporting failure cannot turn one committed fallback into another route attempt."""
+    from agent.chat_completion_helpers import try_activate_fallback
+
+    agent = SimpleNamespace(
+        _fallback_chain=[{"provider": "custom", "model": "restricted", "tool_policy": "none"}],
+        _fallback_index=0,
+        _unavailable_fallback_keys=set(),
+        model="primary",
+        provider="custom",
+        base_url="https://primary.invalid/v1",
+        _provider_fallback_active=False,
+        _provider_fallback_route=None,
+        _provider_fallback_tool_policy="inherit",
+    )
+
+    def publish(target, _entry, provider, model):
+        old = target.model, target.provider
+        target.model, target.provider = model, provider
+        target.base_url = "https://restricted.invalid/v1"
+        target._provider_fallback_active = True
+        target._provider_fallback_route = (model, provider)
+        target._provider_fallback_tool_policy = "none"
+        return old
+
+    with (
+        patch("agent.fallback_cooldown.switch_deferred_by_reset", return_value=False),
+        patch("agent.fallback_cooldown._arm_rate_limit_cooldown", return_value=None),
+        patch("agent.chat_completion_helpers._should_skip_fallback_candidate", return_value=False),
+        patch("agent.route_binding.bind_route_entry", side_effect=publish),
+        patch(
+            "agent.chat_completion_helpers._buffer_fallback_notice",
+            side_effect=RuntimeError("injected notice failure"),
+        ),
+    ):
+        assert try_activate_fallback(agent) is True
+
+    assert agent.model == "restricted"
+    assert agent._provider_fallback_active is True
+    assert agent._provider_fallback_route == ("restricted", "custom")
+    assert agent._provider_fallback_tool_policy == "none"
+
+
 def test_later_failed_candidate_cannot_widen_a_partially_bound_restricted_route():
     from agent.chat_completion_helpers import try_activate_fallback
 
@@ -178,6 +307,106 @@ def test_failed_primary_restore_retains_restrictive_active_policy(active_policy,
         assert restore_primary_runtime(agent) is False
 
     assert agent._provider_fallback_tool_policy == "none"
+
+
+def test_failed_primary_restore_does_not_advance_live_credential_pool(monkeypatch):
+    """Credential choice is preparation: a rejected restore cannot consume it on the live pool."""
+    from agent import route_binding
+    from agent.credential_pool import CredentialPool, PooledCredential
+
+    pool = CredentialPool("custom", [PooledCredential(
+        provider="custom", id="primary-1", label="primary", auth_type="api_key",
+        priority=0, source="test", access_token="test-key", request_count=2,
+    )])
+    agent = SimpleNamespace(
+        _credential_pool=pool,
+        _credential_pool_entry_id="original",
+        _provider_fallback_tool_policy="none",
+    )
+
+    def reject_after_selection(_entry):
+        raise RuntimeError("injected client failure after credential selection")
+
+    agent._swap_credential = reject_after_selection
+    monkeypatch.setattr(route_binding, "_reinstall_runtime_snapshot_in_place", lambda *_args: None)
+
+    with pytest.raises(RuntimeError, match="client failure"):
+        route_binding.reinstall_primary_runtime(
+            agent,
+            {"fallback_tool_policy": "inherit"},
+            "custom",
+            "primary-model",
+            lambda candidate: getattr(candidate, "provider", "") == "custom",
+            lambda: pool,
+        )
+
+    assert pool._current_id is None
+    assert [(entry.id, entry.request_count) for entry in pool.entries()] == [("primary-1", 2)]
+    assert agent._credential_pool_entry_id == "original"
+    assert agent._provider_fallback_tool_policy == "none"
+
+
+def test_successful_primary_restore_publishes_reserved_pool_clone(monkeypatch):
+    """A prepared credential reservation becomes live only with the completed route."""
+    from agent import route_binding
+    from agent.credential_pool import CredentialPool, PooledCredential
+
+    pool = CredentialPool("custom", [PooledCredential(
+        provider="custom", id="primary-1", label="primary", auth_type="api_key",
+        priority=0, source="test", access_token="test-key", request_count=2,
+    )])
+
+    class Agent(SimpleNamespace):
+        def _swap_credential(self, selected):
+            self.selected = selected.id
+
+    agent = Agent(
+        _credential_pool=pool,
+        _credential_pool_entry_id=None,
+        _provider_fallback_active=True,
+        _provider_fallback_route=("restricted", "custom"),
+        _provider_fallback_tool_policy="none",
+    )
+    monkeypatch.setattr(route_binding, "_reinstall_runtime_snapshot_in_place", lambda *_args: None)
+
+    route_binding.reinstall_primary_runtime(
+        agent,
+        {"fallback_tool_policy": "inherit"},
+        "custom",
+        "primary-model",
+        lambda candidate: getattr(candidate, "provider", "") == "custom",
+        lambda: pool,
+    )
+
+    assert agent._credential_pool is not pool
+    assert [(entry.id, entry.request_count) for entry in pool.entries()] == [("primary-1", 2)]
+    assert pool.current() is None
+    assert [(entry.id, entry.request_count) for entry in agent._credential_pool.entries()] == [
+        ("primary-1", 3)
+    ]
+    assert agent._credential_pool.current().id == "primary-1"
+    assert agent.selected == "primary-1"
+    assert agent._provider_fallback_active is False
+    assert agent._provider_fallback_route is None
+
+
+def test_stale_credential_reservation_is_rejected_before_publication():
+    """A pool change between preparation and publication invalidates the route plan."""
+    from agent.credential_pool import CredentialPool, PooledCredential
+    from agent.route_binding_state import (
+        prepare_credential_pool,
+        validate_prepared_credential_pool,
+    )
+
+    pool = CredentialPool("custom", [PooledCredential(
+        provider="custom", id="primary-1", label="primary", auth_type="api_key",
+        priority=0, source="test", access_token="test-key", request_count=0,
+    )])
+    reservation = prepare_credential_pool(pool, model="primary-model")
+
+    assert pool.select(model="primary-model") is not None
+    with pytest.raises(RuntimeError, match="credential pool changed"):
+        validate_prepared_credential_pool(reservation)
 
 
 @pytest.mark.parametrize(("active_policy", "target_policy"), [
