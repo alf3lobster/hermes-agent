@@ -999,6 +999,7 @@ def test_committed_fallback_failure_cannot_restore_primary_next_turn(monkeypatch
     assert agent._fallback_activated is False
     assert agent._fallback_index == len(agent._fallback_chain)
     assert restore_primary_runtime(agent) is False
+    assert agent._fallback_index == len(agent._fallback_chain)
     restore.assert_not_called()
     assert agent.model == "restricted"
     assert agent._provider_fallback_tool_policy == "none"

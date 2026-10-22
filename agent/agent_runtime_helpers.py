@@ -1355,10 +1355,10 @@ def _primary_quota_reopen_probe_due(agent, primary_provider) -> bool:
 
 
 def restore_primary_runtime(agent) -> bool:
-    """Restore the primary runtime at the start of a new turn so fallback stays turn-scoped
-    (long-lived CLI agents and the gateway's cached agents)."""
+    """Restore the primary runtime at the start of a new turn when the fallback is usable."""
     if not agent._fallback_activated:
-        # A failed activation may leave the index past the chain end; always reset it.
+        if getattr(agent, "_provider_fallback_active", False) and not getattr(agent, "_route_client_ready", False):
+            return False  # A committed inert route cannot be re-armed or widened automatically.
         agent._fallback_index = 0
         _revert_credential_rotation(agent)
         return False

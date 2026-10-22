@@ -164,6 +164,10 @@ def test_end_voice_post_commit_restore_failure_does_not_arm_retry(tmp_path, monk
         ))
         monkeypatch.setenv("HERMES_HOME", str(home))
         agent = _agent(home, main.base_url)
+        agent._fallback_chain = [{"provider": "custom", "model": "session-fallback"}]
+        agent._fallback_index = 1
+        agent._fallback_activated = True
+        agent._provider_fallback_active = True
         agent._voice_turn_pending = True
         begin_voice_turn_route(agent, [{"role": "user", "content": "hi"}], "system")
         assert agent.model == "voice-model"

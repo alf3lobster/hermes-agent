@@ -232,7 +232,7 @@ def end_voice_turn_route(agent: Any) -> None:
         return
     agent._voice_route_state = None
     agent._turn_route_task = ""
-    from agent.route_binding import RouteCommittedError
+    from agent.route_binding import RouteCommittedError, close_committed_route_retry
     try:
         if "snapshot" in state:
             if getattr(agent, "_reasoning_floor_required", False):
@@ -242,6 +242,7 @@ def end_voice_turn_route(agent: Any) -> None:
             _reinstall(agent, state)
     except RouteCommittedError:
         _restore_extra_fields(agent, state)
+        close_committed_route_retry(agent)
         logger.exception("Session route was restored but maintenance failed; committed route remains inert")
     except Exception:
         logger.warning("Voice turn route restore failed; the next turn re-resolves the main runtime",
