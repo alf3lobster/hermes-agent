@@ -2436,20 +2436,20 @@ class ContextCompressor(
             int, 0, PROACTIVE_PRUNE_REARM_MODEL_CONFIG_KEY, 0,
         )
 
-    def _clear_durable_proactive_prune_rearm(self) -> None:
-        """Best-effort removal of the persisted prune-runway key; transcript untouched."""
-        self._durable_write("patch_session_model_config", "proactive prune runway clear", {PROACTIVE_PRUNE_REARM_MODEL_CONFIG_KEY: None})
+    def _clear_durable_proactive_prune_rearm(self) -> bool:
+        """Remove the persisted prune-runway key; report whether the write succeeded."""
+        return self._durable_write("patch_session_model_config", "proactive prune runway clear", {PROACTIVE_PRUNE_REARM_MODEL_CONFIG_KEY: None})
 
-    def _persist_fallback_compression_streak(self) -> None:
-        self._durable_write("set_compression_fallback_streak", "compression fallback streak", self._fallback_compression_streak)
+    def _persist_fallback_compression_streak(self) -> bool:
+        return self._durable_write("set_compression_fallback_streak", "compression fallback streak", self._fallback_compression_streak)
 
     def _load_consecutive_overload_aborts(self) -> None:
         """Restore the sustained-overload budget so a fresh compressor bound to a resumed session
         inherits it (#123167 review P1; same contract as the fallback streak, #100185)."""
         self._load_durable("_consecutive_overload_aborts", "get_compression_overload_streak", "compression overload streak", int, 0)
 
-    def _persist_consecutive_overload_aborts(self) -> None:
-        self._durable_write("set_compression_overload_streak", "compression overload streak", self._consecutive_overload_aborts)
+    def _persist_consecutive_overload_aborts(self) -> bool:
+        return self._durable_write("set_compression_overload_streak", "compression overload streak", self._consecutive_overload_aborts)
 
     def _clear_terminal_summary_failures(self) -> None:
         """Clear every terminal summary-failure flag."""
@@ -2475,8 +2475,8 @@ class ContextCompressor(
         """Load the durable anti-thrash strike count so a restart never disarms a guard."""
         self._load_durable("_ineffective_compression_count", "get_compression_ineffective_count", "compression ineffective count", int, 0)
 
-    def _persist_ineffective_compression_count(self) -> None:
-        self._durable_write("set_compression_ineffective_count", "compression ineffective count", self._ineffective_compression_count)
+    def _persist_ineffective_compression_count(self) -> bool:
+        return self._durable_write("set_compression_ineffective_count", "compression ineffective count", self._ineffective_compression_count)
 
     def _load_anti_thrash_recovery_deadline(self) -> None:
         """Restore the durable recovery deadline (wall-clock epoch); missing storage leaves it disarmed.
@@ -2630,16 +2630,16 @@ class ContextCompressor(
             seconds = max(seconds, float(idle))
         self._record_compression_failure_cooldown(seconds, stamped)
 
-    def _clear_compression_failure_cooldown(self) -> None:
+    def _clear_compression_failure_cooldown(self) -> bool:
         # Fence check BEFORE cooldown-clear: a late cancelled worker must not undo the host's timeout cooldown.
         # Class-qualified helper calls: tests bind this single method onto a bare stub.
         if ContextCompressor._compression_cancelled(self):
             logger.info("Skipping compression cooldown clear: host already cancelled this compression attempt")
-            return
+            return False
         self._summary_failure_cooldown_until, self._last_summary_error = 0.0, None
         self._consecutive_timeout_failures = self._consecutive_truncation_failures = 0
         self._cooldown_persist_failed = False
-        ContextCompressor._durable_write(self, "clear_compression_failure_cooldown", "compression failure cooldown clear")
+        return ContextCompressor._durable_write(self, "clear_compression_failure_cooldown", "compression failure cooldown clear")
 
     def _compression_cancelled(self) -> bool:
         """Read the host-owned cooperative cancellation signal, if installed."""

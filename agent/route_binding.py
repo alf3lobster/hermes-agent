@@ -126,13 +126,7 @@ def _commit_route_agent(agent: Any, staged: Any) -> None:
     vars(agent).update(vars(staged))
     if staged_compressor is not None:
         from agent.route_binding_state import persist_prepared_compressor
-        try:
-            persist_prepared_compressor(live_compressor, staged_compressor)
-        except Exception:
-            logger.warning(
-                "Route committed but compressor-state persistence failed",
-                exc_info=True,
-            )
+        persist_prepared_compressor(live_compressor, staged_compressor)
 
 
 def _bind_route_entry_in_place(

@@ -868,40 +868,41 @@ def _routed_client_kwargs(agent, fallback_model, _provider_timeout) -> Optional[
     # providers keep the missing-key diagnostic.
     # An exhausted single-entry pool must still reach the chain instead of dying at init. See #17929.
     _explicit = (agent.provider or "").strip().lower()
-    _refused_entries = []
-    for _fb in _fallback_entries(fallback_model):
+    # Select exactly one metadata-valid fallback before touching its credentials.
+    # Publish the restrictive route identity/policy first; post-publication failure
+    # leaves it committed and inert rather than hopping to a broader candidate.
+    _entries = _fallback_entries(fallback_model)
+    if _entries:
+        from hermes_cli.fallback_config import fallback_tool_policy, resolve_entry_api_key
+
+        _fb = _entries[0]
         _fb_provider = str(_fb["provider"])
-        try:
-            from hermes_cli.fallback_config import fallback_tool_policy, resolve_entry_api_key
-            _fb_explicit_key = resolve_entry_api_key(_fb)
-            _fb_client, _fb_model = resolve_provider_client(
-                _fb["provider"], model=_fb["model"], raw_codex=True,
-                explicit_base_url=_fb.get("base_url"), explicit_api_key=_fb_explicit_key,
-            )
-        except Exception as _fb_exc:
-            logger.debug("Init-time fallback entry %s failed: %s", _fb_provider, _fb_exc)
-            # A bare exception (``KeyError()``) stringifies empty; name its type instead.
-            _refused_entries.append((_fb_provider, str(_fb_exc) or type(_fb_exc).__name__))
-            continue
-        if _fb_client is None:
-            # The router returns None when no credentials are usable for the entry — a skip
-            # that leaves no trace otherwise, hiding key-less fallback entries from the log.
-            logger.debug(
-                "Init-time fallback entry %s resolved no usable credentials", _fb_provider
-            )
-            _refused_entries.append((_fb_provider, "no usable credentials"))
-            continue
+        _fb_policy = fallback_tool_policy(_fb)
         agent._fallback_activated = True
-        agent._provider_fallback_tool_policy = fallback_tool_policy(_fb)
+        agent._provider_fallback_active = True
+        agent._provider_fallback_tool_policy = _fb_policy
+        agent.provider = agent.requested_provider = _fb["provider"]
+        agent.model = _fb["model"]
+        agent._provider_fallback_route = (str(agent.model), str(agent.provider))
+        agent._route_client_ready = False
+
+        _fb_explicit_key = resolve_entry_api_key(_fb)
+        _fb_client, _fb_model = resolve_provider_client(
+            _fb["provider"], model=_fb["model"], raw_codex=True,
+            explicit_base_url=_fb.get("base_url"), explicit_api_key=_fb_explicit_key,
+        )
+        if _fb_client is None:
+            raise RuntimeError(
+                f"post-commit init fallback client resolution failed for {_fb_provider}"
+            )
+        if _fb_model:
+            agent.model = _fb_model
+            agent._provider_fallback_route = (str(agent.model), str(agent.provider))
         if _fb_provider.strip().lower() == "moa":
-            # The chokepoint handed back the preset's aggregator client, which only proves the
-            # preset resolves and its aggregator has credentials. A MoA entry means the preset
-            # itself (same as ``provider: moa`` in config), so bind the facade, not the aggregator.
             from agent.moa_loop import bind_materialized_moa_runtime
             bind_materialized_moa_runtime(agent, _fb["model"])
+            agent._route_client_ready = True
             return None
-        agent.provider = agent.requested_provider = _fb["provider"]
-        agent.model = _fb_model or _fb["model"]
         recompute_init_fallback_api_mode(agent, _fb_client)
         return _client_kwargs_from_routed(_fb_client, _provider_timeout)
     # A burned credential pool (#119533) is otherwise indistinguishable from missing config,
@@ -913,14 +914,10 @@ def _routed_client_kwargs(agent, fallback_model, _provider_timeout) -> Optional[
             from agent.credential_pool import load_pool
             _pool = load_pool(_explicit)
             _pool_exhausted = _pool.has_credentials() and not _pool.has_available(model=agent.model)
-    if _refused_entries or _pool_exhausted:
-        # Neutral wording: the explicit-provider branch below raises the provider-specific
-        # missing-credentials message, not the generic "No LLM provider configured" one.
+    if _pool_exhausted:
         logger.warning(
-            "Init-time provider resolution failed: primary %r unresolvable (%s); fallback entries refused: %s",
+            "Init-time provider resolution failed: primary %r credential pool exhausted",
             agent.provider,
-            "credential pool exhausted" if _pool_exhausted else "no usable credentials",
-            "; ".join(f"{_p} ({_r})" for _p, _r in _refused_entries) or "none configured",
         )
     # A fully-exhausted pool is a billing/quota failure, NOT a config problem: name it for EVERY
     # explicit provider. ``openrouter`` / ``custom`` have no provider-specific missing-credentials
@@ -1015,6 +1012,8 @@ def _init_openai_client(agent, api_key, base_url, fallback_model, _provider_time
     agent.base_url = client_kwargs.get("base_url", agent.base_url)
     try:
         agent.client = agent._create_openai_client(client_kwargs, reason="agent_init", shared=True)
+        if getattr(agent, "_fallback_activated", False):
+            agent._route_client_ready = True
         if not agent.quiet_mode:
             print(f"🤖 AI Agent initialized with model: {agent.model}")
             if base_url:

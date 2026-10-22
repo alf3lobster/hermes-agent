@@ -1001,23 +1001,86 @@ def test_nous_candidate_validation_does_not_open_auth_store():
     load_auth.assert_not_called()
 
 
-def test_post_commit_compressor_persistence_failure_keeps_committed_route(monkeypatch):
-    """A durable-state reporting error after publication cannot make the route look rejected."""
+def test_post_commit_compressor_persistence_failure_keeps_committed_route_inert(monkeypatch):
+    """A committed route propagates persistence failure and cannot continue to readiness."""
     from agent import route_binding
 
     live_compressor = SimpleNamespace(_session_db=object(), _session_id="session")
     staged_compressor = SimpleNamespace(_session_db=None, _session_id="")
     agent = SimpleNamespace(model="primary", context_compressor=live_compressor)
-    staged = SimpleNamespace(model="restricted", context_compressor=staged_compressor)
+    staged = SimpleNamespace(
+        model="restricted", context_compressor=staged_compressor, _route_client_ready=False
+    )
     monkeypatch.setattr(
         "agent.route_binding_state.persist_prepared_compressor",
         lambda *_args: (_ for _ in ()).throw(RuntimeError("persistence failed")),
     )
 
-    route_binding._commit_route_agent(agent, staged)
+    with pytest.raises(RuntimeError, match="persistence failed"):
+        route_binding._commit_route_agent(agent, staged)
 
     assert agent.model == "restricted"
     assert agent.context_compressor is staged_compressor
+    assert agent._route_client_ready is False
+
+
+def test_real_compressor_persistence_false_result_is_failure():
+    """Deep durable-write failures cannot be mistaken for successful route maintenance."""
+    from agent.route_binding_state import persist_prepared_compressor
+
+    previous = SimpleNamespace(
+        model="old", provider="old", base_url="old", api_mode="chat_completions"
+    )
+    prepared = SimpleNamespace(
+        model="new",
+        provider="new",
+        base_url="new",
+        api_mode="chat_completions",
+        _session_db=object(),
+        _session_id="session",
+        _persist_ineffective_compression_count=lambda: False,
+        _clear_durable_proactive_prune_rearm=lambda: False,
+        _persist_fallback_compression_streak=lambda: False,
+        _durable_write=lambda *_args: False,
+        _persist_consecutive_overload_aborts=lambda: False,
+    )
+
+    with pytest.raises(RuntimeError, match="compressor persistence failed"):
+        persist_prepared_compressor(previous, prepared)
+
+
+def test_real_context_compressor_db_failures_block_persistence():
+    """The production compressor surfaces every swallowed deep DB failure to route binding."""
+    from agent.context_compressor import ContextCompressor
+    from agent.route_binding_state import persist_prepared_compressor
+
+    calls = []
+
+    class FailingDB:
+        def __getattr__(self, name):
+            def fail(*_args, **_kwargs):
+                calls.append(name)
+                raise RuntimeError("db unavailable")
+            return fail
+
+    previous = SimpleNamespace(
+        model="old", provider="old", base_url="old", api_mode="chat_completions"
+    )
+    prepared = ContextCompressor.__new__(ContextCompressor)
+    prepared.model = "new"
+    prepared.provider = "new"
+    prepared.base_url = "new"
+    prepared.api_mode = "chat_completions"
+    prepared._session_db = FailingDB()
+    prepared._session_id = "session"
+    prepared._ineffective_compression_count = 0
+    prepared._fallback_compression_streak = 0
+    prepared._consecutive_overload_aborts = 0
+
+    with pytest.raises(RuntimeError, match="compressor persistence failed"):
+        persist_prepared_compressor(previous, prepared)
+
+    assert len(calls) == 5
 
 
 @pytest.mark.parametrize(("active_policy", "target_policy"), [

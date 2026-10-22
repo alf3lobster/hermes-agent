@@ -21,14 +21,33 @@ def persist_prepared_compressor(previous: Any, prepared: Any) -> None:
         getattr(prepared, "base_url", None),
         getattr(prepared, "api_mode", None),
     )
-    prepared._persist_ineffective_compression_count()
-    prepared._clear_durable_proactive_prune_rearm()
+    # An unbound compressor has no durable session state to maintain.
+    session_id = getattr(prepared, "_session_id", "")
+    if (
+        not isinstance(session_id, str)
+        or not session_id
+        or getattr(prepared, "_session_db", None) is None
+    ):
+        return
+    results = [
+        ("ineffective compression count", prepared._persist_ineffective_compression_count()),
+        ("proactive prune runway", prepared._clear_durable_proactive_prune_rearm()),
+    ]
     if changed:
-        prepared._persist_fallback_compression_streak()
-        prepared._durable_write(
-            "clear_compression_failure_cooldown", "compression failure cooldown clear"
-        )
-        prepared._persist_consecutive_overload_aborts()
+        results.extend([
+            ("fallback compression streak", prepared._persist_fallback_compression_streak()),
+            (
+                "compression failure cooldown",
+                prepared._durable_write(
+                    "clear_compression_failure_cooldown",
+                    "compression failure cooldown clear",
+                ),
+            ),
+            ("compression overload streak", prepared._persist_consecutive_overload_aborts()),
+        ])
+    failed = [label for label, succeeded in results if succeeded is not True]
+    if failed:
+        raise RuntimeError("compressor persistence failed: " + ", ".join(failed))
 
 
 def rebind_primary_credential_pool(

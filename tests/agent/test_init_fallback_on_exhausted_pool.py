@@ -18,6 +18,83 @@ def _mock_client(api_key="fb-key-1234567890", base_url="https://fb.example.com/v
     return c
 
 
+def test_init_fallback_publishes_restriction_before_credentials():
+    """Credential resolution observes the committed response-only fallback route."""
+    from types import SimpleNamespace
+
+    from agent.agent_init import _routed_client_kwargs
+
+    agent = SimpleNamespace(
+        provider="primary",
+        requested_provider="primary",
+        model="primary-model",
+        api_mode="chat_completions",
+        _provider_fallback_tool_policy="inherit",
+    )
+    fallback = {
+        "provider": "custom",
+        "model": "fallback-model",
+        "base_url": "https://fallback.invalid/v1",
+        "tool_policy": "none",
+    }
+    observations = []
+
+    def resolve_key(_entry):
+        observations.append(
+            (agent.provider, agent.model, agent._provider_fallback_tool_policy, agent._route_client_ready)
+        )
+        return ""
+
+    client = _mock_client(base_url="https://fallback.invalid/v1")
+    with patch(
+        "agent.auxiliary_client.resolve_provider_client",
+        side_effect=[(None, None), (client, "fallback-model")],
+    ), patch("hermes_cli.fallback_config.resolve_entry_api_key", side_effect=resolve_key):
+        _routed_client_kwargs(agent, [fallback], None)
+
+    assert observations == [("custom", "fallback-model", "none", False)]
+
+
+def test_init_fallback_does_not_reselect_after_post_publish_failure():
+    """A committed restrictive init route cannot hop to a second candidate on failure."""
+    from types import SimpleNamespace
+
+    from agent.agent_init import _routed_client_kwargs
+
+    agent = SimpleNamespace(
+        provider="primary",
+        requested_provider="primary",
+        model="primary-model",
+        api_mode="chat_completions",
+        _provider_fallback_tool_policy="inherit",
+    )
+    attempted = []
+
+    def resolve(provider, **_kwargs):
+        attempted.append(provider)
+        if provider == "primary":
+            return None, None
+        raise RuntimeError("first fallback failed")
+
+    with patch("agent.auxiliary_client.resolve_provider_client", side_effect=resolve), pytest.raises(
+        RuntimeError, match="first fallback failed"
+    ):
+        _routed_client_kwargs(
+            agent,
+            [
+                {"provider": "first", "model": "one", "tool_policy": "none"},
+                {"provider": "second", "model": "two", "tool_policy": "none"},
+            ],
+            None,
+        )
+
+    assert attempted == ["primary", "first"]
+    assert (agent.provider, agent.model, agent._provider_fallback_tool_policy) == (
+        "first", "one", "none"
+    )
+    assert agent._route_client_ready is False
+
+
 def test_init_tries_fallback_when_primary_returns_none():
     """When resolve_provider_client returns None for primary but succeeds for
     a fallback entry, __init__ should NOT raise RuntimeError."""
@@ -50,6 +127,7 @@ def test_init_tries_fallback_when_primary_returns_none():
         assert agent.model == "kimi2.5"
         assert agent._fallback_activated is True
         assert agent._provider_fallback_tool_policy == "none"
+        assert agent._route_client_ready is True
         assert agent._primary_runtime["fallback_tool_policy"] == "none"
 
 
@@ -73,57 +151,51 @@ def test_init_raises_when_no_fallback_configured():
             )
 
 
-def test_init_tries_fallback_when_openrouter_pool_exhausted():
-    """Regression: an exhausted ``openrouter`` pool (single credential entry
-    in 429-cooldown) must still reach fallback_providers at init.
-
-    Before the fix, the init-time fallback block was nested inside the
-    ``_explicit not in {auto, openrouter, custom}`` guard, so the default
-    openrouter setup skipped the chain entirely and raised the misleading
-    "No LLM provider configured" RuntimeError (2026-08-23 outage).
-    """
-    fb = _mock_client(api_key="local-key-1234567890",
-                      base_url="http://127.0.0.1:11434/v1")
+def test_init_openrouter_failure_does_not_reselect_custom_fallback():
+    """After publishing the first fallback, credential failure cannot hop to candidate two."""
+    attempted = []
 
     def fake_resolve(provider, model=None, raw_codex=False,
                      explicit_base_url=None, explicit_api_key=None):
-        if provider == "custom" and explicit_base_url:
-            return fb, "qwen3.5:4b"
-        return None, None  # openrouter pool exhausted
+        attempted.append(provider)
+        return None, None
 
     with patch("agent.auxiliary_client.resolve_provider_client", side_effect=fake_resolve), \
          patch("model_tools.get_tool_definitions", return_value=_make_tool_defs()), \
          patch("model_tools.check_toolset_requirements", return_value={}), \
          patch("agent.process_bootstrap.OpenAI", return_value=MagicMock()):
 
-        agent = AIAgent(
-            provider="openrouter",
-            model="z-ai/glm-5.2:free",
-            api_key=None,
-            base_url=None,
-            quiet_mode=True,
-            skip_context_files=True,
-            skip_memory=True,
-            fallback_model=[
-                {"provider": "openrouter", "model": "poolside/laguna-s-2.1:free"},
-                {"provider": "custom", "model": "qwen3.5:4b",
-                 "base_url": "http://127.0.0.1:11434/v1"},
-            ],
-        )
-        assert agent.provider == "custom"
-        assert agent.model == "qwen3.5:4b"
-        assert agent._fallback_activated is True
+        with pytest.raises(
+            RuntimeError, match="post-commit init fallback client resolution failed for openrouter"
+        ):
+            AIAgent(
+                provider="openrouter",
+                model="z-ai/glm-5.2:free",
+                api_key=None,
+                base_url=None,
+                quiet_mode=True,
+                skip_context_files=True,
+                skip_memory=True,
+                fallback_model=[
+                    {"provider": "openrouter", "model": "poolside/laguna-s-2.1:free"},
+                    {"provider": "custom", "model": "qwen3.5:4b",
+                     "base_url": "http://127.0.0.1:11434/v1"},
+                ],
+            )
+
+    assert attempted == ["openrouter", "openrouter"]
 
 
-def test_init_openrouter_exhausted_without_chain_keeps_generic_error():
-    """openrouter exhausted + no usable fallback keeps the generic
-    'No LLM provider configured' error (not the named-provider one)."""
+def test_init_single_fallback_failure_reports_committed_route():
+    """A one-entry chain reports post-publication failure rather than generic setup advice."""
     with patch("agent.auxiliary_client.resolve_provider_client", return_value=(None, None)), \
          patch("model_tools.get_tool_definitions", return_value=_make_tool_defs()), \
          patch("model_tools.check_toolset_requirements", return_value={}), \
          patch("agent.process_bootstrap.OpenAI", return_value=MagicMock()):
 
-        with pytest.raises(RuntimeError, match="No LLM provider configured"):
+        with pytest.raises(
+            RuntimeError, match="post-commit init fallback client resolution failed for openrouter"
+        ):
             AIAgent(
                 provider="openrouter",
                 model="z-ai/glm-5.2:free",
