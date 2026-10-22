@@ -206,8 +206,9 @@ def _bind_route_entry_in_place(
 def _materialize_route_client_in_place(agent: Any, entry: dict[str, Any], provider: str) -> None:
     """Install real credentials/client without publishing route readiness."""
     if provider == "moa":
-        from agent.moa_loop import bind_moa_runtime
+        from agent.moa_loop import bind_moa_runtime, materialize_moa_slot_runtimes
         bind_moa_runtime(agent, agent.model, owner=agent)
+        materialize_moa_slot_runtimes(agent.model)
         return  # The facade resolves its advisors/aggregator lazily on the committed route.
     from agent.auxiliary_client import resolve_provider_client
     from agent.chat_completion_helpers import (

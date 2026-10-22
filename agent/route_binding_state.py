@@ -45,15 +45,7 @@ def rebind_primary_credential_pool(
     if pool is None or not matches_primary(pool):
         agent._credential_pool = None
         agent._credential_pool_entry_id = None
-        try:
-            agent._credential_pool = prefetched_pool if prefetched else load_primary_pool()
-        except Exception as exc:
-            logger.warning(
-                "Restore could not reload primary credential pool for %s: %s",
-                primary_provider,
-                exc,
-                exc_info=True,
-            )
+        agent._credential_pool = prefetched_pool if prefetched else load_primary_pool()
     agent._credential_pool_entry_id = None
     pool = getattr(agent, "_credential_pool", None)
     entry = pool.select(model=primary_model or None) if pool is not None else None

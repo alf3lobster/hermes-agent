@@ -1883,14 +1883,11 @@ def _rebind_fallback_credential_pool(
                 fb_provider, fb_model, pool_provider)
             agent._credential_pool = agent._credential_pool_entry_id = None
     if load_if_missing and getattr(agent, "_credential_pool", None) is None:
-        try:
-            from agent.credential_pool import load_pool
-            fallback_pool = load_pool(fb_provider)
-            if fallback_pool and fallback_pool.has_credentials():
-                agent._credential_pool = fallback_pool
-                logger.info("Fallback to %s/%s: attached fallback credential pool", fb_provider, fb_model)
-        except Exception as exc:
-            logger.debug("Fallback to %s/%s: could not attach credential pool: %s", fb_provider, fb_model, exc)
+        from agent.credential_pool import load_pool
+        fallback_pool = load_pool(fb_provider)
+        if fallback_pool and fallback_pool.has_credentials():
+            agent._credential_pool = fallback_pool
+            logger.info("Fallback to %s/%s: attached fallback credential pool", fb_provider, fb_model)
 
 
 def _log_fallback_activated(agent, reason, old_model, old_provider, fb_model, fb_provider) -> None:

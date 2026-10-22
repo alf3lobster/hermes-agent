@@ -558,11 +558,6 @@ def test_post_commit_pool_failure_keeps_primary_route(monkeypatch):
     monkeypatch.setattr(
         "agent.agent_runtime_helpers._rebuild_primary_client", lambda *_args, **_kwargs: None,
     )
-    monkeypatch.setattr(
-        route_binding,
-        "rebind_primary_credential_pool",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("pool maintenance failed")),
-    )
 
     route_binding.reinstall_primary_runtime(
         agent,
@@ -570,7 +565,7 @@ def test_post_commit_pool_failure_keeps_primary_route(monkeypatch):
         "primary-provider",
         "primary-model",
         lambda _candidate: True,
-        lambda: None,
+        lambda: (_ for _ in ()).throw(RuntimeError("pool maintenance failed")),
     )
 
     assert agent.model == "primary-model"
@@ -591,7 +586,11 @@ def test_fallback_materialization_failure_after_client_swap_leaves_route_inert(m
         provider="custom",
         base_url="https://restricted.invalid/v1",
         api_mode="chat_completions",
+        _credential_pool=None,
+        _credential_pool_entry_id=None,
         _route_client_ready=False,
+        _anthropic_prompt_cache_policy=lambda **_kwargs: (False, False),
+        _ensure_lmstudio_runtime_loaded=lambda: None,
     )
     monkeypatch.setattr(
         "agent.auxiliary_client.resolve_provider_client",
@@ -599,9 +598,11 @@ def test_fallback_materialization_failure_after_client_swap_leaves_route_inert(m
     )
     monkeypatch.setattr("agent.client_lifecycle._swap_fallback_clients", lambda *_args: None)
     monkeypatch.setattr(
-        "agent.chat_completion_helpers._rebind_fallback_credential_pool",
+        "agent.credential_pool.load_pool",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("pool maintenance failed")),
     )
+    monkeypatch.setattr("agent.agent_runtime_helpers.sync_credential_pool_entry_id", lambda *_args: None)
+    monkeypatch.setattr("agent.chat_completion_helpers._update_fallback_context_compressor", lambda *_args: None)
 
     with pytest.raises(RuntimeError, match="pool maintenance failed"):
         route_binding._materialize_route_client(
@@ -611,6 +612,33 @@ def test_fallback_materialization_failure_after_client_swap_leaves_route_inert(m
         )
 
     assert agent._route_client_ready is False
+
+
+def test_moa_materialization_resolves_every_slot_before_readiness(monkeypatch):
+    """The lazy MoA facade cannot become ready before advisor and aggregator routes resolve."""
+    from agent import moa_loop, route_binding
+
+    preset = {
+        "enabled": True,
+        "reference_models": [{"provider": "custom", "model": "advisor", "enabled": True}],
+        "aggregator": {"provider": "custom", "model": "aggregator"},
+    }
+    resolve = MagicMock(return_value={
+        "provider": "custom",
+        "model": "resolved",
+        "base_url": "https://models.invalid/v1",
+        "api_key": "test-key",
+        "api_mode": "chat_completions",
+    })
+    agent = SimpleNamespace(model="council", provider="moa", _route_client_ready=False)
+    monkeypatch.setattr(moa_loop, "build_moa_facade", lambda *_args, **_kwargs: object())
+    monkeypatch.setattr(moa_loop, "_resolve_preset_cached", lambda _name: (preset, {}))
+    monkeypatch.setattr("hermes_cli.runtime_provider.resolve_runtime_provider", resolve)
+
+    route_binding._materialize_route_client(agent, {}, "moa")
+
+    assert agent._route_client_ready is True
+    assert resolve.call_count == 2
 
 
 def test_runtime_snapshot_maintenance_failure_leaves_route_inert(monkeypatch):

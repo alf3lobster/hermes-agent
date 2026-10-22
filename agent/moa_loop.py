@@ -247,7 +247,7 @@ def _aggregator_reasoning_config(aggregator: dict[str, Any]) -> dict[str, Any] |
         return None
 
 
-def _slot_runtime(slot: dict[str, Any]) -> dict[str, Any]:
+def _slot_runtime(slot: dict[str, Any], *, strict: bool = False) -> dict[str, Any]:
     """Slot → ``call_llm`` kwargs with the provider's real api_mode/base_url/api_key.
 
     Cached per (profile home, provider, model) with a short TTL. Falls back to bare provider/model
@@ -274,12 +274,29 @@ def _slot_runtime(slot: dict[str, Any]) -> dict[str, Any]:
         if isinstance(extra_body, dict) and extra_body:
             out["extra_body"] = dict(extra_body)
     except Exception as exc:
+        if strict:
+            raise RuntimeError(f"MoA slot {_slot_label(slot)} could not be resolved") from exc
         logger.warning("MoA slot %s: provider '%s' could not be resolved (%s); calling with bare provider/model",
                        _slot_label(slot), provider, exc)
         return out
     with _runtime_cache_lock:
         _runtime_cache[cache_key] = (now, out)
     return out
+
+
+def materialize_moa_slot_runtimes(preset_name: str) -> None:
+    """Resolve and cache every enabled advisor and aggregator before route readiness."""
+    preset, _moa_raw = _resolve_preset_cached(preset_name)
+    slots = [
+        slot for slot in (preset.get("reference_models") or []) if slot.get("enabled", True)
+    ] if preset.get("enabled", True) else []
+    aggregator = preset.get("aggregator") or {}
+    if aggregator:
+        slots.append(aggregator)
+    if not slots:
+        raise RuntimeError(f"MoA preset {preset_name!r} has no enabled runtime slots")
+    for slot in slots:
+        _slot_runtime(slot, strict=True)
 
 
 def _merge_slot_extra_body(slot_extra_body: Any, caller_extra_body: Any) -> Any:
