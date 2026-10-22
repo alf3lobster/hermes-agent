@@ -1357,7 +1357,7 @@ def _primary_quota_reopen_probe_due(agent, primary_provider) -> bool:
 def restore_primary_runtime(agent) -> bool:
     """Restore the primary runtime at the start of a new turn when the fallback is usable."""
     if not agent._fallback_activated:
-        if getattr(agent, "_provider_fallback_active", False) and not getattr(agent, "_route_client_ready", False):
+        if getattr(agent, "_route_client_ready", True) is not True:
             return False  # A committed inert route cannot be re-armed or widened automatically.
         agent._fallback_index = 0
         _revert_credential_rotation(agent)
@@ -1425,6 +1425,8 @@ def restore_primary_runtime(agent) -> bool:
             )
         return True
     except RouteCommittedError:
+        from agent.route_binding import close_committed_route_retry
+        close_committed_route_retry(agent)
         logger.exception(
             "Primary route was committed for %s (%s), but maintenance left its client inert",
             agent.model,

@@ -400,7 +400,7 @@ def reinstall_runtime_snapshot(agent: Any, rt: dict[str, Any]) -> None:
         _rebuild_primary_client(agent, rt, reason="restore_snapshot", owner=agent, mark_ready=False)
         _revalidate_committed_compression(agent)
         agent._route_client_ready = True
-    except Exception:
+    except Exception as exc:
         agent._route_client_ready = False
         logger.warning(
             "Runtime route committed but client maintenance failed for %s/%s",
@@ -408,6 +408,7 @@ def reinstall_runtime_snapshot(agent: Any, rt: dict[str, Any]) -> None:
             rt.get("model", ""),
             exc_info=True,
         )
+        raise RouteCommittedError(f"committed route maintenance failed: {exc}") from exc
 
 
 def reinstall_primary_runtime(
@@ -446,7 +447,7 @@ def reinstall_primary_runtime(
                 logger.info(
                     "Primary Codex route committed but quota remains unavailable; client stays inert",
                 )
-                return
+                raise RouteCommittedError("committed primary route remains unavailable after quota probe")
             agent._rate_limited_until = 0
             prefetched_pool, prefetched = pool, True
         from agent.agent_runtime_helpers import _rebuild_primary_client
@@ -459,7 +460,10 @@ def reinstall_primary_runtime(
         )
         agent._primary_credential_pool = getattr(agent, "_credential_pool", None)
         agent._route_client_ready = True
-    except Exception:
+    except RouteCommittedError:
+        agent._route_client_ready = False
+        raise
+    except Exception as exc:
         agent._route_client_ready = False
         logger.warning(
             "Primary route committed but client/credential maintenance failed for %s/%s",
@@ -467,3 +471,4 @@ def reinstall_primary_runtime(
             primary_model,
             exc_info=True,
         )
+        raise RouteCommittedError(f"committed primary route maintenance failed: {exc}") from exc

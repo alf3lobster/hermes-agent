@@ -187,6 +187,69 @@ def test_end_voice_post_commit_restore_failure_does_not_arm_retry(tmp_path, monk
         assert agent._restore_primary_runtime() is False
 
 
+def test_end_voice_client_rebuild_failure_closes_restore_bookkeeping(tmp_path, monkeypatch):
+    """A committed session route with failed client rebuild cannot re-arm the prior fallback."""
+    from agent.voice_turn_route import begin_voice_turn_route, end_voice_turn_route
+
+    with FakeLLMServer([]) as main, FakeLLMServer([]) as voice:
+        home = write_hermes_home(tmp_path / ".hermes", main.base_url, extra_config=(
+            "auxiliary:\n  voice_chat:\n    provider: custom\n"
+            f"    base_url: {voice.base_url}\n    model: voice-model\n    api_key: «redacted:sk-…»\n"
+        ))
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        agent = _agent(home, main.base_url)
+        agent._fallback_chain = [{"provider": "custom", "model": "session-fallback"}]
+        agent._fallback_index = 1
+        agent._fallback_activated = True
+        agent._provider_fallback_active = True
+        agent._voice_turn_pending = True
+        begin_voice_turn_route(agent, [{"role": "user", "content": "hi"}], "system")
+
+        monkeypatch.setattr(
+            "agent.agent_runtime_helpers._rebuild_primary_client",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("client rebuild failed")),
+        )
+        end_voice_turn_route(agent)
+
+        assert agent.model == "fake-model"
+        assert agent._route_client_ready is False
+        assert agent._fallback_activated is False
+        assert agent._fallback_index == len(agent._fallback_chain)
+        assert agent._restore_primary_runtime() is False
+
+
+def test_committed_inert_route_cannot_enter_voice_route(tmp_path, monkeypatch):
+    """An ordinary voice turn is not authority to leave a committed inert restrictive route."""
+    from agent.voice_turn_route import begin_voice_turn_route
+
+    with FakeLLMServer([]) as main, FakeLLMServer([]) as voice:
+        home = write_hermes_home(tmp_path / ".hermes", main.base_url, extra_config=(
+            "auxiliary:\n  voice_chat:\n    provider: custom\n"
+            f"    base_url: {voice.base_url}\n    model: voice-model\n    api_key: «redacted:sk-…»\n"
+        ))
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        agent = _agent(home, main.base_url)
+        agent.model = "restricted"
+        agent._provider_fallback_tool_policy = "none"
+        agent._route_client_ready = False
+        agent._fallback_chain = [{"provider": "custom", "model": "restricted"}]
+        agent._fallback_index = 1
+        agent._fallback_activated = False
+        agent._voice_turn_pending = True
+        monkeypatch.setattr(
+            "agent.route_binding.bind_route_entry",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("inert route escaped")),
+        )
+
+        result = begin_voice_turn_route(agent, [{"role": "user", "content": "hi"}], "system")
+
+        assert result == "system"
+        assert agent.model == "restricted"
+        assert agent._provider_fallback_tool_policy == "none"
+        assert agent._route_client_ready is False
+        assert agent._fallback_index == 1
+
+
 def test_voice_restore_rebinds_captured_pool_before_readiness(tmp_path, monkeypatch):
     """The session pool is part of the atomic runtime snapshot, never a post-ready extra."""
     import agent.voice_turn_route as voice_route

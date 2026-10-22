@@ -396,6 +396,43 @@ def test_codex_early_reopen_does_not_load_primary_pool_before_commit(monkeypatch
     assert agent._provider_fallback_tool_policy == "none"
 
 
+def test_committed_primary_restore_failure_closes_retry_and_credential_revert(monkeypatch):
+    """A committed inert primary cannot reset fallback selection or touch credentials next turn."""
+    from agent.agent_runtime_helpers import restore_primary_runtime
+    from agent.route_binding import RouteCommittedError
+
+    agent = _fallback_restore_agent("custom")
+    agent._fallback_chain = [
+        {"provider": "custom", "model": "restricted"},
+        {"provider": "custom", "model": "broader"},
+    ]
+    agent._route_client_ready = True
+    revert = MagicMock()
+
+    def commit_then_fail(target, *_args, **_kwargs):
+        target.model = "primary-model"
+        target.provider = "custom"
+        target._fallback_activated = False
+        target._fallback_index = 0
+        target._provider_fallback_active = False
+        target._route_client_ready = False
+        raise RouteCommittedError("client maintenance failed")
+
+    monkeypatch.setattr("agent.fallback_cooldown._is_entitlement_rejected", lambda *_args: False)
+    monkeypatch.setattr("hermes_cli.chat_catalog.is_known_non_chat_model", lambda *_args: False)
+    monkeypatch.setattr("agent.agent_runtime_helpers._primary_reset_gate_blocks", lambda *_args: (False, None, False))
+    monkeypatch.setattr("agent.agent_runtime_helpers._revert_credential_rotation", revert)
+    monkeypatch.setattr("agent.route_binding.reinstall_primary_runtime", commit_then_fail)
+
+    assert restore_primary_runtime(agent) is True
+    assert agent._route_client_ready is False
+    assert agent._fallback_activated is False
+    assert agent._fallback_index == len(agent._fallback_chain)
+    assert restore_primary_runtime(agent) is False
+    assert agent._fallback_index == len(agent._fallback_chain)
+    revert.assert_not_called()
+
+
 def test_post_publication_notice_failure_keeps_committed_fallback(monkeypatch):
     """Reporting failure cannot turn one committed fallback into another route attempt."""
     from agent.chat_completion_helpers import try_activate_fallback
@@ -677,14 +714,15 @@ def test_post_commit_pool_failure_keeps_primary_route(monkeypatch):
         "agent.agent_runtime_helpers._rebuild_primary_client", lambda *_args, **_kwargs: None,
     )
 
-    route_binding.reinstall_primary_runtime(
-        agent,
-        {"fallback_tool_policy": "inherit"},
-        "primary-provider",
-        "primary-model",
-        lambda _candidate: True,
-        lambda: (_ for _ in ()).throw(RuntimeError("pool maintenance failed")),
-    )
+    with pytest.raises(route_binding.RouteCommittedError, match="pool maintenance failed"):
+        route_binding.reinstall_primary_runtime(
+            agent,
+            {"fallback_tool_policy": "inherit"},
+            "primary-provider",
+            "primary-model",
+            lambda _candidate: True,
+            lambda: (_ for _ in ()).throw(RuntimeError("pool maintenance failed")),
+        )
 
     assert agent.model == "primary-model"
     assert agent.provider == "primary-provider"
@@ -914,7 +952,8 @@ def test_runtime_snapshot_maintenance_failure_leaves_route_inert(monkeypatch):
         lambda *_args: (_ for _ in ()).throw(RuntimeError("compression maintenance failed")),
     )
 
-    route_binding.reinstall_runtime_snapshot(agent, {"provider": "custom", "model": "primary"})
+    with pytest.raises(route_binding.RouteCommittedError, match="compression maintenance failed"):
+        route_binding.reinstall_runtime_snapshot(agent, {"provider": "custom", "model": "primary"})
 
     assert agent._route_client_ready is False
 
