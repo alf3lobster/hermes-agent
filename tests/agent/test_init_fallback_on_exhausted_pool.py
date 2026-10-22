@@ -143,6 +143,158 @@ def test_init_fallback_becomes_ready_after_matching_pool_and_snapshot(monkeypatc
     assert agent._primary_credential_pool is fallback_pool
 
 
+def test_init_fallback_materializes_native_anthropic_before_readiness(monkeypatch):
+    """Constructor fallback binds the final Anthropic wire before snapshot/publication."""
+    from agent import agent_init
+
+    primary_pool = _TaggedPool("openrouter", "primary-key", "primary-entry")
+    fallback_pool = _TaggedPool("anthropic", "fallback-key", "fallback-entry")
+    routed_fallback = _mock_client(
+        api_key="fallback-key", base_url="https://api.anthropic.com"
+    )
+    native_client = object()
+    snapshot_states = []
+    original_snapshot = agent_init._snapshot_primary_runtime
+
+    def resolve(provider, **_kwargs):
+        if provider == "openrouter":
+            return None, None
+        assert provider == "anthropic"
+        return routed_fallback, "claude-sonnet-4-6"
+
+    def observe_snapshot(agent):
+        snapshot_states.append(
+            (
+                agent._route_client_ready,
+                agent.client,
+                agent._anthropic_client,
+                agent._credential_pool,
+                agent._credential_pool_entry_id,
+            )
+        )
+        original_snapshot(agent)
+
+    openai_constructor = MagicMock(return_value=MagicMock())
+    build_anthropic = MagicMock(return_value=native_client)
+    monkeypatch.setattr("agent.auxiliary_client.resolve_provider_client", resolve)
+    monkeypatch.setattr("agent.credential_pool.load_pool", lambda provider: fallback_pool)
+    monkeypatch.setattr("agent.anthropic_adapter.build_anthropic_client", build_anthropic)
+    monkeypatch.setattr(agent_init, "_snapshot_primary_runtime", observe_snapshot)
+
+    with (
+        patch("model_tools.get_tool_definitions", return_value=_make_tool_defs()),
+        patch("model_tools.check_toolset_requirements", return_value={}),
+        patch("agent.process_bootstrap.OpenAI", openai_constructor),
+    ):
+        agent = AIAgent(
+            provider="openrouter",
+            model="primary-model",
+            credential_pool=primary_pool,
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+            fallback_model=[{
+                "provider": "anthropic",
+                "model": "claude-sonnet-4-6",
+                "tool_policy": "none",
+            }],
+        )
+
+    openai_constructor.assert_not_called()
+    build_anthropic.assert_called_once_with(
+        "fallback-key", "https://api.anthropic.com", timeout=None
+    )
+    assert snapshot_states == [
+        (False, None, native_client, fallback_pool, "fallback-entry")
+    ]
+    assert agent.api_mode == "anthropic_messages"
+    assert agent.api_key == agent._anthropic_api_key == "fallback-key"
+    assert agent._anthropic_base_url == "https://api.anthropic.com"
+    assert agent._is_anthropic_oauth is False
+    assert agent._primary_runtime["anthropic_api_key"] == "fallback-key"
+    assert agent._route_client_ready is True
+
+
+@pytest.mark.parametrize("api_mode", [None, "anthropic_messages"])
+def test_init_fallback_materializes_bedrock_wire_before_readiness(monkeypatch, api_mode):
+    """Constructor fallback binds either native Bedrock wire without an OpenAI client."""
+    from agent import agent_init
+
+    primary_pool = _TaggedPool("openrouter", "primary-key", "primary-entry")
+    fallback_pool = _TaggedPool("bedrock", "aws-sdk", "bedrock-entry")
+    routed_fallback = _mock_client(
+        api_key="aws-sdk",
+        base_url="https://bedrock-runtime.us-west-2.amazonaws.com",
+    )
+    bind_calls = []
+    snapshot_states = []
+    original_snapshot = agent_init._snapshot_primary_runtime
+
+    def resolve(provider, **_kwargs):
+        if provider == "openrouter":
+            return None, None
+        assert provider == "bedrock"
+        return routed_fallback, "anthropic.claude-sonnet-4-6-v1:0"
+
+    def bind_bedrock(agent, base_url, api_mode):
+        bind_calls.append((base_url, api_mode, agent._route_client_ready))
+        agent._bedrock_region = "us-west-2"
+        agent._bedrock_guardrail_config = None
+        agent.client = None
+        agent._client_kwargs = {}
+        agent.api_key = agent._anthropic_api_key = "aws-sdk"
+        agent._anthropic_base_url = base_url
+        agent._is_anthropic_oauth = False
+        agent._anthropic_client = None
+
+    def observe_snapshot(agent):
+        snapshot_states.append(
+            (
+                agent._route_client_ready,
+                agent.client,
+                agent._credential_pool,
+                agent._credential_pool_entry_id,
+            )
+        )
+        original_snapshot(agent)
+
+    openai_constructor = MagicMock(return_value=MagicMock())
+    monkeypatch.setattr("agent.auxiliary_client.resolve_provider_client", resolve)
+    monkeypatch.setattr("agent.credential_pool.load_pool", lambda provider: fallback_pool)
+    monkeypatch.setattr("agent.bedrock_adapter.bind_bedrock_runtime", bind_bedrock)
+    monkeypatch.setattr(agent_init, "_snapshot_primary_runtime", observe_snapshot)
+
+    with (
+        patch("model_tools.get_tool_definitions", return_value=_make_tool_defs()),
+        patch("model_tools.check_toolset_requirements", return_value={}),
+        patch("agent.process_bootstrap.OpenAI", openai_constructor),
+    ):
+        agent = AIAgent(
+            provider="openrouter",
+            model="primary-model",
+            credential_pool=primary_pool,
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+            fallback_model=[{
+                "provider": "bedrock",
+                "model": "anthropic.claude-sonnet-4-6-v1:0",
+                "tool_policy": "none",
+                **({"api_mode": api_mode} if api_mode else {}),
+            }],
+        )
+
+    openai_constructor.assert_not_called()
+    expected_mode = api_mode or "bedrock_converse"
+    assert bind_calls == [
+        ("https://bedrock-runtime.us-west-2.amazonaws.com", expected_mode, False)
+    ]
+    assert snapshot_states == [(False, None, fallback_pool, "bedrock-entry")]
+    assert agent.api_mode == expected_mode
+    assert agent._bedrock_region == "us-west-2"
+    assert agent._route_client_ready is True
+
+
 def test_init_fallback_does_not_reselect_after_post_publish_failure():
     """A committed restrictive init route cannot hop to a second candidate on failure."""
     from types import SimpleNamespace

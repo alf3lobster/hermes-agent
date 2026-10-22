@@ -23,7 +23,12 @@ from typing import Any, Callable, Dict, List, Optional
 from urllib.parse import parse_qs, urlparse, urlunparse
 
 from agent.context_compressor import ContextCompressor
-from agent.agent_init_fallback import _fallback_entries, _init_fallback_chain, recompute_init_fallback_api_mode
+from agent.agent_init_fallback import (
+    _fallback_entries,
+    _init_fallback_chain,
+    _client_kwargs_from_routed,
+    recompute_init_fallback_api_mode,
+)
 from agent.agent_init_params import _CALLBACK_PARAMS, _GATEWAY_IDENTITY_PARAMS, _PASSTHROUGH_PARAMS
 from agent.agent_runtime_helpers import _ra
 from agent.iteration_budget import IterationBudget, normalize_budget_warning_ratio
@@ -851,8 +856,8 @@ def _routed_client_kwargs(agent, fallback_model, _provider_timeout) -> Optional[
     """OpenAI-client kwargs via the centralized provider router (no explicit creds).
 
     Falls through to the init-time fallback chain, then raises with the missing-key /
-    no-provider diagnostic. ``None`` when the chain landed on a MoA preset: the facade is
-    already bound and there is no OpenAI client to construct.
+    no-provider diagnostic. ``None`` when the fallback runtime is already materialized;
+    there is no generic OpenAI client left to construct.
     """
     from agent.auxiliary_client import resolve_provider_client
     _routed_client, _ = resolve_provider_client(
@@ -900,10 +905,16 @@ def _routed_client_kwargs(agent, fallback_model, _provider_timeout) -> Optional[
             agent._provider_fallback_route = (str(agent.model), str(agent.provider))
         if _fb_provider.strip().lower() == "moa":
             from agent.moa_loop import bind_materialized_moa_runtime
-            bind_materialized_moa_runtime(agent, _fb["model"])
+            bind_materialized_moa_runtime(agent, agent.model)
             return None
-        recompute_init_fallback_api_mode(agent, _fb_client)
-        return _client_kwargs_from_routed(_fb_client, _provider_timeout)
+        recompute_init_fallback_api_mode(agent, _fb_client, _fb)
+        agent.base_url = str(_fb_client.base_url)
+        from agent.client_lifecycle import _swap_fallback_clients
+        _swap_fallback_clients(
+            agent, _fb_client, str(agent.provider), str(agent.model),
+            agent.base_url, agent.api_mode,
+        )
+        return None
     # A burned credential pool (#119533) is otherwise indistinguishable from missing config,
     # so name it even when no fallback entries are configured.
     _pool_exhausted = False
@@ -989,8 +1000,8 @@ def _init_openai_client(agent, api_key, base_url, fallback_model, _provider_time
         client_kwargs = _explicit_client_kwargs(agent, api_key, base_url, _provider_timeout)
     else:
         client_kwargs = _routed_client_kwargs(agent, fallback_model, _provider_timeout)
-        if client_kwargs is None:  # init-time fallback bound the MoA facade
-            if not agent.quiet_mode:
+        if client_kwargs is None:  # init-time fallback already bound its final wire runtime
+            if not agent.quiet_mode and agent.provider == "moa":
                 print(f"🤖 AI Agent initialized with MoA preset: {agent.model}")
             return
     from hermes_cli.providers import is_actual_route
@@ -1071,21 +1082,6 @@ def _host_default_headers_factory(base_url: str):
             return factory
     return None
 
-
-def _client_kwargs_from_routed(client, timeout) -> dict[str, Any]:
-    """OpenAI-client kwargs mirroring a router-resolved client, keeping its provider headers
-    (SDK stores them in ``_custom_headers``; older/mocked clients expose ``default_headers``)."""
-    kwargs = {"api_key": client.api_key, "base_url": str(client.base_url)}
-    if timeout is not None:
-        kwargs["timeout"] = timeout
-    headers = (
-        getattr(client, "_custom_headers", None)
-        or getattr(client, "default_headers", None)
-        or getattr(client, "_default_headers", None)
-    )
-    if headers:
-        kwargs["default_headers"] = dict(headers)
-    return kwargs
 
 
 def _load_tools(agent, enabled_toolsets, disabled_toolsets):

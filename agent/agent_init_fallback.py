@@ -8,6 +8,21 @@ from typing import Any, Dict, List
 logger = logging.getLogger("run_agent")
 
 
+def _client_kwargs_from_routed(client, timeout) -> dict[str, Any]:
+    """OpenAI kwargs preserving the provider headers baked into a routed client."""
+    kwargs = {"api_key": client.api_key, "base_url": str(client.base_url)}
+    if timeout is not None:
+        kwargs["timeout"] = timeout
+    headers = (
+        getattr(client, "_custom_headers", None)
+        or getattr(client, "default_headers", None)
+        or getattr(client, "_default_headers", None)
+    )
+    if headers:
+        kwargs["default_headers"] = dict(headers)
+    return kwargs
+
+
 def _fallback_entries(fallback_model) -> list[dict[str, Any]]:
     """Normalize legacy single-dict ``fallback_model`` / list ``fallback_providers``."""
     if isinstance(fallback_model, dict):
@@ -45,7 +60,7 @@ def _init_fallback_chain(agent, fallback_model):
             print(f"🔄 Fallback chain ({len(chain)} providers): " + " → ".join(labels))
 
 
-def recompute_init_fallback_api_mode(agent, fb_client) -> None:
+def recompute_init_fallback_api_mode(agent, fb_client, entry: dict[str, Any] | None = None) -> None:
     """Give an init-time fallback its own api_mode instead of the unreachable primary's.
 
     A Nous primary configured with ``api_mode: codex_responses`` otherwise leaves a Copilot
@@ -55,10 +70,19 @@ def recompute_init_fallback_api_mode(agent, fb_client) -> None:
     ``_primary_runtime`` snapshot so ``restore_primary_runtime`` replays the recomputed mode.
     A detection failure keeps the primary's mode and never blocks the fallback itself.
     """
-    from agent.chat_completion_helpers import _fallback_api_mode_resolved
+    from agent.chat_completion_helpers import _fallback_api_mode_hint, _fallback_api_mode_resolved
     try:
-        agent.api_mode = _fallback_api_mode_resolved(
-            agent, agent.provider, agent.model, str(getattr(fb_client, "base_url", "") or ""))
+        explicit, hinted_mode = _fallback_api_mode_hint(
+            entry or {}, agent.provider, str((entry or {}).get("base_url") or "") or None,
+        )
+        agent.api_mode = (
+            hinted_mode
+            if explicit or hinted_mode != "chat_completions"
+            else _fallback_api_mode_resolved(
+                agent, agent.provider, agent.model,
+                str(getattr(fb_client, "base_url", "") or ""),
+            )
+        )
     except Exception:
         logger.debug("Init-time fallback api_mode detection failed for %s", agent.provider, exc_info=True)
         return
