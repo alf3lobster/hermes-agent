@@ -2239,6 +2239,7 @@ def _codex_summary_attempt(agent, api_messages: list, api_request_id: str):
 
 def _anthropic_summary_attempt(agent, api_messages: list, api_request_id: str):
     def _attempt(retry_count: int) -> str:
+        require_route_client_ready(agent)
         ant_kw = agent._get_transport().build_kwargs(
             model=agent.model, messages=api_messages, tools=None, max_tokens=agent.max_tokens,
             reasoning_config=agent.reasoning_config, is_oauth=agent._is_anthropic_oauth,
@@ -2252,8 +2253,7 @@ def _anthropic_summary_attempt(agent, api_messages: list, api_request_id: str):
 
 def _chat_summary_attempt(agent, api_messages: list, api_request_id: str):
     require_route_client_ready(agent)
-    # Same kwargs builder as the main loop so the summary keeps the cached prefix (tools,
-    # prompt_cache_key, xAI alias, Moonshot sanitization). Do not omit tools or force
+    # Keep main-loop kwargs so the summary retains cached tools and sanitization; do not omit tools or force
     # tool_choice="none" here: SGLang renders the prompt with tools=None in that mode and the KV
     # prefix diverges. (cache_control breakpoint decoration is not re-applied on this path.)
     summary_kwargs = agent._build_api_kwargs(api_messages)

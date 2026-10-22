@@ -18,6 +18,19 @@ def _mock_client(api_key="fb-key-1234567890", base_url="https://fb.example.com/v
     return c
 
 
+class _TaggedPool:
+    def __init__(self, provider, api_key, entry_id):
+        self.provider = provider
+        self.api_key = api_key
+        self.entry_id = entry_id
+
+    def has_credentials(self):
+        return True
+
+    def entry_id_for_api_key(self, api_key):
+        return self.entry_id if api_key == self.api_key else None
+
+
 def test_init_fallback_publishes_restriction_before_credentials():
     """Credential resolution observes the committed response-only fallback route."""
     from types import SimpleNamespace
@@ -53,6 +66,81 @@ def test_init_fallback_publishes_restriction_before_credentials():
         _routed_client_kwargs(agent, [fallback], None)
 
     assert observations == [("custom", "fallback-model", "none", False)]
+
+
+def test_init_fallback_becomes_ready_after_matching_pool_and_snapshot(monkeypatch):
+    """Constructor fallback publishes readiness only after its route authority is complete."""
+    from agent import agent_init
+
+    primary_pool = _TaggedPool("openrouter", "primary-key", "primary-entry")
+    fallback_pool = _TaggedPool("deepseek", "fallback-key", "fallback-entry")
+    routed_fallback = _mock_client(
+        api_key="fallback-key", base_url="https://api.deepseek.com/v1"
+    )
+    readiness_writes = []
+
+    class ObservedAgent(AIAgent):
+        @property
+        def _route_client_ready(self):
+            return self.__dict__.get("_route_client_ready_value", True)
+
+        @_route_client_ready.setter
+        def _route_client_ready(self, value):
+            readiness_writes.append(
+                (
+                    value,
+                    getattr(self, "provider", None),
+                    getattr(self, "_credential_pool", None),
+                    getattr(self, "_credential_pool_entry_id", None),
+                    hasattr(self, "_primary_runtime"),
+                )
+            )
+            self.__dict__["_route_client_ready_value"] = value
+
+    def resolve(provider, **_kwargs):
+        if provider == "openrouter":
+            return None, None
+        assert provider == "deepseek"
+        return routed_fallback, "deepseek-chat"
+
+    snapshot_readiness = []
+    original_snapshot = agent_init._snapshot_primary_runtime
+
+    def observe_snapshot(agent):
+        snapshot_readiness.append(agent._route_client_ready)
+        original_snapshot(agent)
+
+    monkeypatch.setattr("agent.auxiliary_client.resolve_provider_client", resolve)
+    monkeypatch.setattr("agent.credential_pool.load_pool", lambda provider: fallback_pool)
+    monkeypatch.setattr(agent_init, "_snapshot_primary_runtime", observe_snapshot)
+
+    with (
+        patch("model_tools.get_tool_definitions", return_value=_make_tool_defs()),
+        patch("model_tools.check_toolset_requirements", return_value={}),
+        patch("agent.process_bootstrap.OpenAI", return_value=MagicMock()),
+    ):
+        agent = ObservedAgent(
+            provider="openrouter",
+            model="primary-model",
+            credential_pool=primary_pool,
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+            fallback_model=[{
+                "provider": "deepseek",
+                "model": "deepseek-chat",
+                "tool_policy": "none",
+            }],
+        )
+
+    assert snapshot_readiness == [False]
+    assert readiness_writes == [
+        (False, "deepseek", primary_pool, None, False),
+        (True, "deepseek", fallback_pool, "fallback-entry", True),
+    ]
+    assert agent._credential_pool is fallback_pool
+    assert agent._credential_pool_entry_id == "fallback-entry"
+    assert agent._primary_credential_pool is fallback_pool
 
 
 def test_init_fallback_does_not_reselect_after_post_publish_failure():

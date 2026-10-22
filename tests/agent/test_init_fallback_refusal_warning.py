@@ -1,10 +1,4 @@
-"""A fully-refusing init-time fallback ladder must say why at WARNING before dying.
-
-One burned primary (an exhausted single-entry OpenRouter pool, for example) plus fallback
-entries that cannot resolve credentials raises the generic ``No LLM provider configured``
-RuntimeError. Without a WARNING naming each refused entry and its reason, the failure is
-indistinguishable from actual config loss in gateway.log.
-"""
+"""Init-time fallback diagnostics preserve committed-route safety."""
 
 import logging
 from types import SimpleNamespace
@@ -28,14 +22,6 @@ _LADDER = [
 ]
 
 
-_LADDER_REASONS = (
-    "deepseek",
-    "no usable credentials",
-    "kimi",
-    "kimi auth handshake refused",
-)
-
-
 class _Pool:
     def __init__(self, available):
         self._available = available
@@ -50,9 +36,6 @@ class _Pool:
 @pytest.mark.parametrize(
     "primary, ladder, pool_available, raise_match, expected",
     [
-        ("openrouter", _LADDER, True, "No LLM provider configured", _LADDER_REASONS),
-        # Explicit non-OpenRouter primary: provider-specific missing-credentials error.
-        ("anthropic", _LADDER, True, "no API key was found", _LADDER_REASONS),
         # #119533: a burned primary pool with no ladder at all must still be named.
         ("openrouter", [], False, "No LLM provider configured", ("credential pool exhausted",)),
     ],
@@ -88,14 +71,17 @@ def test_fully_refusing_ladder_warns_with_each_reason(
         assert fragment in text
 
 
-def test_recovered_ladder_does_not_warn(monkeypatch, caplog):
-    """An entry refusing while a later one serves the init is degraded config, not a failure."""
+def test_committed_refusal_does_not_try_later_ladder_entry(monkeypatch, caplog):
+    """A post-publication refusal remains on entry one instead of widening to entry two."""
     from agent import agent_init
 
     class _Client:
         pass
 
+    attempted = []
+
     def _fake_resolve(provider, model=None, **kwargs):
+        attempted.append(provider)
         if provider == "kimi":
             return (_Client(), model)
         return (None, None)
@@ -104,17 +90,16 @@ def test_recovered_ladder_does_not_warn(monkeypatch, caplog):
     monkeypatch.setattr(
         "hermes_cli.fallback_config.resolve_entry_api_key", lambda entry: None
     )
-    monkeypatch.setattr(
-        agent_init,
-        "_client_kwargs_from_routed",
-        lambda client, timeout: {"api_key": "k"},
-    )
-
     agent = _agent()
     with caplog.at_level(logging.WARNING, logger="run_agent"):
-        kwargs = agent_init._routed_client_kwargs(agent, _LADDER, 60)
+        with pytest.raises(
+            RuntimeError,
+            match="post-commit init fallback client resolution failed for deepseek",
+        ):
+            agent_init._routed_client_kwargs(agent, _LADDER, 60)
 
-    assert kwargs == {"api_key": "k"}
-    assert agent.provider == "kimi"
+    assert attempted == ["openrouter", "deepseek"]
+    assert agent.provider == "deepseek"
     assert agent._fallback_activated
+    assert agent._route_client_ready is False
     assert not [r for r in caplog.records if r.levelno >= logging.WARNING]

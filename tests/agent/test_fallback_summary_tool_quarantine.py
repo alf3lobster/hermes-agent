@@ -1,10 +1,15 @@
 """Response-only fallback regressions for independently dispatched summary requests."""
 
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
 
-from agent.chat_completion_helpers import _chat_summary_attempt, direct_api_call
+from agent.chat_completion_helpers import (
+    _anthropic_summary_attempt,
+    _chat_summary_attempt,
+    direct_api_call,
+)
 from run_agent import AIAgent
 from tests.agent.test_run_agent import _make_tool_defs, _mock_response
 
@@ -86,3 +91,32 @@ def test_inert_moa_route_refuses_summary_prepare():
         )
 
     agent.client.chat.completions.prepare.assert_not_called()
+
+
+def test_anthropic_summary_refuses_before_relay_and_keeps_ready_path():
+    """Native Anthropic summaries fence relay registration, not only its callback."""
+    agent = _agent()
+    agent.api_mode = "anthropic_messages"
+    agent._is_anthropic_oauth = False
+    agent._anthropic_base_url = "https://api.anthropic.com"
+    transport = MagicMock()
+    transport.build_kwargs.return_value = {"model": agent.model, "messages": []}
+    transport.normalize_response.return_value = SimpleNamespace(
+        content="Summary", tool_calls=[]
+    )
+    agent._get_transport = MagicMock(return_value=transport)
+
+    with patch(
+        "agent.relay_llm.execute_current", return_value=SimpleNamespace()
+    ) as execute_current:
+        agent._route_client_ready = False
+        with pytest.raises(RuntimeError, match="route client is not ready"):
+            _anthropic_summary_attempt(agent, [], "iteration-summary:test")(0)
+        execute_current.assert_not_called()
+
+        agent._route_client_ready = True
+        assert (
+            _anthropic_summary_attempt(agent, [], "iteration-summary:test")(0)
+            == "Summary"
+        )
+        execute_current.assert_called_once()

@@ -901,7 +901,6 @@ def _routed_client_kwargs(agent, fallback_model, _provider_timeout) -> Optional[
         if _fb_provider.strip().lower() == "moa":
             from agent.moa_loop import bind_materialized_moa_runtime
             bind_materialized_moa_runtime(agent, _fb["model"])
-            agent._route_client_ready = True
             return None
         recompute_init_fallback_api_mode(agent, _fb_client)
         return _client_kwargs_from_routed(_fb_client, _provider_timeout)
@@ -1012,8 +1011,6 @@ def _init_openai_client(agent, api_key, base_url, fallback_model, _provider_time
     agent.base_url = client_kwargs.get("base_url", agent.base_url)
     try:
         agent.client = agent._create_openai_client(client_kwargs, reason="agent_init", shared=True)
-        if getattr(agent, "_fallback_activated", False):
-            agent._route_client_ready = True
         if not agent.quiet_mode:
             print(f"🤖 AI Agent initialized with model: {agent.model}")
             if base_url:
@@ -2386,6 +2383,8 @@ def init_agent(
     _clamp_compressor_to_ollama_num_ctx(agent)
     _emit_compression_summary(agent, cs)
     _snapshot_primary_runtime(agent)
+    if getattr(agent, "_fallback_activated", False):
+        agent._route_client_ready = True
 
 
 __all__ = ["init_agent"]

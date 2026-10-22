@@ -20,6 +20,10 @@ def _fallback_entries(fallback_model) -> list[dict[str, Any]]:
 
 
 def _init_fallback_chain(agent, fallback_model):
+    if getattr(agent, "_fallback_activated", False):
+        from agent.chat_completion_helpers import _rebind_fallback_credential_pool
+        _rebind_fallback_credential_pool(agent, agent.provider, agent.model)
+
     # Stable pool-entry identity: OAuth refreshes can replace the token before a failed
     # request is recovered, so the key value alone can't attribute the failure.
     from agent.agent_runtime_helpers import sync_credential_pool_entry_id
