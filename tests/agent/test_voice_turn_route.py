@@ -137,6 +137,7 @@ def test_post_commit_voice_maintenance_failure_is_not_reported_as_main_fallback(
         def commit_then_fail(target, *_args, **_kwargs):
             target.model = "voice-model"
             target.provider = "custom"
+            target._fallback_activated = True
             target._route_client_ready = False
             raise RouteCommittedError("committed route maintenance failed")
 
@@ -145,6 +146,7 @@ def test_post_commit_voice_maintenance_failure_is_not_reported_as_main_fallback(
 
         assert agent.model == "voice-model"
         assert agent._route_client_ready is False
+        assert agent._fallback_activated is False
         assert agent._voice_route_state == {"reasoning_config": None}
         assert "not used" not in caplog.text
         assert "using fake-model" not in caplog.text

@@ -2045,10 +2045,9 @@ def _buffer_fallback_notice(agent, notice: str) -> None:
 
 
 def try_activate_fallback(agent, reason: FailoverReason | None = None, reset_at=None) -> bool:
-    """Switch to the next fallback route in place; return False when the chain is exhausted.
-    Client construction still goes through resolve_provider_client."""
+    """Switch to the next fallback route in place; return False when the chain is exhausted."""
     from agent.fallback_cooldown import _arm_rate_limit_cooldown, switch_deferred_by_reset
-    from agent.route_binding import RouteCommittedError, bind_route_entry
+    from agent.route_binding import RouteCommittedError, bind_route_entry, close_committed_route_retry
     if switch_deferred_by_reset(agent, reason, reset_at):
         return False
     cooldown_seconds = _arm_rate_limit_cooldown(agent, reason, reset_at=reset_at)
@@ -2096,6 +2095,7 @@ def try_activate_fallback(agent, reason: FailoverReason | None = None, reset_at=
             record_fallback(from_provider=old_provider, to_provider=fb_provider, reason=reason)
             return True
         except RouteCommittedError:
+            close_committed_route_retry(agent)
             logger.exception(
                 "Fallback route %s/%s was committed but maintenance failed; route remains inert",
                 fb_provider,

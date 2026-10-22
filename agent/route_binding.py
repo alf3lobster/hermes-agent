@@ -24,6 +24,12 @@ class RouteCommittedError(RuntimeError):
     """Post-publication maintenance failed; callers must not reject or reselect the route."""
 
 
+def close_committed_route_retry(agent: Any) -> None:
+    """Prevent automatic restore or reselection after a restrictive route was committed."""
+    agent._fallback_activated = False
+    agent._fallback_index = len(getattr(agent, "_fallback_chain", ()))
+
+
 _CREDENTIAL_FREE_ROUTE_DEFAULTS = {
     # ``openai`` is the documented direct-API alias for ``openai-api``.
     "openai": "https://api.openai.com/v1",
@@ -298,13 +304,16 @@ def bind_route_entry(
         _commit_route_agent(agent, staged)
         try:
             _materialize_route_client(agent, entry, provider)
-        except Exception:
+        except Exception as exc:
             logger.warning(
                 "Fallback route committed but credential/client maintenance failed for %s/%s",
                 provider,
                 agent.model,
                 exc_info=True,
             )
+            raise RouteCommittedError(
+                f"committed fallback route maintenance failed for {provider}/{agent.model}: {exc}"
+            ) from exc
     return bound
 
 

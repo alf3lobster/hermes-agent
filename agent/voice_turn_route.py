@@ -153,7 +153,7 @@ def begin_voice_turn_route(agent: Any, messages: list[dict[str, Any]], system_pr
         state.update(_capture(agent))
         reason = ""
         route_bound = False
-        from agent.route_binding import RouteCommittedError, bind_route_entry
+        from agent.route_binding import RouteCommittedError, bind_route_entry, close_committed_route_retry
         try:
 
             def admit(staged: Any) -> None:
@@ -179,6 +179,7 @@ def begin_voice_turn_route(agent: Any, messages: list[dict[str, Any]], system_pr
                 target["provider"],
                 agent.model,
             )
+            close_committed_route_retry(agent)
             agent._voice_route_state = {"reasoning_config": state["reasoning_config"]}
             return agent._cached_system_prompt or system_prompt
         except Exception as exc:  # health: allow BLE001 -- pre-publication bind failure falls back with a notice

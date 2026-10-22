@@ -184,7 +184,8 @@ def test_post_commit_persistence_failure_never_reselects_broader_fallback(monkey
     assert agent.model == "restricted"
     assert agent._provider_fallback_tool_policy == "none"
     assert agent._route_client_ready is False
-    assert agent._fallback_index == 1
+    assert agent._fallback_activated is False
+    assert agent._fallback_index == len(agent._fallback_chain)
     assert materialized == []
     assert observations and all(item == ("restricted", "none", False) for item in observations)
 
@@ -918,8 +919,8 @@ def test_runtime_snapshot_maintenance_failure_leaves_route_inert(monkeypatch):
     assert agent._route_client_ready is False
 
 
-def test_post_commit_fallback_pool_failure_keeps_committed_route(monkeypatch):
-    """Fallback pool maintenance is not allowed to escape after route publication."""
+def test_post_commit_fallback_pool_failure_raises_committed_outcome(monkeypatch):
+    """Post-publication maintenance failure stays restrictive, inert, and observable to callers."""
     from agent import route_binding
 
     agent = SimpleNamespace(
@@ -933,6 +934,8 @@ def test_post_commit_fallback_pool_failure_keeps_committed_route(monkeypatch):
     def prepare(staged, _entry, provider, model, *, owner=None):
         staged.model = model
         staged.provider = provider
+        staged._fallback_activated = True
+        staged._route_client_ready = False
         return "primary", "custom"
 
     monkeypatch.setattr(route_binding, "_bind_route_entry_in_place", prepare)
@@ -945,15 +948,61 @@ def test_post_commit_fallback_pool_failure_keeps_committed_route(monkeypatch):
         lambda *_args: (_ for _ in ()).throw(RuntimeError("pool maintenance failed")),
     )
 
-    assert route_binding.bind_route_entry(
-        agent,
-        {"provider": "custom", "model": "restricted", "tool_policy": "none"},
-        "custom",
-        "restricted",
-    ) == ("primary", "custom")
+    with pytest.raises(route_binding.RouteCommittedError, match="pool maintenance failed"):
+        route_binding.bind_route_entry(
+            agent,
+            {"provider": "custom", "model": "restricted", "tool_policy": "none"},
+            "custom",
+            "restricted",
+        )
     assert agent.model == "restricted"
     assert agent._provider_fallback_active is True
     assert agent._provider_fallback_tool_policy == "none"
+    assert agent._route_client_ready is False
+
+
+def test_committed_fallback_failure_cannot_restore_primary_next_turn(monkeypatch):
+    """A failed committed fallback closes automatic restore bookkeeping without widening."""
+    from agent.agent_runtime_helpers import restore_primary_runtime
+    from agent.chat_completion_helpers import try_activate_fallback
+    from agent.route_binding import RouteCommittedError
+
+    agent = SimpleNamespace(
+        _fallback_chain=[{"provider": "custom", "model": "restricted", "tool_policy": "none"}],
+        _fallback_index=0,
+        _fallback_activated=False,
+        _unavailable_fallback_keys=set(),
+        _route_client_ready=True,
+        _provider_fallback_active=False,
+        _provider_fallback_tool_policy="inherit",
+        model="primary",
+        provider="custom",
+    )
+
+    def commit_then_fail(target, *_args, **_kwargs):
+        target.model = "restricted"
+        target._fallback_activated = True
+        target._provider_fallback_active = True
+        target._provider_fallback_tool_policy = "none"
+        target._route_client_ready = False
+        raise RouteCommittedError("pool maintenance failed")
+
+    restore = MagicMock()
+    monkeypatch.setattr("agent.fallback_cooldown.switch_deferred_by_reset", lambda *_args: False)
+    monkeypatch.setattr("agent.fallback_cooldown._arm_rate_limit_cooldown", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr("agent.chat_completion_helpers._should_skip_fallback_candidate", lambda *_args: False)
+    monkeypatch.setattr("agent.route_binding.bind_route_entry", commit_then_fail)
+    monkeypatch.setattr("agent.route_binding.reinstall_primary_runtime", restore)
+    monkeypatch.setattr("agent.agent_runtime_helpers._revert_credential_rotation", lambda *_args: None)
+
+    assert try_activate_fallback(agent) is False
+    assert agent._fallback_activated is False
+    assert agent._fallback_index == len(agent._fallback_chain)
+    assert restore_primary_runtime(agent) is False
+    restore.assert_not_called()
+    assert agent.model == "restricted"
+    assert agent._provider_fallback_tool_policy == "none"
+    assert agent._route_client_ready is False
 
 
 def test_unmaterialized_committed_route_cannot_call_provider():
