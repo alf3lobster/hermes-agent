@@ -112,11 +112,16 @@ def _capture(agent: Any) -> dict[str, Any]:
     }
 
 
+def _restore_extra_fields(agent: Any, state: dict[str, Any]) -> None:
+    """Restore captured non-route bookkeeping without rebuilding or republishing a route."""
+    for name in _EXTRA_FIELDS:
+        setattr(agent, name, state[name])
+
+
 def _reinstall(agent: Any, state: dict[str, Any]) -> None:
     from agent.route_binding import reinstall_runtime_snapshot
     reinstall_runtime_snapshot(agent, state["snapshot"])
-    for name in _EXTRA_FIELDS:
-        setattr(agent, name, state[name])
+    _restore_extra_fields(agent, state)
 
 
 def _warn_once(agent: Any, target: dict[str, Any], reason: str) -> None:
@@ -236,6 +241,7 @@ def end_voice_turn_route(agent: Any) -> None:
                 remember_reasoning_floor(agent.provider, agent.base_url, {"model": agent.model}, None)
             _reinstall(agent, state)
     except RouteCommittedError:
+        _restore_extra_fields(agent, state)
         logger.exception("Session route was restored but maintenance failed; committed route remains inert")
     except Exception:
         logger.warning("Voice turn route restore failed; the next turn re-resolves the main runtime",

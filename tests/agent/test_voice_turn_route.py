@@ -151,38 +151,34 @@ def test_post_commit_voice_maintenance_failure_is_not_reported_as_main_fallback(
         assert "Voice turn routed" not in caplog.text
 
 
-def test_end_voice_post_commit_restore_failure_does_not_arm_retry(monkeypatch):
-    """A published inert session route is retained; end-of-turn must not request another restore."""
-    from types import SimpleNamespace
+def test_end_voice_post_commit_restore_failure_does_not_arm_retry(tmp_path, monkeypatch):
+    """A real published session route stays inert and cannot trigger next-turn restoration."""
+    from agent.voice_turn_route import begin_voice_turn_route, end_voice_turn_route
 
-    from agent.route_binding import RouteCommittedError
-    from agent.voice_turn_route import end_voice_turn_route
+    with FakeLLMServer([]) as main, FakeLLMServer([]) as voice:
+        home = write_hermes_home(tmp_path / ".hermes", main.base_url, extra_config=(
+            "auxiliary:\n  voice_chat:\n    provider: custom\n"
+            f"    base_url: {voice.base_url}\n    model: voice-model\n    api_key: «redacted:sk-…»\n"
+        ))
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        agent = _agent(home, main.base_url)
+        agent._voice_turn_pending = True
+        begin_voice_turn_route(agent, [{"role": "user", "content": "hi"}], "system")
+        assert agent.model == "voice-model"
+        assert agent._fallback_activated is True
+        assert agent._route_client_ready is True
 
-    state = {"snapshot": {"model": "main"}, "reasoning_config": {"enabled": True}}
-    agent = SimpleNamespace(
-        _voice_route_state=state,
-        _turn_route_task="voice_chat",
-        _reasoning_floor_required=False,
-        _fallback_activated=False,
-        model="voice-model",
-        provider="custom",
-        base_url="https://voice.invalid/v1",
-        reasoning_config={"enabled": False},
-    )
+        monkeypatch.setattr(
+            "agent.route_binding_state.persist_prepared_compressor",
+            lambda *_args: (_ for _ in ()).throw(RuntimeError("db unavailable")),
+        )
+        end_voice_turn_route(agent)
 
-    def commit_then_fail(target, _state):
-        target.model = "main"
-        target._route_client_ready = False
-        raise RouteCommittedError("committed route maintenance failed")
-
-    monkeypatch.setattr("agent.voice_turn_route._reinstall", commit_then_fail)
-    end_voice_turn_route(agent)
-
-    assert agent.model == "main"
-    assert agent._route_client_ready is False
-    assert agent._fallback_activated is False
-    assert agent._voice_route_state is None
-    assert agent.reasoning_config == {"enabled": True}
+        assert agent.model == "fake-model"
+        assert agent._route_client_ready is False
+        assert agent._fallback_activated is False
+        assert agent._voice_route_state is None
+        assert agent._restore_primary_runtime() is False
 
 
 @pytest.mark.parametrize("model,api_mode,expected", [
