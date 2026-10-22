@@ -1404,7 +1404,7 @@ def restore_primary_runtime(agent) -> bool:
     failed_restore_tool_policy = "none" if "none" in (
         fallback_tool_policy, (rt or {}).get("fallback_tool_policy")) else "inherit"
     try:
-        from agent.route_binding import reinstall_primary_runtime
+        from agent.route_binding import RouteCommittedError, reinstall_primary_runtime
         reinstall_primary_runtime(
             agent, rt, primary_provider, primary_model, _matches_primary, _load_primary_pool, prefetched_pool, prefetched,
             probe_codex_reopen=probe_codex_reopen,
@@ -1423,6 +1423,13 @@ def restore_primary_runtime(agent) -> bool:
                 agent.model,
                 agent.provider,
             )
+        return True
+    except RouteCommittedError:
+        logger.exception(
+            "Primary route was committed for %s (%s), but maintenance left its client inert",
+            agent.model,
+            agent.provider,
+        )
         return True
     except Exception as e:
         agent._provider_fallback_tool_policy = failed_restore_tool_policy

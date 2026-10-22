@@ -149,8 +149,8 @@ def begin_voice_turn_route(agent: Any, messages: list[dict[str, Any]], system_pr
         state.update(_capture(agent))
         reason = ""
         route_bound = False
+        from agent.route_binding import RouteCommittedError, bind_route_entry
         try:
-            from agent.route_binding import bind_route_entry
 
             def admit(staged: Any) -> None:
                 if not _fits(staged, messages, system_prompt):
@@ -169,7 +169,15 @@ def begin_voice_turn_route(agent: Any, messages: list[dict[str, Any]], system_pr
                         target["model"],
                     )
                     return agent._cached_system_prompt or system_prompt
-        except Exception as exc:  # health: allow BLE001 -- any bind failure falls back to the main model with a notice
+        except RouteCommittedError:
+            logger.exception(
+                "Voice route %s/%s was committed but maintenance failed; route remains inert",
+                target["provider"],
+                agent.model,
+            )
+            agent._voice_route_state = {"reasoning_config": state["reasoning_config"]}
+            return agent._cached_system_prompt or system_prompt
+        except Exception as exc:  # health: allow BLE001 -- pre-publication bind failure falls back with a notice
             reason = str(exc).splitlines()[0] if str(exc) else type(exc).__name__
         if reason:
             if route_bound:
@@ -219,6 +227,7 @@ def end_voice_turn_route(agent: Any) -> None:
         return
     agent._voice_route_state = None
     agent._turn_route_task = ""
+    from agent.route_binding import RouteCommittedError
     try:
         if "snapshot" in state:
             if getattr(agent, "_reasoning_floor_required", False):
@@ -226,6 +235,8 @@ def end_voice_turn_route(agent: Any) -> None:
                 from agent.auxiliary_reasoning_floor import remember_reasoning_floor
                 remember_reasoning_floor(agent.provider, agent.base_url, {"model": agent.model}, None)
             _reinstall(agent, state)
+    except RouteCommittedError:
+        logger.exception("Session route was restored but maintenance failed; committed route remains inert")
     except Exception:
         logger.warning("Voice turn route restore failed; the next turn re-resolves the main runtime",
                        exc_info=True)

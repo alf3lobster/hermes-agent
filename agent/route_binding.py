@@ -18,6 +18,12 @@ from agent.route_binding_state import rebind_primary_credential_pool
 logger = logging.getLogger(__name__)
 
 _DEFERRED_ROUTE_CREDENTIAL = "route-preparation-uncredentialed"
+
+
+class RouteCommittedError(RuntimeError):
+    """Post-publication maintenance failed; callers must not reject or reselect the route."""
+
+
 _CREDENTIAL_FREE_ROUTE_DEFAULTS = {
     # ``openai`` is the documented direct-API alias for ``openai-api``.
     "openai": "https://api.openai.com/v1",
@@ -126,7 +132,10 @@ def _commit_route_agent(agent: Any, staged: Any) -> None:
     vars(agent).update(vars(staged))
     if staged_compressor is not None:
         from agent.route_binding_state import persist_prepared_compressor
-        persist_prepared_compressor(live_compressor, staged_compressor)
+        try:
+            persist_prepared_compressor(live_compressor, staged_compressor)
+        except Exception as exc:
+            raise RouteCommittedError(f"committed route maintenance failed: {exc}") from exc
 
 
 def _bind_route_entry_in_place(

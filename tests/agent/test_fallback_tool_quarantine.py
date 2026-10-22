@@ -133,6 +133,62 @@ def test_committed_inert_fallback_is_not_reported_as_activated(monkeypatch):
     notices.assert_not_called()
 
 
+def test_post_commit_persistence_failure_never_reselects_broader_fallback(monkeypatch):
+    """A real durable-write failure after publication stops the enclosing candidate loop."""
+    from agent.chat_completion_helpers import try_activate_fallback
+
+    agent = _agent()
+    agent._fallback_chain = [
+        {
+            "provider": "custom",
+            "model": "restricted",
+            "base_url": "https://restricted.invalid/v1",
+            "tool_policy": "none",
+        },
+        {
+            "provider": "custom",
+            "model": "wide",
+            "base_url": "https://wide.invalid/v1",
+            "tool_policy": "inherit",
+        },
+    ]
+    agent._fallback_index = 0
+    agent._unavailable_fallback_keys = set()
+    agent.context_compressor._session_id = "session"
+    observations = []
+
+    class RouteAwareDB:
+        def __getattr__(self, _name):
+            def write(*_args, **_kwargs):
+                observations.append(
+                    (agent.model, agent._provider_fallback_tool_policy, agent._route_client_ready)
+                )
+                if agent.model == "restricted":
+                    raise RuntimeError("db unavailable")
+            return write
+
+    agent.context_compressor._session_db = RouteAwareDB()
+    materialized = []
+
+    def inert_materialize(target, _entry, _provider):
+        materialized.append(target.model)
+        target._route_client_ready = True
+
+    monkeypatch.setattr("agent.fallback_cooldown.switch_deferred_by_reset", lambda *_args: False)
+    monkeypatch.setattr("agent.fallback_cooldown._arm_rate_limit_cooldown", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr("agent.chat_completion_helpers._should_skip_fallback_candidate", lambda *_args: False)
+    monkeypatch.setattr("agent.route_binding._materialize_route_client", inert_materialize)
+    monkeypatch.setattr("agent.route_binding._revalidate_committed_compression", lambda *_args: None)
+
+    assert try_activate_fallback(agent) is False
+    assert agent.model == "restricted"
+    assert agent._provider_fallback_tool_policy == "none"
+    assert agent._route_client_ready is False
+    assert agent._fallback_index == 1
+    assert materialized == []
+    assert observations and all(item == ("restricted", "none", False) for item in observations)
+
+
 def test_shared_kwargs_builder_strips_tools_for_response_only_fallback(monkeypatch):
     """Every request builder invocation enforces quarantine, even with explicit schemas."""
     from agent import chat_completion_helpers

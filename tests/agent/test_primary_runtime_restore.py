@@ -156,6 +156,36 @@ class TestRestorePrimaryRuntime:
         assert "primary-model" in emitted[0]
         assert "anthropic/claude-sonnet-4" in emitted[0]
 
+    def test_post_commit_restore_failure_reports_committed_inert_primary(self):
+        """Published primary state is success-with-inert-client, not a retryable restore rejection."""
+        from agent.route_binding import RouteCommittedError
+
+        agent = _make_agent()
+        agent.model = "fallback-model"
+        agent.provider = "custom"
+        agent._fallback_activated = True
+        agent._provider_fallback_active = True
+        agent._provider_fallback_route = ("fallback-model", "custom")
+        agent._provider_fallback_tool_policy = "none"
+
+        def commit_then_fail(target, *_args, **_kwargs):
+            target.model = "primary-model"
+            target.provider = "openrouter"
+            target._fallback_activated = False
+            target._provider_fallback_active = False
+            target._provider_fallback_route = None
+            target._provider_fallback_tool_policy = "inherit"
+            target._route_client_ready = False
+            raise RouteCommittedError("committed route maintenance failed")
+
+        with patch("agent.route_binding.reinstall_primary_runtime", side_effect=commit_then_fail):
+            assert agent._restore_primary_runtime() is True
+
+        assert agent.model == "primary-model"
+        assert agent._provider_fallback_tool_policy == "inherit"
+        assert agent._route_client_ready is False
+        assert agent._fallback_activated is False
+
     def test_resets_fallback_index(self):
         """After restore, the full fallback chain should be available again."""
         agent = _make_agent(

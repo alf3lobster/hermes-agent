@@ -118,6 +118,73 @@ def test_inert_committed_voice_route_is_not_reported_as_routed(tmp_path, monkeyp
         assert "Voice turn routed" not in caplog.text
 
 
+def test_post_commit_voice_maintenance_failure_is_not_reported_as_main_fallback(
+    tmp_path, monkeypatch, caplog,
+):
+    """Voice publication failure retains the inert voice route without a false main-route notice."""
+    from agent.route_binding import RouteCommittedError
+    from agent.voice_turn_route import begin_voice_turn_route
+
+    with FakeLLMServer([]) as main, FakeLLMServer([]) as voice:
+        home = write_hermes_home(tmp_path / ".hermes", main.base_url, extra_config=(
+            "auxiliary:\n  voice_chat:\n    provider: custom\n"
+            f"    base_url: {voice.base_url}\n    model: voice-model\n    api_key: «redacted:sk-…»\n"
+        ))
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        agent = _agent(home, main.base_url)
+        agent._voice_turn_pending = True
+
+        def commit_then_fail(target, *_args, **_kwargs):
+            target.model = "voice-model"
+            target.provider = "custom"
+            target._route_client_ready = False
+            raise RouteCommittedError("committed route maintenance failed")
+
+        monkeypatch.setattr("agent.route_binding.bind_route_entry", commit_then_fail)
+        begin_voice_turn_route(agent, [{"role": "user", "content": "hi"}], "system")
+
+        assert agent.model == "voice-model"
+        assert agent._route_client_ready is False
+        assert agent._voice_route_state == {"reasoning_config": None}
+        assert "not used" not in caplog.text
+        assert "using fake-model" not in caplog.text
+        assert "Voice turn routed" not in caplog.text
+
+
+def test_end_voice_post_commit_restore_failure_does_not_arm_retry(monkeypatch):
+    """A published inert session route is retained; end-of-turn must not request another restore."""
+    from types import SimpleNamespace
+
+    from agent.route_binding import RouteCommittedError
+    from agent.voice_turn_route import end_voice_turn_route
+
+    state = {"snapshot": {"model": "main"}, "reasoning_config": {"enabled": True}}
+    agent = SimpleNamespace(
+        _voice_route_state=state,
+        _turn_route_task="voice_chat",
+        _reasoning_floor_required=False,
+        _fallback_activated=False,
+        model="voice-model",
+        provider="custom",
+        base_url="https://voice.invalid/v1",
+        reasoning_config={"enabled": False},
+    )
+
+    def commit_then_fail(target, _state):
+        target.model = "main"
+        target._route_client_ready = False
+        raise RouteCommittedError("committed route maintenance failed")
+
+    monkeypatch.setattr("agent.voice_turn_route._reinstall", commit_then_fail)
+    end_voice_turn_route(agent)
+
+    assert agent.model == "main"
+    assert agent._route_client_ready is False
+    assert agent._fallback_activated is False
+    assert agent._voice_route_state is None
+    assert agent.reasoning_config == {"enabled": True}
+
+
 @pytest.mark.parametrize("model,api_mode,expected", [
     ("gpt-6-astra", "codex_responses", "low"),        # Responses ladder has no "none"
     ("claude-opus-5-5", "anthropic_messages", "low"),  # mandatory thinking

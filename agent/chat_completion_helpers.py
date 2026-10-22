@@ -2046,6 +2046,7 @@ def try_activate_fallback(agent, reason: FailoverReason | None = None, reset_at=
     """Switch to the next fallback route in place; return False when the chain is exhausted.
     Client construction still goes through resolve_provider_client."""
     from agent.fallback_cooldown import _arm_rate_limit_cooldown, switch_deferred_by_reset
+    from agent.route_binding import RouteCommittedError, bind_route_entry
     if switch_deferred_by_reset(agent, reason, reset_at):
         return False
     cooldown_seconds = _arm_rate_limit_cooldown(agent, reason, reset_at=reset_at)
@@ -2065,7 +2066,6 @@ def try_activate_fallback(agent, reason: FailoverReason | None = None, reset_at=
 
         route_committed = False
         try:
-            from agent.route_binding import bind_route_entry
             bound = bind_route_entry(agent, fb, fb_provider, fb_model)
             if bound is None:
                 logger.warning("Fallback to %s failed: provider not configured", fb_provider)
@@ -2093,6 +2093,13 @@ def try_activate_fallback(agent, reason: FailoverReason | None = None, reset_at=
             from hermes_cli.observability.shared_metrics_events import record_fallback
             record_fallback(from_provider=old_provider, to_provider=fb_provider, reason=reason)
             return True
+        except RouteCommittedError:
+            logger.exception(
+                "Fallback route %s/%s was committed but maintenance failed; route remains inert",
+                fb_provider,
+                agent.model,
+            )
+            return False
         except Exception as e:
             if route_committed:
                 logger.exception("Fallback route is active but post-publication reporting failed")
