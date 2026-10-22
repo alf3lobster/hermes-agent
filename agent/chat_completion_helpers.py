@@ -1931,11 +1931,7 @@ def _candidate_pool_exhausted(agent, fb_provider: str, fb_model: str) -> bool:
     turn the same way the primary just did (#89401). A short throttle still gets its chance."""
     pool = getattr(agent, "_credential_pool", None)
     if pool is None or (getattr(pool, "provider", "") or "").strip().lower() != fb_provider:
-        try:
-            from agent.credential_pool import load_pool
-            pool = load_pool(fb_provider)
-        except Exception:
-            return False
+        return False
     if pool is None or not pool.has_credentials() or pool.has_available(model=fb_model):
         return False
     until = pool.next_available_at(model=fb_model)
@@ -2074,6 +2070,7 @@ def try_activate_fallback(agent, reason: FailoverReason | None = None, reset_at=
         if _should_skip_fallback_candidate(agent, fb, fb_key, fb_provider, fb_model, unavailable):
             continue
 
+        route_committed = False
         try:
             from agent.route_binding import bind_route_entry
             bound = bind_route_entry(agent, fb, fb_provider, fb_model)
@@ -2082,6 +2079,7 @@ def try_activate_fallback(agent, reason: FailoverReason | None = None, reset_at=
                 unavailable.add(fb_key)
                 continue
             old_model, old_provider = bound
+            route_committed = True
             fb_model = agent.model  # normalized by the binder
 
             notice = (
@@ -2096,11 +2094,7 @@ def try_activate_fallback(agent, reason: FailoverReason | None = None, reset_at=
             record_fallback(from_provider=old_provider, to_provider=fb_provider, reason=reason)
             return True
         except Exception as e:
-            if (
-                getattr(agent, "_provider_fallback_active", False)
-                and getattr(agent, "_provider_fallback_route", None)
-                == (str(getattr(agent, "model", "")), str(fb_provider))
-            ):
+            if route_committed:
                 logger.exception("Fallback route is active but post-publication reporting failed")
                 return True
             if fb_provider == "nous":

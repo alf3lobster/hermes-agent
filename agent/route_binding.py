@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import copy
 import logging
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Callable, Dict, Optional, Tuple
 
 from utils import base_url_host_matches
 from agent.route_binding_state import rebind_primary_credential_pool
@@ -20,7 +20,6 @@ logger = logging.getLogger(__name__)
 def _stage_route_agent(agent: Any) -> Any:
     """Copy the live route while detaching objects whose preparation has durable effects."""
     staged = copy.copy(agent)
-    vars(staged).pop("_route_credential_reservation", None)
     compressor = getattr(agent, "context_compressor", None)
     if compressor is not None:
         staged.context_compressor = copy.copy(compressor)
@@ -37,25 +36,21 @@ def _stage_route_agent(agent: Any) -> Any:
 
 def _commit_route_agent(agent: Any, staged: Any) -> None:
     """Publish one prepared route, then persist its already-decided compressor reset state."""
-    reservation = getattr(staged, "_route_credential_reservation", None)
-    if reservation is not None:
-        from agent.route_binding_state import validate_prepared_credential_pool
-
-        validate_prepared_credential_pool(reservation)
-        prepared_pool, _entry = reservation
-        vars(prepared_pool).pop("_route_reservation_source", None)
-        vars(prepared_pool).pop("_route_reservation_snapshot", None)
-        del staged._route_credential_reservation
     live_compressor = getattr(agent, "context_compressor", None)
     staged_compressor = getattr(staged, "context_compressor", None)
     if staged_compressor is not None and live_compressor is not None:
         staged_compressor._session_db = getattr(live_compressor, "_session_db", None)
         staged_compressor._session_id = getattr(live_compressor, "_session_id", "")
-    vars(agent).pop("_route_credential_reservation", None)
     vars(agent).update(vars(staged))
     if staged_compressor is not None:
         from agent.route_binding_state import persist_prepared_compressor
-        persist_prepared_compressor(live_compressor, staged_compressor)
+        try:
+            persist_prepared_compressor(live_compressor, staged_compressor)
+        except Exception:
+            logger.warning(
+                "Route committed but compressor-state persistence failed",
+                exc_info=True,
+            )
 
 
 def _bind_route_entry_in_place(
@@ -138,7 +133,14 @@ def _bind_route_entry_in_place(
     return old_model, old_provider
 
 
-def bind_route_entry(agent: Any, entry: dict[str, Any], provider: str, model: str) -> Optional[tuple[str, str]]:
+def bind_route_entry(
+    agent: Any,
+    entry: dict[str, Any],
+    provider: str,
+    model: str,
+    *,
+    admit: Optional[Callable[[Any], None]] = None,
+) -> Optional[tuple[str, str]]:
     """Prepare a complete route without live effects, then publish it once."""
     from hermes_cli.fallback_config import fallback_tool_policy
     staged = _stage_route_agent(agent)
@@ -158,12 +160,22 @@ def bind_route_entry(agent: Any, entry: dict[str, Any], provider: str, model: st
             provider=provider,
             is_codex_backend=provider == "openai-codex",
         )
+        if admit is not None:
+            admit(staged)
         _commit_route_agent(agent, staged)
         from agent.chat_completion_helpers import _rebind_fallback_credential_pool
         from agent.agent_runtime_helpers import sync_credential_pool_entry_id
 
-        _rebind_fallback_credential_pool(agent, provider, agent.model)
-        sync_credential_pool_entry_id(agent)
+        try:
+            _rebind_fallback_credential_pool(agent, provider, agent.model)
+            sync_credential_pool_entry_id(agent)
+        except Exception:
+            logger.warning(
+                "Fallback route committed but credential-pool maintenance failed for %s/%s",
+                provider,
+                agent.model,
+                exc_info=True,
+            )
     return bound
 
 
@@ -247,9 +259,6 @@ def reinstall_primary_runtime(
     staged._route_owner = agent
     try:
         _reinstall_runtime_snapshot_in_place(staged, rt)
-        rebind_primary_credential_pool(
-            staged, primary_provider, primary_model, matches_primary, load_primary_pool, prefetched_pool, prefetched
-        )
         staged._fallback_activated = False
         staged._fallback_index = 0
         staged._rate_limit_backoff_count = 0
@@ -262,3 +271,15 @@ def reinstall_primary_runtime(
         raise
     del staged._route_owner
     _commit_route_agent(agent, staged)
+    try:
+        rebind_primary_credential_pool(
+            agent, primary_provider, primary_model, matches_primary,
+            load_primary_pool, prefetched_pool, prefetched,
+        )
+    except Exception:
+        logger.warning(
+            "Primary route committed but credential-pool maintenance failed for %s/%s",
+            primary_provider,
+            primary_model,
+            exc_info=True,
+        )

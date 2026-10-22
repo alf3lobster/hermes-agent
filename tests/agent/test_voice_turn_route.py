@@ -57,6 +57,39 @@ def test_voice_turn_routes_then_restores(tmp_path, monkeypatch, voice_window_ok)
         assert agent._fallback_activated is False
 
 
+def test_undersized_voice_route_is_rejected_before_publication(tmp_path, monkeypatch):
+    """A route that cannot fit the turn must never become live and therefore needs no restore."""
+    from agent.voice_turn_route import begin_voice_turn_route
+
+    with FakeLLMServer([]) as main, FakeLLMServer([]) as voice:
+        home = write_hermes_home(tmp_path / ".hermes", main.base_url, extra_config=(
+            "auxiliary:\n  voice_chat:\n    provider: custom\n"
+            f"    base_url: {voice.base_url}\n    model: voice-model\n    api_key: «redacted:sk-…»\n"
+            "custom_providers:\n  - name: voice\n"
+            f"    base_url: {voice.base_url}\n    models:\n      voice-model:\n        context_length: 1000\n"
+        ))
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        agent = _agent(home, main.base_url)
+        original_client = agent.client
+        original_compressor = agent.context_compressor
+        agent._voice_turn_pending = True
+        monkeypatch.setattr(
+            "agent.route_binding.reinstall_runtime_snapshot",
+            lambda *_args: (_ for _ in ()).throw(AssertionError("rejected route required restore")),
+        )
+
+        begin_voice_turn_route(
+            agent,
+            [{"role": "user", "content": "large " * 5000}],
+            "system",
+        )
+
+        assert agent.model == "fake-model"
+        assert agent.client is original_client
+        assert agent.context_compressor is original_compressor
+        assert agent._fallback_activated is False
+
+
 @pytest.mark.parametrize("model,api_mode,expected", [
     ("gpt-6-astra", "codex_responses", "low"),        # Responses ladder has no "none"
     ("claude-opus-5-5", "anthropic_messages", "low"),  # mandatory thinking

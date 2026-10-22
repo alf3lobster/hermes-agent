@@ -151,14 +151,19 @@ def begin_voice_turn_route(agent: Any, messages: list[dict[str, Any]], system_pr
         route_bound = False
         try:
             from agent.route_binding import bind_route_entry
-            if bind_route_entry(agent, target, target["provider"], target["model"]) is None:
+
+            def admit(staged: Any) -> None:
+                if not _fits(staged, messages, system_prompt):
+                    raise RuntimeError("the conversation is larger than its context window")
+
+            if bind_route_entry(
+                agent, target, target["provider"], target["model"], admit=admit,
+            ) is None:
                 reason = "provider not configured"
             else:
                 route_bound = True
         except Exception as exc:  # health: allow BLE001 -- any bind failure falls back to the main model with a notice
             reason = str(exc).splitlines()[0] if str(exc) else type(exc).__name__
-        if not reason and not _fits(agent, messages, system_prompt):
-            reason = "the conversation is larger than its context window"
         if reason:
             if route_bound:
                 _reinstall(agent, state)
