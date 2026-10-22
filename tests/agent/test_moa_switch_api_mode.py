@@ -57,10 +57,17 @@ def test_switch_to_moa_pins_chat_completions(monkeypatch, incoming_api_mode):
     """
     from agent import agent_runtime_helpers as arh
 
-    # Neutralize the post-swap machinery that needs a real AIAgent (credential
-    # pool reload, context-compressor refresh, primary-runtime bookkeeping).
-    # We only assert the api_mode invariant set in the moa client-build branch.
-    monkeypatch.setattr(arh, "load_pool", lambda *a, **k: None, raising=False)
+    # Isolate unrelated config, pool, snapshot and persistence work while still
+    # exercising the real MoA bind/materialisation and final readiness transaction.
+    monkeypatch.setattr("agent.credential_pool.load_pool", lambda *a, **k: None)
+    monkeypatch.setattr(arh, "_resolve_switch_context_length", lambda *a, **k: ([], None))
+    monkeypatch.setattr(arh, "_apply_switched_provider_request_overrides", lambda *a, **k: None)
+    monkeypatch.setattr(
+        arh,
+        "_build_primary_runtime_snapshot",
+        lambda _agent, mode: {"request_overrides": {}, "api_mode": mode},
+    )
+    monkeypatch.setattr(arh, "_persist_switch_billing_route", lambda *a, **k: None)
     readiness_seen = []
 
     def materialize(target, _preset):
@@ -70,21 +77,15 @@ def test_switch_to_moa_pins_chat_completions(monkeypatch, incoming_api_mode):
     monkeypatch.setattr("agent.moa_loop.materialize_moa_slot_runtimes", materialize)
 
     agent = _make_fake_agent()
-    try:
-        arh.switch_model(
-            agent,
-            new_model="frontier",
-            new_provider="moa",
-            api_key="moa-virtual-provider",
-            base_url="moa://local",
-            api_mode=incoming_api_mode,
-        )
-    except Exception:
-        # switch_model does post-swap work (compressor, pool, runtime) that may
-        # raise against a fake agent. The runtime-field swap — including the
-        # api_mode pin in the moa branch — happens before any of that, so the
-        # invariant we care about is already set even if a later step blew up.
-        pass
+    agent._anthropic_prompt_cache_policy = lambda **kwargs: (False, False)
+    arh.switch_model(
+        agent,
+        new_model="frontier",
+        new_provider="moa",
+        api_key="moa-virtual-provider",
+        base_url="moa://local",
+        api_mode=incoming_api_mode,
+    )
 
     assert agent.provider == "moa"
     assert agent.base_url == "moa://local"
@@ -96,6 +97,7 @@ def test_switch_to_moa_pins_chat_completions(monkeypatch, incoming_api_mode):
     # The MoAClient facade should be installed as the client.
     assert type(agent.client).__name__ == "MoAClient"
     assert readiness_seen == [False]
+    assert agent._route_client_ready is True
 
 
 def test_failed_moa_materialization_rolls_back_manual_switch(monkeypatch):

@@ -28,6 +28,19 @@ from agent.agent_runtime_helpers import switch_model
 # ---------------------------------------------------------------------------
 
 
+@pytest.fixture(autouse=True)
+def _isolate_unrelated_switch_config(monkeypatch):
+    """Keep pool regressions independent of live config/bootstrap discovery."""
+    monkeypatch.setattr(
+        "agent.agent_runtime_helpers._resolve_switch_context_length",
+        lambda *args, **kwargs: ([], None),
+    )
+    monkeypatch.setattr(
+        "agent.agent_runtime_helpers._apply_switched_provider_request_overrides",
+        lambda *args, **kwargs: None,
+    )
+
+
 def _make_agent(current_provider, current_model, current_pool):
     """Bare agent object with the minimum attributes switch_model touches.
 
@@ -191,18 +204,19 @@ class TestSwitchModelReloadsCredentialPool:
             "pool.current() was never called — mismatch guard short-circuited"
         )
 
-    def test_pool_reload_failure_does_not_block_switch(self):
-        """If load_pool raises (e.g. corrupt auth.json), switch_model must
-        still complete — the pool will simply be missing for this turn, and
-        the next turn can re-attempt. Crashing the whole switch is worse
-        than a transient pool gap."""
-        agent = _make_agent("opencode-go", "qwen-coder", _make_pool("opencode-go"))
+    def test_pool_reload_failure_rolls_back_switch_and_readiness(self):
+        """A switched route without its required credential pool remains unavailable."""
+        old_pool = _make_pool("opencode-go")
+        agent = _make_agent("opencode-go", "qwen-coder", old_pool)
+        agent._route_client_ready = True
 
         with patch(
             "agent.credential_pool.load_pool",
-            side_effect=RuntimeError("simulated corrupt auth.json"),
-        ):
-            # Should NOT raise — pool reload failure is logged+swallowed.
+            side_effect=RuntimeError("simulated corrupt auth store"),
+        ), patch(
+            "agent.agent_runtime_helpers._resolve_switch_context_length",
+            return_value=([], None),
+        ), pytest.raises(RuntimeError, match="simulated corrupt auth store"):
             switch_model(
                 agent,
                 new_model="llama-3.3-70b",
@@ -212,8 +226,7 @@ class TestSwitchModelReloadsCredentialPool:
                 api_mode="chat_completions",
             )
 
-        # The switch itself completed (provider/model updated) even though
-        # the pool reload failed, without retaining the old provider's pool.
-        assert agent.provider == "groq"
-        assert agent.model == "llama-3.3-70b"
-        assert agent._credential_pool is None
+        assert agent.provider == "opencode-go"
+        assert agent.model == "qwen-coder"
+        assert agent._credential_pool is old_pool
+        assert agent._route_client_ready is True

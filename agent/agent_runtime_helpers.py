@@ -2063,9 +2063,14 @@ _SWITCH_SNAPSHOT_FIELDS = (
     "model", "provider", "requested_provider", "base_url", "api_mode", "api_key", "client",
     "_anthropic_client", "_anthropic_api_key", "_anthropic_base_url", "_is_anthropic_oauth",
     "_config_context_length", "_reasoning_echo_flag", "runtime_capabilities",
-    "_credential_pool", "_credential_pool_entry_id",
+    "_credential_pool", "_credential_pool_entry_id", "_primary_credential_pool",
     "_codex_reasoning_replay_enabled", "_codex_reasoning_replay_rejected",
-    "_route_client_ready", "_moa_slot_runtimes",
+    "_route_client_ready", "_moa_slot_runtimes", "context_compressor",
+    "_custom_providers", "_use_prompt_caching", "_use_native_cache_layout",
+    "reasoning_config", "_cached_system_prompt", "request_overrides",
+    "_fallback_activated", "_provider_fallback_active", "_provider_fallback_route",
+    "_provider_fallback_tool_policy", "_fallback_index", "_credential_pool_revert_id",
+    "_fallback_chain", "_fallback_model", "_primary_runtime", "_consecutive_stale_streams",
 )
 _MISSING = object()
 
@@ -2075,8 +2080,15 @@ def _snapshot_switch_state(agent) -> dict[str, Any]:
     (else a new model name + OLD client 400s next turn). The sentinel distinguishes unset from
     None: tests build bare agents via ``__new__`` without all fields."""
     snapshot = {name: getattr(agent, name, _MISSING) for name in _SWITCH_SNAPSHOT_FIELDS}
-    # Shallow-copy the dict so mutating the live one doesn't poison the rollback target.
-    snapshot["_client_kwargs"] = dict(getattr(agent, "_client_kwargs", {}) or {})
+    # Copy mutable route maps so in-place transition work cannot poison rollback,
+    # while preserving exact attribute absence on bare/test agents.
+    for name in ("_client_kwargs", "_transport_cache"):
+        value = getattr(agent, name, _MISSING)
+        snapshot[name] = dict(value or {}) if value is not _MISSING else _MISSING
+    for name in ("runtime_capabilities", "reasoning_config", "request_overrides"):
+        value = snapshot.get(name, _MISSING)
+        if isinstance(value, dict):
+            snapshot[name] = copy.deepcopy(value)
     return snapshot
 
 
@@ -2231,20 +2243,14 @@ def _swap_switch_runtime(agent, new_model, new_provider, api_key, base_url, api_
     reset_codex_reasoning_replay(agent)
     if api_key:
         agent.api_key = api_key
-    # Reload the credential pool on provider change: a pool with a mismatched provider makes
-    # recover_with_credential_pool short-circuit. Reload failure is non-fatal.
+    # Reload the credential pool on provider change. Pool maintenance is required
+    # before the switched route can become dispatchable; failures propagate to the
+    # outer absence-aware rollback transaction.
     if old_norm != new_norm or getattr(agent, "_credential_pool", None) is None:
-        # A pool bound to the old provider is worse than none: the recovery guard rejects it.
         agent._credential_pool = None
         agent._credential_pool_entry_id = None
-        try:
-            from agent.credential_pool import load_pool
-            agent._credential_pool = load_pool(new_provider)
-        except Exception as _pool_exc:
-            logger.warning(
-                "switch_model: credential pool reload failed for %s (%s); "
-                "continuing without pool rotation this turn", new_provider, _pool_exc,
-            )
+        from agent.credential_pool import load_pool
+        agent._credential_pool = load_pool(new_provider)
     _build_switched_client(agent, new_provider, api_key, base_url, api_mode, new_norm)
     sync_credential_pool_entry_id(agent)
 
@@ -2325,7 +2331,7 @@ def _update_switch_compressor(agent, custom_providers, effective_context_length,
 
 
 def _finish_switch(agent, new_provider, old_norm, new_norm) -> None:
-    """Post-switch bookkeeping: fallback reset/prune, request_overrides, billing route."""
+    """Apply final route bookkeeping while readiness remains fenced false."""
     agent._fallback_activated = False
     agent._provider_fallback_active = False
     agent._provider_fallback_route = None
@@ -2342,11 +2348,9 @@ def _finish_switch(agent, new_provider, old_norm, new_norm) -> None:
     agent._fallback_chain = fallback_chain
     agent._fallback_model = fallback_chain[0] if fallback_chain else None
     # Apply the switched-to provider's request_overrides (custom_providers extra_body).
-    try:
-        _apply_switched_provider_request_overrides(agent, new_provider)
-    except Exception:
-        logger.debug("switch_model: request_overrides re-derivation failed", exc_info=True)
-    agent._route_client_ready = True
+    # Failure is part of the switch transaction and must not publish a partially
+    # configured route.
+    _apply_switched_provider_request_overrides(agent, new_provider)
 
 
 def _persist_switch_billing_route(agent) -> None:
@@ -2356,13 +2360,10 @@ def _persist_switch_billing_route(agent) -> None:
     session_id = getattr(agent, "session_id", None)
     if session_db is None or not session_id:
         return
-    try:
-        session_db.update_session_billing_route(
-            session_id, provider=agent.provider, base_url=agent.base_url,
-            billing_mode=getattr(agent, "api_mode", None),
-        )
-    except Exception:
-        logger.warning("Failed to persist billing route after model switch", exc_info=True)
+    session_db.update_session_billing_route(
+        session_id, provider=agent.provider, base_url=agent.base_url,
+        billing_mode=getattr(agent, "api_mode", None),
+    )
 
 
 def switch_model(
@@ -2377,73 +2378,80 @@ def switch_model(
     # ── Reload credential pool for the new provider (issue #52727) ── Without this,
     # ``recover_with_credential_pool`` sees a ``pool.provider != agent.provider`` mismatch and
     # short-circuits, leaving the new provider with no rotation/recovery on 401/429 and burning the original
-    # pool's entries. Only reload when the provider actually changed (or the pool was missing) —
-    # re-selecting the same provider must not churn the pool reference. A reload failure is logged +
-    # swallowed: the switch itself must still complete.
+    # pool's entries. Reload is required when the provider changes (or the pool is missing) —
+    # re-selecting the same provider must not churn the pool reference. A reload failure aborts
+    # the switch and restores the exact prior route; an unpooled destination is not ready.
     old_norm = (old_provider or "").strip().lower()
     new_norm = (new_provider or "").strip().lower()
     api_mode, base_url, destination_capabilities = _resolve_switch_destination(
         agent, new_model, new_provider, base_url, api_mode, capabilities, old_norm, new_norm
     )
     snapshot = _snapshot_switch_state(agent)
+    live_compressor = getattr(agent, "context_compressor", None)
+    if live_compressor is not None:
+        prepared_compressor = copy.copy(live_compressor)
+        prepared_compressor._session_db = None
+        prepared_compressor._session_id = ""
+        agent.context_compressor = prepared_compressor
     # A switch mutates the live agent in place. Fence request assembly before the first
-    # identity/client change; success republishes readiness in _finish_switch, while rollback
-    # restores the old route's readiness from the snapshot.
+    # identity/client change and keep it fenced through snapshot and durable maintenance.
     agent._route_client_ready = False
     try:
         _swap_switch_runtime(
             agent, new_model, new_provider, api_key, base_url, api_mode, old_provider, old_norm, new_norm
         )
+        custom_providers, effective_context_length = _resolve_switch_context_length(agent, snapshot)
+        # Refresh the custom-provider snapshot from the config just loaded so the prompt_caching lookup
+        # sees flags added to config.yaml after session start.
+        if custom_providers is not None:
+            agent._custom_providers = custom_providers
+        agent._use_prompt_caching, agent._use_native_cache_layout = agent._anthropic_prompt_cache_policy(
+            provider=new_provider, base_url=agent.base_url, api_mode=api_mode, model=new_model
+        )
+        if getattr(agent, "context_compressor", None):
+            _update_switch_compressor(agent, custom_providers, effective_context_length, snapshot)
+        # Re-read the per-model reasoning_effort override so it applies immediately (per-model > global;
+        # YAML False = disabled).
+        try:
+            from hermes_constants import resolve_reasoning_config
+            from hermes_cli.config import load_config as _sm_load_config
+            agent.reasoning_config = resolve_reasoning_config(_sm_load_config() or {}, agent.model)
+            logger.info(
+                "switch_model: reasoning_config resolved for %s: %s", agent.model, agent.reasoning_config
+            )
+        except Exception as _reasoning_err:
+            logger.debug("switch_model: could not re-resolve reasoning_config: %s", _reasoning_err)
+        agent._cached_system_prompt = None
+        agent.runtime_capabilities = destination_capabilities
+        from agent.chat_completion_helpers import _reset_stale_streak
+        _reset_stale_streak(agent)
+        switch_time_overrides = dict(getattr(agent, "request_overrides", {}) or {})
+        _finish_switch(agent, new_provider, old_norm, new_norm)
+        agent._primary_runtime = _build_primary_runtime_snapshot(agent, api_mode)
+        if (
+            "extra_body" in switch_time_overrides
+            and "extra_body" not in agent._primary_runtime["request_overrides"]
+        ):
+            agent._primary_runtime["request_overrides"] = switch_time_overrides
+        agent._primary_credential_pool = getattr(agent, "_credential_pool", None)
+
+        prepared_compressor = getattr(agent, "context_compressor", None)
+        if prepared_compressor is not None and live_compressor is not None:
+            prepared_compressor._session_db = getattr(live_compressor, "_session_db", None)
+            prepared_compressor._session_id = getattr(live_compressor, "_session_id", "")
+            from agent.route_binding_state import persist_prepared_compressor
+            persist_prepared_compressor(live_compressor, prepared_compressor)
+        _persist_switch_billing_route(agent)
+        logger.info(
+            "Model switched in-place: %s (%s) -> %s (%s)",
+            old_model, old_provider, new_model, new_provider,
+        )
+        # Readiness is the final publication bit. No required route or durable
+        # maintenance may follow this assignment.
+        agent._route_client_ready = True
     except Exception:
         _restore_switch_snapshot(agent, snapshot)
         raise
-    custom_providers, effective_context_length = _resolve_switch_context_length(agent, snapshot)
-    # Refresh the custom-provider snapshot from the config just loaded so the prompt_caching lookup
-    # sees flags added to config.yaml after session start.
-    if custom_providers is not None:
-        agent._custom_providers = custom_providers
-    agent._use_prompt_caching, agent._use_native_cache_layout = agent._anthropic_prompt_cache_policy(
-        provider=new_provider, base_url=agent.base_url, api_mode=api_mode, model=new_model
-    )
-    if hasattr(agent, "context_compressor") and agent.context_compressor:
-        _update_switch_compressor(agent, custom_providers, effective_context_length, snapshot)
-    # Re-read the per-model reasoning_effort override so it applies immediately (per-model > global;
-    # YAML False = disabled).
-    try:
-        from hermes_constants import resolve_reasoning_config
-        from hermes_cli.config import load_config as _sm_load_config
-        agent.reasoning_config = resolve_reasoning_config(_sm_load_config() or {}, agent.model)
-        logger.info(
-            "switch_model: reasoning_config resolved for %s: %s", agent.model, agent.reasoning_config
-        )
-    except Exception as _reasoning_err:
-        logger.debug("switch_model: could not re-resolve reasoning_config: %s", _reasoning_err)
-    # Invalidate the cached system prompt so it rebuilds next turn.
-    agent._cached_system_prompt = None
-    # Publish the destination capability map only after every runtime setup above has succeeded.
-    # Failed switches must leave the old map intact.
-    agent.runtime_capabilities = destination_capabilities
-    # Reset the cross-turn stale-call circuit breaker; otherwise the latched streak keeps
-    # short-circuiting the freshly selected healthy provider.
-    from agent.chat_completion_helpers import _reset_stale_streak
-    _reset_stale_streak(agent)
-    switch_time_overrides = dict(getattr(agent, "request_overrides", {}) or {})
-    _finish_switch(agent, new_provider, old_norm, new_norm)
-    agent._primary_runtime = _build_primary_runtime_snapshot(agent, api_mode)
-    # Keep the established recovery contract when the destination has no configured
-    # extra_body: transport recovery restores the explicit overrides that were live
-    # when /model was invoked. A destination-specific extra_body still wins.
-    if (
-        "extra_body" in switch_time_overrides
-        and "extra_body" not in agent._primary_runtime["request_overrides"]
-    ):
-        agent._primary_runtime["request_overrides"] = switch_time_overrides
-    agent._primary_credential_pool = getattr(agent, "_credential_pool", None)
-    logger.info(
-        "Model switched in-place: %s (%s) -> %s (%s)",
-        old_model, old_provider, new_model, new_provider,
-    )
-    _persist_switch_billing_route(agent)
 
 
 def _pre_tool_block_message(agent, function_name, function_args, effective_task_id, tool_call_id, middleware_trace):
