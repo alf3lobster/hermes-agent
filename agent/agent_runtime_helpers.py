@@ -1164,7 +1164,9 @@ def _build_anthropic_client_from_runtime(agent, rt: dict[str, Any]) -> None:
     agent.client = None
 
 
-def _rebuild_primary_client(agent, rt: dict[str, Any], *, reason: str, owner: Any = None) -> None:
+def _rebuild_primary_client(
+    agent, rt: dict[str, Any], *, reason: str, owner: Any = None, mark_ready: bool = True,
+) -> None:
     """Rebuild the primary client from a ``_primary_runtime`` snapshot (MoA facade / native Anthropic / OpenAI wire)."""
     if (agent.provider or "").strip().lower() == "moa":
         # MoA has empty client_kwargs; rebuild via the shared facade factory so the
@@ -1183,7 +1185,8 @@ def _rebuild_primary_client(agent, rt: dict[str, Any], *, reason: str, owner: An
         _build_anthropic_client_from_runtime(agent, rt)
     else:
         agent.client = agent._create_openai_client(dict(rt["client_kwargs"]), reason=reason, shared=True)
-    agent._route_client_ready = True
+    if mark_ready:
+        agent._route_client_ready = True
 
 
 def try_recover_primary_transport(

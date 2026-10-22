@@ -539,6 +539,7 @@ def test_post_commit_pool_failure_keeps_primary_route(monkeypatch):
     agent = SimpleNamespace(
         model="fallback-model",
         provider="fallback-provider",
+        _route_client_ready=False,
         _provider_fallback_tool_policy="none",
         _provider_fallback_active=True,
         _provider_fallback_route=("fallback-model", "fallback-provider"),
@@ -577,6 +578,63 @@ def test_post_commit_pool_failure_keeps_primary_route(monkeypatch):
     assert agent._provider_fallback_tool_policy == "inherit"
     assert agent._provider_fallback_active is False
     assert agent._provider_fallback_route is None
+    assert agent._route_client_ready is False
+
+
+def test_fallback_materialization_failure_after_client_swap_leaves_route_inert(monkeypatch):
+    """Readiness is published only after every required maintenance step succeeds."""
+    from agent import route_binding
+
+    client = SimpleNamespace(base_url="https://restricted.invalid/v1")
+    agent = SimpleNamespace(
+        model="restricted",
+        provider="custom",
+        base_url="https://restricted.invalid/v1",
+        api_mode="chat_completions",
+        _route_client_ready=False,
+    )
+    monkeypatch.setattr(
+        "agent.auxiliary_client.resolve_provider_client",
+        lambda *_args, **_kwargs: (client, None),
+    )
+    monkeypatch.setattr("agent.client_lifecycle._swap_fallback_clients", lambda *_args: None)
+    monkeypatch.setattr(
+        "agent.chat_completion_helpers._rebind_fallback_credential_pool",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("pool maintenance failed")),
+    )
+
+    with pytest.raises(RuntimeError, match="pool maintenance failed"):
+        route_binding._materialize_route_client(
+            agent,
+            {"api_mode": "chat_completions"},
+            "custom",
+        )
+
+    assert agent._route_client_ready is False
+
+
+def test_runtime_snapshot_maintenance_failure_leaves_route_inert(monkeypatch):
+    """A rebuilt snapshot client is not ready until post-commit maintenance completes."""
+    from agent import route_binding
+
+    agent = SimpleNamespace(_route_client_ready=False)
+    staged = SimpleNamespace(_route_owner=agent)
+    monkeypatch.setattr(route_binding, "_stage_route_agent", lambda _agent: staged)
+    monkeypatch.setattr(route_binding, "_reinstall_runtime_snapshot_in_place", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(route_binding, "_commit_route_agent", lambda *_args: None)
+    monkeypatch.setattr(
+        "agent.agent_runtime_helpers._rebuild_primary_client",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        route_binding,
+        "_revalidate_committed_compression",
+        lambda *_args: (_ for _ in ()).throw(RuntimeError("compression maintenance failed")),
+    )
+
+    route_binding.reinstall_runtime_snapshot(agent, {"provider": "custom", "model": "primary"})
+
+    assert agent._route_client_ready is False
 
 
 def test_post_commit_fallback_pool_failure_keeps_committed_route(monkeypatch):

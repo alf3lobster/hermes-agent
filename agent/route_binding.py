@@ -203,12 +203,11 @@ def _bind_route_entry_in_place(
     return old_model, old_provider
 
 
-def _materialize_route_client(agent: Any, entry: dict[str, Any], provider: str) -> None:
-    """Install real credentials/client after the restrictive route is already live."""
+def _materialize_route_client_in_place(agent: Any, entry: dict[str, Any], provider: str) -> None:
+    """Install real credentials/client without publishing route readiness."""
     if provider == "moa":
         from agent.moa_loop import bind_moa_runtime
         bind_moa_runtime(agent, agent.model, owner=agent)
-        agent._route_client_ready = True
         return  # The facade resolves its advisors/aggregator lazily on the committed route.
     from agent.auxiliary_client import resolve_provider_client
     from agent.chat_completion_helpers import (
@@ -242,7 +241,6 @@ def _materialize_route_client(agent: Any, entry: dict[str, Any], provider: str) 
     agent.base_url, agent.api_mode = base_url, api_mode
     from agent.client_lifecycle import _swap_fallback_clients
     _swap_fallback_clients(agent, client, provider, agent.model, base_url, api_mode)
-    agent._route_client_ready = True
     _rebind_fallback_credential_pool(agent, provider, agent.model)
     from agent.agent_runtime_helpers import sync_credential_pool_entry_id
     sync_credential_pool_entry_id(agent)
@@ -251,6 +249,17 @@ def _materialize_route_client(agent: Any, entry: dict[str, Any], provider: str) 
     )
     agent._ensure_lmstudio_runtime_loaded()
     _update_fallback_context_compressor(agent)
+
+
+def _materialize_route_client(agent: Any, entry: dict[str, Any], provider: str) -> None:
+    """Install post-commit route machinery and publish readiness only when complete."""
+    agent._route_client_ready = False
+    try:
+        _materialize_route_client_in_place(agent, entry, provider)
+    except Exception:
+        agent._route_client_ready = False
+        raise
+    agent._route_client_ready = True
 
 
 def bind_route_entry(
@@ -371,10 +380,12 @@ def reinstall_runtime_snapshot(agent: Any, rt: dict[str, Any]) -> None:
     _commit_route_agent(agent, staged)
     try:
         from agent.agent_runtime_helpers import _rebuild_primary_client
-        _rebuild_primary_client(agent, rt, reason="restore_snapshot", owner=agent)
-        agent._route_client_ready = True
+        agent._route_client_ready = False
+        _rebuild_primary_client(agent, rt, reason="restore_snapshot", owner=agent, mark_ready=False)
         _revalidate_committed_compression(agent)
+        agent._route_client_ready = True
     except Exception:
+        agent._route_client_ready = False
         logger.warning(
             "Runtime route committed but client maintenance failed for %s/%s",
             rt.get("provider", ""),
@@ -423,15 +434,17 @@ def reinstall_primary_runtime(
             agent._rate_limited_until = 0
             prefetched_pool, prefetched = pool, True
         from agent.agent_runtime_helpers import _rebuild_primary_client
-        _rebuild_primary_client(agent, rt, reason="restore_primary", owner=agent)
-        agent._route_client_ready = True
+        agent._route_client_ready = False
+        _rebuild_primary_client(agent, rt, reason="restore_primary", owner=agent, mark_ready=False)
         _revalidate_committed_compression(agent)
         rebind_primary_credential_pool(
             agent, primary_provider, primary_model, matches_primary,
             load_primary_pool, prefetched_pool, prefetched,
         )
         agent._primary_credential_pool = getattr(agent, "_credential_pool", None)
+        agent._route_client_ready = True
     except Exception:
+        agent._route_client_ready = False
         logger.warning(
             "Primary route committed but client/credential maintenance failed for %s/%s",
             primary_provider,
