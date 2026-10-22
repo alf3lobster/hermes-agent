@@ -2065,6 +2065,7 @@ _SWITCH_SNAPSHOT_FIELDS = (
     "_config_context_length", "_reasoning_echo_flag", "runtime_capabilities",
     "_credential_pool", "_credential_pool_entry_id",
     "_codex_reasoning_replay_enabled", "_codex_reasoning_replay_rejected",
+    "_route_client_ready", "_moa_slot_runtimes",
 )
 _MISSING = object()
 
@@ -2082,7 +2083,9 @@ def _snapshot_switch_state(agent) -> dict[str, Any]:
 def _restore_switch_snapshot(agent, snapshot: dict[str, Any]) -> None:
     for name, value in snapshot.items():
         if value is _MISSING:
-            continue  # attribute did not exist before the swap; don't fabricate it
+            with contextlib.suppress(Exception):
+                delattr(agent, name)
+            continue  # attribute did not exist before the swap; remove any value created by it
         with contextlib.suppress(Exception):
             setattr(agent, name, value)
 
@@ -2383,6 +2386,10 @@ def switch_model(
         agent, new_model, new_provider, base_url, api_mode, capabilities, old_norm, new_norm
     )
     snapshot = _snapshot_switch_state(agent)
+    # A switch mutates the live agent in place. Fence request assembly before the first
+    # identity/client change; success republishes readiness in _finish_switch, while rollback
+    # restores the old route's readiness from the snapshot.
+    agent._route_client_ready = False
     try:
         _swap_switch_runtime(
             agent, new_model, new_provider, api_key, base_url, api_mode, old_provider, old_norm, new_norm

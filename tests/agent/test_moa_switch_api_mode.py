@@ -61,10 +61,13 @@ def test_switch_to_moa_pins_chat_completions(monkeypatch, incoming_api_mode):
     # pool reload, context-compressor refresh, primary-runtime bookkeeping).
     # We only assert the api_mode invariant set in the moa client-build branch.
     monkeypatch.setattr(arh, "load_pool", lambda *a, **k: None, raising=False)
-    monkeypatch.setattr(
-        "agent.moa_loop.materialize_moa_slot_runtimes",
-        lambda agent, preset: setattr(agent, "_moa_slot_runtimes", {}),
-    )
+    readiness_seen = []
+
+    def materialize(target, _preset):
+        readiness_seen.append(target._route_client_ready)
+        target._moa_slot_runtimes = {}
+
+    monkeypatch.setattr("agent.moa_loop.materialize_moa_slot_runtimes", materialize)
 
     agent = _make_fake_agent()
     try:
@@ -92,6 +95,7 @@ def test_switch_to_moa_pins_chat_completions(monkeypatch, incoming_api_mode):
     )
     # The MoAClient facade should be installed as the client.
     assert type(agent.client).__name__ == "MoAClient"
+    assert readiness_seen == [False]
 
 
 def test_failed_moa_materialization_rolls_back_manual_switch(monkeypatch):
@@ -99,9 +103,16 @@ def test_failed_moa_materialization_rolls_back_manual_switch(monkeypatch):
     from agent import agent_runtime_helpers as arh
 
     agent = _make_fake_agent()
+    agent._route_client_ready = True
+    readiness_seen = []
+
+    def fail_materialization(target, _preset):
+        readiness_seen.append(target._route_client_ready)
+        raise RuntimeError("slot resolution failed")
+
     monkeypatch.setattr(
         "agent.moa_loop.materialize_moa_slot_runtimes",
-        lambda *_args: (_ for _ in ()).throw(RuntimeError("slot resolution failed")),
+        fail_materialization,
     )
 
     with pytest.raises(RuntimeError, match="slot resolution failed"):
@@ -117,4 +128,5 @@ def test_failed_moa_materialization_rolls_back_manual_switch(monkeypatch):
     assert agent.model == "minimax-m3"
     assert agent.provider == "opencode-go"
     assert agent.api_mode == "anthropic_messages"
-    assert getattr(agent, "_route_client_ready", False) is False
+    assert readiness_seen == [False]
+    assert agent._route_client_ready is True
