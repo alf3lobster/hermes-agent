@@ -133,6 +133,32 @@ def test_committed_inert_fallback_is_not_reported_as_activated(monkeypatch):
     notices.assert_not_called()
 
 
+def test_shared_kwargs_builder_strips_tools_for_response_only_fallback(monkeypatch):
+    """Every request builder invocation enforces quarantine, even with explicit schemas."""
+    from agent import chat_completion_helpers
+
+    schema = {"type": "function", "function": {"name": "terminal"}}
+    agent = SimpleNamespace(
+        api_mode="chat_completions",
+        tools=[schema],
+        _provider_fallback_tool_policy="none",
+    )
+    monkeypatch.setattr(chat_completion_helpers, "_reasoning_config_for_wire", lambda _agent: None)
+    monkeypatch.setattr(chat_completion_helpers, "effective_request_overrides", lambda _agent: {})
+    build = MagicMock(side_effect=lambda _a, _m, tools, *_rest: {"tools": tools})
+    monkeypatch.setattr(chat_completion_helpers, "_build_chat_completions_kwargs", build)
+
+    implicit = chat_completion_helpers._build_api_kwargs_for_mode(
+        agent, [{"role": "user", "content": "summarize"}]
+    )
+    explicit = chat_completion_helpers._build_api_kwargs_for_mode(
+        agent, [{"role": "user", "content": "summarize"}], [schema]
+    )
+
+    assert implicit["tools"] == []
+    assert explicit["tools"] == []
+
+
 def test_failed_fallback_capability_resolution_does_not_publish_route(monkeypatch):
     """All route metadata must resolve before the prepared fallback becomes live."""
     from agent import route_binding

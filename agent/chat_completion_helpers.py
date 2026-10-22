@@ -1524,7 +1524,9 @@ def _build_api_kwargs_for_mode(agent, api_messages: list, tools_for_api: list | 
     # One-shot continuation override — consumed exactly once, on the FIRST
     # request this call builds (only one api_mode branch runs per invocation).
     reasoning_config = _reasoning_config_for_wire(agent)
-    if tools_for_api is None:
+    if getattr(agent, "_provider_fallback_tool_policy", "inherit") == "none":
+        tools_for_api = []
+    elif tools_for_api is None:
         tools_for_api = agent.tools
     # The one place request_overrides are consumed: static /fast values are already pinned
     # in agent.request_overrides; auto/cold windows layer the fast override per request.
