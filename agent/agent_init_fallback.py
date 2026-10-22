@@ -2,10 +2,7 @@
 
 from __future__ import annotations
 
-import logging
 from typing import Any, Dict, List
-
-logger = logging.getLogger("run_agent")
 
 
 def _client_kwargs_from_routed(client, timeout) -> dict[str, Any]:
@@ -68,7 +65,8 @@ def recompute_init_fallback_api_mode(agent, fb_client, entry: dict[str, Any] | N
     The per-turn path (``try_activate_fallback``) already recomputes via
     ``_fallback_api_mode_resolved``; this keeps init in agreement, and runs before the
     ``_primary_runtime`` snapshot so ``restore_primary_runtime`` replays the recomputed mode.
-    A detection failure keeps the primary's mode and never blocks the fallback itself.
+    Detection failure is post-publication failure: the committed fallback stays inert rather
+    than inheriting the unreachable primary route's API mode.
     """
     from agent.chat_completion_helpers import _fallback_api_mode_hint, _fallback_api_mode_resolved
     try:
@@ -83,8 +81,9 @@ def recompute_init_fallback_api_mode(agent, fb_client, entry: dict[str, Any] | N
                 str(getattr(fb_client, "base_url", "") or ""),
             )
         )
-    except Exception:
-        logger.debug("Init-time fallback api_mode detection failed for %s", agent.provider, exc_info=True)
-        return
+    except Exception as exc:
+        raise RuntimeError(
+            f"post-commit init fallback api mode detection failed for {agent.provider}"
+        ) from exc
     if hasattr(agent, "_transport_cache"):
         agent._transport_cache.clear()

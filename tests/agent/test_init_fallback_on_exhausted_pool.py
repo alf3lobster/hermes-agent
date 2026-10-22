@@ -43,6 +43,9 @@ def test_init_fallback_publishes_restriction_before_credentials():
         model="primary-model",
         api_mode="chat_completions",
         _provider_fallback_tool_policy="inherit",
+        _is_azure_openai_url=lambda _url: False,
+        _is_direct_openai_url=lambda _url: False,
+        _provider_model_requires_responses_api=lambda _model, provider=None: False,
     )
     fallback = {
         "provider": "custom",
@@ -293,6 +296,64 @@ def test_init_fallback_materializes_bedrock_wire_before_readiness(monkeypatch, a
     assert agent.api_mode == expected_mode
     assert agent._bedrock_region == "us-west-2"
     assert agent._route_client_ready is True
+
+
+def test_init_fallback_mode_detection_failure_stays_inert(monkeypatch):
+    """A committed fallback cannot inherit the unreachable primary's API mode."""
+    routed_fallback = _mock_client(base_url="https://fallback.invalid/v1")
+    readiness_writes = []
+
+    class ObservedAgent(AIAgent):
+        @property
+        def _route_client_ready(self):
+            return self.__dict__.get("_route_client_ready_value", True)
+
+        @_route_client_ready.setter
+        def _route_client_ready(self, value):
+            readiness_writes.append(value)
+            self.__dict__["_route_client_ready_value"] = value
+
+    def resolve(provider, **_kwargs):
+        if provider == "nous":
+            return None, None
+        assert provider == "my-provider"
+        return routed_fallback, "fallback-model"
+
+    from agent.client_lifecycle import _swap_fallback_clients
+
+    swap_clients = MagicMock(wraps=_swap_fallback_clients)
+    monkeypatch.setattr("agent.auxiliary_client.resolve_provider_client", resolve)
+    monkeypatch.setattr(
+        "agent.chat_completion_helpers._fallback_api_mode_resolved",
+        MagicMock(side_effect=ValueError("mode detection failed")),
+    )
+    monkeypatch.setattr("agent.client_lifecycle._swap_fallback_clients", swap_clients)
+
+    with (
+        patch("model_tools.get_tool_definitions", return_value=_make_tool_defs()),
+        patch("model_tools.check_toolset_requirements", return_value={}),
+        patch("agent.process_bootstrap.OpenAI", return_value=MagicMock()),
+    ):
+        with pytest.raises(
+            RuntimeError,
+            match="post-commit init fallback api mode detection failed for my-provider",
+        ):
+            ObservedAgent(
+                provider="nous",
+                model="primary-model",
+                api_mode="codex_responses",
+                quiet_mode=True,
+                skip_context_files=True,
+                skip_memory=True,
+                fallback_model=[{
+                    "provider": "my-provider",
+                    "model": "fallback-model",
+                    "tool_policy": "none",
+                }],
+            )
+
+    assert readiness_writes == [False]
+    swap_clients.assert_not_called()
 
 
 def test_init_fallback_does_not_reselect_after_post_publish_failure():
