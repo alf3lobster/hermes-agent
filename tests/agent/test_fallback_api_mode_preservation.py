@@ -71,8 +71,12 @@ def _activate(agent, resolved_base_url, resolved_model, build_anthropic=None):
             side_effect=build_anthropic
             or (lambda api_key, base_url, timeout=None, **kw: MagicMock()),
         ),
+        # Route preparation now derives endpoint metadata without invoking the
+        # credential-aware resolver.  Supply the configured endpoint directly;
+        # the resolver mock remains the post-commit materialisation boundary.
+        patch("agent.route_binding._prepared_route_base_url", return_value=resolved_base_url),
     ]
-    with patches[0], patches[1] as mock_rpc, patches[2], patches[3]:
+    with patches[0], patches[1] as mock_rpc, patches[2], patches[3], patches[4]:
         assert agent._try_activate_fallback() is True
     return mock_rpc
 

@@ -350,6 +350,39 @@ class TestRestorePrimaryRuntime:
         assert agent.provider == "openai-api"
         assert agent._credential_pool is None
 
+    def test_rejected_primary_publication_never_loads_pool_during_preparation(self):
+        """The real restore call graph reaches publication before reopening auth state."""
+        agent = _make_agent(
+            provider="openai-api",
+            base_url="https://api.openai.com/v1",
+            fallback_model={
+                "provider": "deepseek",
+                "model": "deepseek-v4-flash",
+                "tool_policy": "none",
+            },
+        )
+        fallback_client = _mock_resolve(base_url="https://api.deepseek.com/v1")
+        with patch(
+            "agent.auxiliary_client.resolve_provider_client",
+            return_value=(fallback_client, "deepseek-v4-flash"),
+        ):
+            assert agent._try_activate_fallback() is True
+
+        load_pool = MagicMock(side_effect=AssertionError("pool opened before primary publication"))
+        with (
+            patch("agent.process_bootstrap.OpenAI", return_value=MagicMock()),
+            patch("agent.credential_pool.load_pool", load_pool),
+            patch(
+                "agent.route_binding._commit_route_agent",
+                side_effect=RuntimeError("injected primary publication rejection"),
+            ),
+        ):
+            assert agent._restore_primary_runtime() is False
+
+        load_pool.assert_not_called()
+        assert agent.provider == "deepseek"
+        assert agent._provider_fallback_tool_policy == "none"
+
     def test_restore_swaps_matching_custom_pool_entry(self):
         """Custom primary + custom:<name> entry whose base_url resolves to the
         SAME custom key must swap (legitimate same-endpoint rotation)."""

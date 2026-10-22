@@ -1,20 +1,94 @@
 """Construct and publish provider routes without exposing partial runtime state.
 
-``bind_route_entry`` stages the fallback/voice route (client, pool, compressor, reasoning,
-extra_body, tool policy) and publishes it only after construction succeeds;
-``reinstall_primary_runtime`` applies the same rule when restoring the primary route.
+``bind_route_entry`` stages fallback/voice metadata with a credential-inert client shell,
+then publishes before credential/client materialisation; ``reinstall_primary_runtime``
+applies the same publication rule when restoring the primary route.
 """
 
 from __future__ import annotations
 
 import copy
 import logging
+from types import SimpleNamespace
 from typing import Any, Callable, Dict, Optional, Tuple
 
 from utils import base_url_host_matches
 from agent.route_binding_state import rebind_primary_credential_pool
 
 logger = logging.getLogger(__name__)
+
+_DEFERRED_ROUTE_CREDENTIAL = "route-preparation-uncredentialed"
+_CREDENTIAL_FREE_ROUTE_DEFAULTS = {
+    # ``openai`` is the documented direct-API alias for ``openai-api``.
+    "openai": "https://api.openai.com/v1",
+    # A remote/custom Ollama route carries an explicit URL; only the bare local
+    # alias falls back to the standard loopback endpoint.
+    "ollama": "http://127.0.0.1:11434/v1",
+}
+
+
+def _prepared_route_base_url(entry: dict[str, Any], provider: str) -> Optional[str]:
+    """Resolve endpoint metadata without opening any credential source."""
+    explicit = str(entry.get("base_url") or "").strip().rstrip("/")
+    if explicit:
+        return explicit
+    if provider == "moa":
+        return "moa://local"
+    if provider in _CREDENTIAL_FREE_ROUTE_DEFAULTS:
+        return _CREDENTIAL_FREE_ROUTE_DEFAULTS[provider]
+    try:
+        from providers import get_provider_profile
+        profile = get_provider_profile(provider)
+        profiled = str(getattr(profile, "base_url", "") or "").strip().rstrip("/")
+        if profiled:
+            return profiled
+    except Exception:
+        logger.debug("Provider profile unavailable during route preparation", exc_info=True)
+    try:
+        from hermes_cli.auth import PROVIDER_REGISTRY
+        config = PROVIDER_REGISTRY.get(provider)
+        registered = str(getattr(config, "inference_base_url", "") or "").strip().rstrip("/")
+        if registered:
+            return registered
+    except Exception:
+        logger.debug("Provider registry metadata unavailable during route preparation", exc_info=True)
+    try:
+        from hermes_cli.runtime_provider import _get_named_custom_provider
+        custom = _get_named_custom_provider(provider) or {}
+        configured = str(custom.get("base_url") or "").strip().rstrip("/")
+        if configured:
+            return configured
+    except Exception:
+        logger.debug("Named-provider metadata unavailable during route preparation", exc_info=True)
+    return None
+
+
+def _prepared_route_client(entry: dict[str, Any], provider: str) -> Optional[Any]:
+    """Credential-inert client shell used only until post-publication maintenance runs."""
+    base_url = _prepared_route_base_url(entry, provider)
+    if not base_url:
+        return None
+    return SimpleNamespace(base_url=base_url, api_key=_DEFERRED_ROUTE_CREDENTIAL)
+
+
+def _install_prepared_route_client(agent: Any, client: Any, base_url: str, api_mode: str) -> None:
+    """Install a deliberately unusable client shell without invoking provider auth builders."""
+    agent.api_key = _DEFERRED_ROUTE_CREDENTIAL
+    agent._client_kwargs = {
+        "api_key": _DEFERRED_ROUTE_CREDENTIAL,
+        "base_url": base_url,
+    }
+    agent._anthropic_client = None
+    agent._anthropic_api_key = ""
+    agent._anthropic_base_url = ""
+    agent._is_anthropic_oauth = False
+    if api_mode == "anthropic_messages":
+        agent.client = None
+        agent._anthropic_client = client
+        agent._anthropic_api_key = _DEFERRED_ROUTE_CREDENTIAL
+        agent._anthropic_base_url = base_url
+    else:
+        agent.client = client
 
 
 def _stage_route_agent(agent: Any) -> Any:
@@ -59,26 +133,15 @@ def _bind_route_entry_in_place(
     """Swap ``agent`` onto ``entry`` (a fallback-chain-shaped dict). Returns ``(old_model,
     old_provider)``, or None when the provider has no usable client. Sets ``_fallback_activated``
     so the next turn's ``restore_primary_runtime`` reverts it; raises on a failed swap."""
-    from agent.auxiliary_client import resolve_provider_client
     from agent.chat_completion_helpers import (
         _fallback_api_mode_hint, _fallback_api_mode_resolved, _rebind_fallback_credential_pool,
         _reresolve_fallback_reasoning_config, _rescope_fallback_extra_body, _update_fallback_context_compressor,
     )
-    from hermes_cli.fallback_config import resolve_entry_api_key
-    # Pass the entry's base_url/api_key so custom endpoints (Ollama Cloud) resolve instead
-    # of falling through to OpenRouter defaults.
+    # Preparation uses endpoint metadata plus a non-secret dead credential. The real
+    # provider resolver may heal/select persistent pools, so it runs only after publication.
     base_url_hint = (entry.get("base_url") or "").strip() or None
-    api_key_hint = resolve_entry_api_key(entry)
     api_mode_explicit, api_mode = _fallback_api_mode_hint(entry, provider, base_url_hint)
-    # Ollama Cloud: OLLAMA_API_KEY from env when the entry has no key. Host match, not
-    # substring — GHSA-76xc-57q6-vm5m.
-    if base_url_hint and base_url_host_matches(base_url_hint, "ollama.com") and not api_key_hint:
-        from agent.secret_scope import get_secret
-        api_key_hint = get_secret("OLLAMA_API_KEY") or None
-    # raw_codex=True: the main agent needs direct responses.stream() access for Codex providers.
-    client, _resolved_model = resolve_provider_client(
-        provider, model=model, raw_codex=True, explicit_base_url=base_url_hint, explicit_api_key=api_key_hint,
-        api_mode=api_mode)
+    client = _prepared_route_client(entry, provider)
     if client is None:
         return None
     if provider == "moa":
@@ -118,19 +181,63 @@ def _bind_route_entry_in_place(
         from agent.moa_loop import bind_moa_runtime
         bind_moa_runtime(agent, model, owner=owner)
     else:
-        from agent.client_lifecycle import _swap_fallback_clients
-        _swap_fallback_clients(agent, client, provider, model, base_url, api_mode)
+        _install_prepared_route_client(agent, client, base_url, api_mode)
 
     from agent.agent_runtime_helpers import sync_credential_pool_entry_id
     sync_credential_pool_entry_id(agent)
 
     agent._use_prompt_caching, agent._use_native_cache_layout = agent._anthropic_prompt_cache_policy(
         provider=provider, base_url=base_url, api_mode=api_mode, model=model)
-    agent._ensure_lmstudio_runtime_loaded()  # LM Studio: preload before probing context length
     _update_fallback_context_compressor(agent)
     _reresolve_fallback_reasoning_config(agent)
     _rescope_fallback_extra_body(agent, old_model, old_provider, old_base_url)
     return old_model, old_provider
+
+
+def _materialize_route_client(agent: Any, entry: dict[str, Any], provider: str) -> None:
+    """Install real credentials/client after the restrictive route is already live."""
+    if provider == "moa":
+        return  # The facade resolves its advisors/aggregator lazily on the committed route.
+    from agent.auxiliary_client import resolve_provider_client
+    from agent.chat_completion_helpers import (
+        _fallback_api_mode_resolved, _rebind_fallback_credential_pool,
+        _update_fallback_context_compressor,
+    )
+    from hermes_cli.fallback_config import resolve_entry_api_key
+
+    base_url_hint = (entry.get("base_url") or "").strip() or None
+    api_key_hint = resolve_entry_api_key(entry)
+    if base_url_hint and base_url_host_matches(base_url_hint, "ollama.com") and not api_key_hint:
+        from agent.secret_scope import get_secret
+        api_key_hint = get_secret("OLLAMA_API_KEY") or None
+    client, _resolved_model = resolve_provider_client(
+        provider,
+        model=agent.model,
+        raw_codex=True,
+        explicit_base_url=base_url_hint,
+        explicit_api_key=api_key_hint,
+        api_mode=agent.api_mode,
+    )
+    if client is None:
+        raise RuntimeError(f"post-commit client resolution failed for {provider}")
+    base_url = str(client.base_url)
+    api_mode = agent.api_mode
+    from hermes_cli.providers import is_actual_route
+    if is_actual_route(provider, base_url):
+        api_mode = "chat_completions"
+    elif not entry.get("api_mode") and api_mode == "chat_completions":
+        api_mode = _fallback_api_mode_resolved(agent, provider, agent.model, base_url)
+    agent.base_url, agent.api_mode = base_url, api_mode
+    from agent.client_lifecycle import _swap_fallback_clients
+    _swap_fallback_clients(agent, client, provider, agent.model, base_url, api_mode)
+    _rebind_fallback_credential_pool(agent, provider, agent.model)
+    from agent.agent_runtime_helpers import sync_credential_pool_entry_id
+    sync_credential_pool_entry_id(agent)
+    agent._use_prompt_caching, agent._use_native_cache_layout = agent._anthropic_prompt_cache_policy(
+        provider=provider, base_url=base_url, api_mode=api_mode, model=agent.model,
+    )
+    agent._ensure_lmstudio_runtime_loaded()
+    _update_fallback_context_compressor(agent)
 
 
 def bind_route_entry(
@@ -163,15 +270,11 @@ def bind_route_entry(
         if admit is not None:
             admit(staged)
         _commit_route_agent(agent, staged)
-        from agent.chat_completion_helpers import _rebind_fallback_credential_pool
-        from agent.agent_runtime_helpers import sync_credential_pool_entry_id
-
         try:
-            _rebind_fallback_credential_pool(agent, provider, agent.model)
-            sync_credential_pool_entry_id(agent)
+            _materialize_route_client(agent, entry, provider)
         except Exception:
             logger.warning(
-                "Fallback route committed but credential-pool maintenance failed for %s/%s",
+                "Fallback route committed but credential/client maintenance failed for %s/%s",
                 provider,
                 agent.model,
                 exc_info=True,
@@ -276,6 +379,7 @@ def reinstall_primary_runtime(
             agent, primary_provider, primary_model, matches_primary,
             load_primary_pool, prefetched_pool, prefetched,
         )
+        agent._primary_credential_pool = getattr(agent, "_credential_pool", None)
     except Exception:
         logger.warning(
             "Primary route committed but credential-pool maintenance failed for %s/%s",

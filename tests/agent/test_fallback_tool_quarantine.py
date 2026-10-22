@@ -1,5 +1,6 @@
 """Fail-closed dispatch tests for response-only fallback routes."""
 
+import time
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -140,23 +141,22 @@ def test_failed_fallback_capability_resolution_does_not_publish_route(monkeypatc
     assert agent._provider_fallback_tool_policy == "inherit"
 
 
-def test_rejected_fallback_does_not_load_or_heal_credential_pool(monkeypatch):
-    """Credential-store maintenance starts only after the complete fallback route is accepted."""
-    from agent import route_binding
+def test_rejected_fallback_real_resolver_does_not_load_or_select_credential_pool(monkeypatch):
+    """The real provider resolver must remain credential-inert until route publication."""
+    from agent import auxiliary_client, route_binding
 
     agent = _agent()
     agent._credential_pool = None
+    load_pool = MagicMock(side_effect=AssertionError("route preparation loaded credentials"))
+    select_pool = MagicMock(side_effect=AssertionError("route preparation selected credentials"))
     fake_client = SimpleNamespace(
-        base_url="https://restricted.invalid/v1",
-        api_key="fallback-key",
+        base_url="https://openrouter.ai/api/v1",
+        api_key="route-preparation-placeholder",
     )
-    load_pool = MagicMock(return_value=None)
 
-    monkeypatch.setattr(
-        "agent.auxiliary_client.resolve_provider_client",
-        lambda *_args, **_kwargs: (fake_client, "restricted"),
-    )
     monkeypatch.setattr("agent.credential_pool.load_pool", load_pool)
+    monkeypatch.setattr(auxiliary_client, "_select_pool_entry", select_pool)
+    monkeypatch.setattr(auxiliary_client, "_create_openai_client", lambda **_kwargs: fake_client)
     monkeypatch.setattr("agent.client_lifecycle._swap_fallback_clients", lambda *_args: None)
     monkeypatch.setattr("agent.agent_runtime_helpers.sync_credential_pool_entry_id", lambda *_args: None)
     monkeypatch.setattr("agent.chat_completion_helpers._update_fallback_context_compressor", lambda *_args: None)
@@ -172,17 +172,16 @@ def test_rejected_fallback_does_not_load_or_heal_credential_pool(monkeypatch):
         route_binding.bind_route_entry(
             agent,
             {
-                "provider": "custom",
-                "model": "restricted",
-                "base_url": "https://restricted.invalid/v1",
-                "api_key": "fallback-key",
+                "provider": "openrouter",
+                "model": "example/restricted:free",
                 "tool_policy": "none",
             },
-            "custom",
-            "restricted",
+            "openrouter",
+            "example/restricted:free",
         )
 
     load_pool.assert_not_called()
+    select_pool.assert_not_called()
 
 
 def test_candidate_screening_does_not_load_or_heal_credential_pool(monkeypatch):
@@ -195,6 +194,78 @@ def test_candidate_screening_does_not_load_or_heal_credential_pool(monkeypatch):
 
     assert _candidate_pool_exhausted(agent, "custom", "candidate") is False
     load_pool.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("provider", "expected"),
+    [
+        ("openai", "https://api.openai.com/v1"),
+        ("ollama", "http://127.0.0.1:11434/v1"),
+    ],
+)
+def test_prepared_builtin_route_metadata_needs_no_credentials(provider, expected):
+    """Common aliases remain useful without invoking their credential-aware resolver."""
+    from agent.route_binding import _prepared_route_base_url
+
+    assert _prepared_route_base_url({"provider": provider}, provider) == expected
+
+
+def _fallback_restore_agent(primary_provider: str) -> SimpleNamespace:
+    return SimpleNamespace(
+        _fallback_activated=True,
+        _fallback_index=0,
+        _primary_runtime={
+            "provider": primary_provider,
+            "model": "primary-model",
+            "base_url": "https://primary.invalid/v1",
+            "requested_provider": primary_provider,
+            "fallback_tool_policy": "inherit",
+        },
+        _credential_pool=SimpleNamespace(provider="fallback-provider"),
+        _rate_limited_until=0,
+        _codex_reopen_checked_at=float("-inf"),
+        _restore_wait_logged=False,
+        _provider_fallback_active=True,
+        _provider_fallback_route=("fallback-model", "fallback-provider"),
+        _provider_fallback_tool_policy="none",
+        provider="fallback-provider",
+        model="fallback-model",
+    )
+
+
+def test_rejected_primary_restore_does_not_load_pool_before_route_preparation(monkeypatch):
+    """The complete restoration entry point must not open a mismatched primary pool pre-commit."""
+    from agent.agent_runtime_helpers import restore_primary_runtime
+
+    agent = _fallback_restore_agent("custom")
+    load_runtime_pool = MagicMock(side_effect=AssertionError("primary pool loaded before commit"))
+    monkeypatch.setattr("agent.custom_entry_pool.load_runtime_pool", load_runtime_pool)
+    monkeypatch.setattr("agent.fallback_cooldown._is_entitlement_rejected", lambda *_args: False)
+    monkeypatch.setattr("hermes_cli.chat_catalog.is_known_non_chat_model", lambda *_args: False)
+    monkeypatch.setattr(
+        "agent.route_binding.reinstall_primary_runtime",
+        MagicMock(side_effect=RuntimeError("primary preparation rejected")),
+    )
+
+    assert restore_primary_runtime(agent) is False
+    load_runtime_pool.assert_not_called()
+    assert agent._provider_fallback_tool_policy == "none"
+
+
+def test_codex_early_reopen_does_not_load_primary_pool_before_commit(monkeypatch):
+    """An early-reopen probe may inspect a retained primary pool, but must not load one."""
+    from agent.agent_runtime_helpers import restore_primary_runtime
+
+    agent = _fallback_restore_agent("openai-codex")
+    agent._rate_limited_until = time.monotonic() + 3600
+    load_runtime_pool = MagicMock(return_value=None)
+    monkeypatch.setattr("agent.custom_entry_pool.load_runtime_pool", load_runtime_pool)
+    monkeypatch.setattr("agent.fallback_cooldown._is_entitlement_rejected", lambda *_args: False)
+    monkeypatch.setattr("hermes_cli.chat_catalog.is_known_non_chat_model", lambda *_args: False)
+
+    assert restore_primary_runtime(agent) is False
+    load_runtime_pool.assert_not_called()
+    assert agent._provider_fallback_tool_policy == "none"
 
 
 def test_post_publication_notice_failure_keeps_committed_fallback(monkeypatch):
@@ -510,7 +581,8 @@ def test_post_commit_fallback_pool_failure_keeps_committed_route(monkeypatch):
     monkeypatch.setattr("agent.chat_completion_helpers._reset_stale_streak", lambda *_args: None)
     monkeypatch.setattr("agent.native_compaction.resolve_native_compaction_capabilities", lambda **_kwargs: {})
     monkeypatch.setattr(
-        "agent.chat_completion_helpers._rebind_fallback_credential_pool",
+        route_binding,
+        "_materialize_route_client",
         lambda *_args: (_ for _ in ()).throw(RuntimeError("pool maintenance failed")),
     )
 

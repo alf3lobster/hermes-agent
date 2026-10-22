@@ -50,6 +50,12 @@ def _fallback_agent():
         )
     agent.client = MagicMock()
     agent._primary_runtime = {**agent._primary_runtime, "provider": "openai-codex", "base_url": CODEX_URL}
+    # Production snapshots retain the already-open shared primary pool so quota gates can
+    # inspect it without reopening/healing auth.json during a route transition.
+    from agent.custom_entry_pool import load_runtime_pool
+    agent._primary_credential_pool = load_runtime_pool(
+        "openai-codex", CODEX_URL, "openai-codex", agent._primary_runtime,
+    )
     agent._swap_credential = MagicMock()
     _pin_to_fallback(agent)
     return agent

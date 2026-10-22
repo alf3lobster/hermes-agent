@@ -123,9 +123,13 @@ class TestFallbackCredentialIsolation:
         assert agent._credential_pool.provider == "openai-codex"
         assert agent._transport_cache == {}
 
-    def test_fallback_skips_a_candidate_whose_pool_is_exhausted_for_hours(self):
-        """#89401: a fallback whose every credential is benched until the weekly quota resets is
-        skipped before any client is built; a short throttle on the next candidate is still tried."""
+    def test_fallback_does_not_reselect_after_postcommit_pool_exhaustion(self):
+        """Credential availability is maintenance, never pre-commit candidate authority.
+
+        Once the first restrictive route is published, an exhausted pool must leave that
+        safe route in place rather than retrying a later candidate and widening the
+        transition transaction.
+        """
         import time
         from agent.chat_completion_helpers import try_activate_fallback
 
@@ -150,12 +154,18 @@ class TestFallbackCredentialIsolation:
         pools = {"openai-codex": benched, "openrouter": throttled}
         client = SimpleNamespace(api_key="k", base_url="https://openrouter.ai/api/v1", _custom_headers={})
 
-        with patch("agent.auxiliary_client.resolve_provider_client", return_value=(client, "m")) as resolve, \
-                patch("agent.credential_pool.load_pool", side_effect=lambda p: pools[p]):
+        with patch(
+            "agent.auxiliary_client.resolve_provider_client",
+            side_effect=lambda provider, model, **_kwargs: (client, model),
+        ) as resolve, patch(
+            "agent.credential_pool.load_pool", side_effect=lambda p: pools[p],
+        ):
             assert try_activate_fallback(agent) is True
 
-        assert resolve.call_count == 1 and resolve.call_args.args[0] == "openrouter"
-        assert agent.provider == "openrouter" and agent._credential_pool is throttled
+        assert resolve.call_count == 1
+        assert resolve.call_args.args[0] == "openai-codex"
+        assert agent.provider == "openai-codex"
+        assert agent.model == "gpt-5.5"
 
 # ── Test: _recover_with_credential_pool rejects mismatched pool ──────
 

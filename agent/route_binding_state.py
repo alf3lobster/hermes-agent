@@ -42,8 +42,7 @@ def rebind_primary_credential_pool(
 ) -> None:
     """Select primary credentials only after the complete primary route is already live."""
     pool = getattr(agent, "_credential_pool", None)
-    pool_provider = str(getattr(pool, "provider", "") or "").strip().lower()
-    if pool is not None and pool_provider and not matches_primary(pool):
+    if pool is None or not matches_primary(pool):
         agent._credential_pool = None
         agent._credential_pool_entry_id = None
         try:

@@ -1286,16 +1286,20 @@ def drop_thinking_only_and_merge_users(
     return merged
 
 
-def _primary_reset_gate_blocks(agent, rt, primary_provider, primary_runtime_base_url, matches_primary, load_primary_pool):
-    """Reset-aware gate: skip a guaranteed-to-fail restore while the primary pool reports a
-    future reset; fails open on any error/None. Returns ``(blocked, prefetched_pool, prefetched)``
-    so the rebind step reuses the loaded pool (one auth.json read at most)."""
-    prefetched_pool, prefetched = None, False
+def _primary_reset_gate_blocks(agent, rt, primary_provider, matches_primary, retained_pool):
+    """Inspect an already-retained primary pool without opening the credential store.
+
+    Returns ``(blocked, pool, retained)`` so post-commit maintenance can reuse the
+    shared pool object. Missing/mismatched state fails open to a primary attempt.
+    """
+    pool = (
+        retained_pool
+        if retained_pool is not None and matches_primary(retained_pool)
+        else getattr(agent, "_credential_pool", None)
+    )
+    if pool is None or not matches_primary(pool):
+        return False, None, False
     try:
-        pool = getattr(agent, "_credential_pool", None)
-        if not matches_primary(pool):
-            prefetched_pool = pool = load_primary_pool()
-            prefetched = True
         primary_model = str(rt.get("model") or "").strip()
         next_at = getattr(pool, "next_available_at", lambda **_kwargs: None)(model=primary_model or None)
         if next_at is not None and next_at > time.time():
@@ -1307,10 +1311,10 @@ def _primary_reset_gate_blocks(agent, rt, primary_provider, primary_runtime_base
                     datetime.fromtimestamp(next_at).isoformat(timespec="seconds"), agent.provider,
                     agent.model,
                 )
-            return True, prefetched_pool, prefetched
+            return True, pool, True
     except Exception:
         logger.debug("Reset-aware restore gate failed; falling back to per-turn retry", exc_info=True)
-    return False, prefetched_pool, prefetched
+    return False, pool, True
 
 
 def _restore_runtime_capabilities(agent, rt: dict[str, Any]) -> None:
@@ -1349,18 +1353,11 @@ def _revert_credential_rotation(agent) -> None:
     agent._credential_pool_revert_id = None
 
 
-def _primary_quota_reopened_early(agent, primary_provider, primary_model, matches_primary, load_primary_pool) -> bool:
-    """True when a Codex quota window that the primary pool still has benched has reopened.
+def _primary_quota_reopened_early(agent, primary_provider, primary_model, matches_primary, retained_pool) -> bool:
+    """True when a retained Codex primary pool proves its quota window reopened early.
 
-    A Codex 429 benches the entry, and arms ``_rate_limited_until``, until a ``resets_at`` that can be
-    days out (weekly window). The window can reopen sooner (redeemed reset, top-up, plan change); the
-    pool's throttled usage probe notices, but only on ``select()``, which a session pinned to its
-    fallback never reaches. Fails closed: any doubt leaves both cooldowns in force.
-
-    At most one check per probe interval per agent: the probe caches its verdict and nothing clears
-    it on the next 429, so a "restored" answer the endpoint got wrong would otherwise restore,
-    fail, and fall back again on every turn of the cached window. Checks in between could only
-    replay that cached verdict, so they return before loading the pool.
+    No pool is loaded here: this is a pre-publication admission check. If the
+    primary snapshot did not retain its shared pool, the ordinary cooldown wins.
     """
     if primary_provider != "openai-codex":
         return False
@@ -1369,12 +1366,14 @@ def _primary_quota_reopened_early(agent, primary_provider, primary_model, matche
     if now - getattr(agent, "_codex_reopen_checked_at", float("-inf")) < CODEX_QUOTA_PROBE_MIN_INTERVAL_SECONDS:
         return False
     agent._codex_reopen_checked_at = now
+    pool = (
+        retained_pool
+        if retained_pool is not None and matches_primary(retained_pool)
+        else getattr(agent, "_credential_pool", None)
+    )
+    if pool is None or not matches_primary(pool):
+        return False
     try:
-        pool = getattr(agent, "_credential_pool", None)
-        if pool is None or not matches_primary(pool):
-            pool = load_primary_pool()
-        if pool is None:
-            return False
         model = primary_model or None
         benched_until = pool.next_available_at(model=model)
         if benched_until is None or benched_until <= time.time():
@@ -1415,12 +1414,15 @@ def restore_primary_runtime(agent) -> bool:
         from agent.custom_entry_pool import load_runtime_pool
         loaded = load_runtime_pool(primary_provider, primary_runtime_base_url, (rt or {}).get("requested_provider"), rt or {})
         return loaded if loaded is not None and _matches_primary(loaded) else None
-    if _primary_quota_reopened_early(agent, primary_provider, primary_model, _matches_primary, _load_primary_pool):
+    retained_primary_pool = getattr(agent, "_primary_credential_pool", None)
+    if _primary_quota_reopened_early(
+        agent, primary_provider, primary_model, _matches_primary, retained_primary_pool,
+    ):
         agent._rate_limited_until = 0
     if getattr(agent, "_rate_limited_until", 0) > time.monotonic():
         return False  # primary still in rate-limit cooldown, stay on fallback
     blocked, prefetched_pool, prefetched = _primary_reset_gate_blocks(
-        agent, rt, primary_provider, primary_runtime_base_url, _matches_primary, _load_primary_pool
+        agent, rt, primary_provider, _matches_primary, retained_primary_pool,
     )
     if blocked:
         return False
@@ -2440,8 +2442,18 @@ def switch_model(
     # short-circuiting the freshly selected healthy provider.
     from agent.chat_completion_helpers import _reset_stale_streak
     _reset_stale_streak(agent)
+    switch_time_overrides = dict(getattr(agent, "request_overrides", {}) or {})
     _finish_switch(agent, new_provider, old_norm, new_norm)
     agent._primary_runtime = _build_primary_runtime_snapshot(agent, api_mode)
+    # Keep the established recovery contract when the destination has no configured
+    # extra_body: transport recovery restores the explicit overrides that were live
+    # when /model was invoked. A destination-specific extra_body still wins.
+    if (
+        "extra_body" in switch_time_overrides
+        and "extra_body" not in agent._primary_runtime["request_overrides"]
+    ):
+        agent._primary_runtime["request_overrides"] = switch_time_overrides
+    agent._primary_credential_pool = getattr(agent, "_credential_pool", None)
     logger.info(
         "Model switched in-place: %s (%s) -> %s (%s)",
         old_model, old_provider, new_model, new_provider,
