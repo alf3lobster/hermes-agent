@@ -61,6 +61,8 @@ def _build_primary_runtime_snapshot(agent, api_mode) -> dict[str, Any]:
         "base_url": agent.base_url,
         "api_mode": agent.api_mode,
         "api_key": getattr(agent, "api_key", ""),
+        "credential_pool": getattr(agent, "_credential_pool", None),
+        "credential_pool_entry_id": getattr(agent, "_credential_pool_entry_id", None),
         "client_kwargs": dict(agent._client_kwargs),
         "use_prompt_caching": agent._use_prompt_caching,
         "use_native_cache_layout": agent._use_native_cache_layout,

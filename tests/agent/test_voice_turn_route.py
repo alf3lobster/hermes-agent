@@ -181,6 +181,55 @@ def test_end_voice_post_commit_restore_failure_does_not_arm_retry(tmp_path, monk
         assert agent._restore_primary_runtime() is False
 
 
+def test_voice_restore_rebinds_captured_pool_before_readiness(tmp_path, monkeypatch):
+    """The session pool is part of the atomic runtime snapshot, never a post-ready extra."""
+    import agent.voice_turn_route as voice_route
+    from agent.voice_turn_route import begin_voice_turn_route, end_voice_turn_route
+
+    from types import SimpleNamespace
+
+    with FakeLLMServer([]) as main, FakeLLMServer([]) as voice:
+        home = write_hermes_home(tmp_path / ".hermes", main.base_url, extra_config=(
+            "auxiliary:\n  voice_chat:\n    provider: openrouter\n"
+            f"    base_url: {voice.base_url}\n    model: voice-model\n    api_key: «redacted:sk-…»\n"
+        ))
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        agent = _agent(home, main.base_url)
+        session_pool = SimpleNamespace(
+            provider="custom",
+            entry_id_for_api_key=lambda _key: "session-entry",
+        )
+        voice_pool = SimpleNamespace(
+            provider="openrouter",
+            has_credentials=lambda: True,
+            entry_id_for_api_key=lambda _key: "voice-entry",
+        )
+        monkeypatch.setattr("agent.credential_pool.load_pool", lambda _provider: voice_pool)
+        agent._credential_pool = session_pool
+        agent._credential_pool_entry_id = "session-entry"
+        agent._voice_turn_pending = True
+        begin_voice_turn_route(agent, [{"role": "user", "content": "hi"}], "system")
+        assert agent._credential_pool is not session_pool
+
+        observed = []
+        original_restore = voice_route._restore_extra_fields
+
+        def observe_restore(target, state):
+            observed.append((
+                target._route_client_ready,
+                target._credential_pool is session_pool,
+                target._credential_pool_entry_id,
+            ))
+            original_restore(target, state)
+
+        monkeypatch.setattr(voice_route, "_restore_extra_fields", observe_restore)
+        end_voice_turn_route(agent)
+
+        assert observed == [(True, True, "session-entry")]
+        assert "_credential_pool" not in voice_route._EXTRA_FIELDS
+        assert agent._credential_pool is session_pool
+
+
 @pytest.mark.parametrize("model,api_mode,expected", [
     ("gpt-6-astra", "codex_responses", "low"),        # Responses ladder has no "none"
     ("claude-opus-5-5", "anthropic_messages", "low"),  # mandatory thinking

@@ -8,6 +8,12 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 
+def require_route_client_ready(agent: Any) -> None:
+    """Refuse provider/client paths while a published route is incomplete."""
+    if getattr(agent, "_route_client_ready", True) is not True:
+        raise RuntimeError("route client is not ready")
+
+
 def persist_prepared_compressor(previous: Any, prepared: Any) -> None:
     """Persist reset values only after the prepared compressor is live."""
     changed = (

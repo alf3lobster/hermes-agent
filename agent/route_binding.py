@@ -324,6 +324,9 @@ def _reinstall_runtime_snapshot_in_place(
         _apply_primary_runtime_fields, _rebuild_primary_client, _restore_runtime_capabilities,
     )
     _apply_primary_runtime_fields(agent, rt)
+    if "credential_pool" in rt:
+        agent._credential_pool = rt["credential_pool"]
+        agent._credential_pool_entry_id = rt.get("credential_pool_entry_id")
     from agent.turn_recovery_codex import reset_codex_reasoning_replay
     reset_codex_reasoning_replay(agent)
     _restore_runtime_capabilities(agent, rt)
