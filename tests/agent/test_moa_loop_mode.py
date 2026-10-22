@@ -5,6 +5,20 @@ import pytest
 from run_agent import AIAgent
 
 
+def _stub_slot_runtimes(monkeypatch):
+    """Keep MoA unit tests credential-free while satisfying strict materialisation."""
+    monkeypatch.setattr(
+        "hermes_cli.runtime_provider.resolve_runtime_provider",
+        lambda requested, target_model: {
+            "provider": requested,
+            "model": target_model,
+            "base_url": f"https://{requested}.invalid/v1",
+            "api_key": "test-key",
+            "api_mode": "chat_completions",
+        },
+    )
+
+
 def _response(content="done", *, tool_calls=None):
     message = SimpleNamespace(content=content, tool_calls=tool_calls or [])
     choice = SimpleNamespace(message=message, finish_reason="stop")
@@ -12,6 +26,7 @@ def _response(content="done", *, tool_calls=None):
 
 
 def test_moa_virtual_provider_aggregator_is_actor(monkeypatch, tmp_path):
+    _stub_slot_runtimes(monkeypatch)
     home = tmp_path / ".hermes"
     home.mkdir()
     (home / "config.yaml").write_text(
@@ -94,6 +109,7 @@ def test_prepared_moa_runtime_keeps_the_live_agent_as_its_owner():
 
 
 def test_moa_primary_restore_rebuilds_virtual_facade(monkeypatch, tmp_path):
+    _stub_slot_runtimes(monkeypatch)
     """MoA sessions must restore from fallback without constructing OpenAI().
 
     Regression for a long-lived MoA session that failed over to a real provider:
@@ -154,6 +170,7 @@ moa:
 
 
 def test_moa_restored_facade_still_emits_reference_events(monkeypatch, tmp_path):
+    _stub_slot_runtimes(monkeypatch)
     """A restored MoA facade must keep the reference_callback relay wired.
 
     Regression for the naive-rebuild flaw in the original #53802 approach:
@@ -228,6 +245,7 @@ moa:
 
 
 def test_moa_generic_client_rebuild_preserves_virtual_facade(monkeypatch, tmp_path):
+    _stub_slot_runtimes(monkeypatch)
     """Generic client replacement must not install a native OpenAI client.
 
     Credential rotation and timeout/dead-connection recovery call the shared
@@ -481,6 +499,7 @@ def test_reference_view_keeps_the_data_use_requirement_of_a_folded_tool_result()
 
 
 def test_max_iterations_summary_keeps_the_data_use_requirement_on_every_moa_slot(monkeypatch, tmp_path):
+    _stub_slot_runtimes(monkeypatch)
     from agent.chat_completion_helpers import handle_max_iterations
     from agent.message_metadata import data_use_requirement
 

@@ -1171,8 +1171,9 @@ def _rebuild_primary_client(
     if (agent.provider or "").strip().lower() == "moa":
         # MoA has empty client_kwargs; rebuild via the shared facade factory so the
         # reference_callback relay survives recovery.
-        from agent.moa_loop import build_moa_facade
+        from agent.moa_loop import build_moa_facade, materialize_moa_slot_runtimes
         agent.client = build_moa_facade(owner or agent, agent.model)
+        materialize_moa_slot_runtimes(agent, agent.model)
         # MoA is a virtual chat-completions provider. It never has real OpenAI client kwargs; restoring it
         # after a fallback must recreate the facade, not call OpenAI() with an empty api_key. Use the shared
         # factory so the restored facade keeps the reference_callback relay wired at init — a bare
@@ -2130,11 +2131,12 @@ def _resolve_switch_destination(agent, new_model, new_provider, base_url, api_mo
 def _build_switched_client(agent, new_provider, api_key, base_url, api_mode, new_norm) -> None:
     """Build the client for the switched-to destination (MoA facade / native Anthropic / OpenAI wire)."""
     if new_norm == "moa":
-        from agent.moa_loop import bind_moa_runtime
+        from agent.moa_loop import bind_moa_runtime, materialize_moa_slot_runtimes
         # MoA speaks only chat.completions via the MoAClient facade; the aggregator's real transport
         # is applied inside the fan-out. The binder pins api_mode so the loop never dispatches
         # client.responses.create against the facade (same pins as agent_init / fallback).
         bind_moa_runtime(agent, agent.model, api_key)
+        materialize_moa_slot_runtimes(agent, agent.model)
         return
     if new_provider == "bedrock" and api_mode in ("anthropic_messages", "bedrock_converse"):
         # Non-Mantle Bedrock wires authenticate through boto3, never through the generic

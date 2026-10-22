@@ -262,7 +262,7 @@ def _slot_runtime(slot: dict[str, Any], *, strict: bool = False) -> dict[str, An
     now = time.monotonic()
     with _runtime_cache_lock:
         entry = _runtime_cache.get(cache_key)
-    if entry is not None and now - entry[0] < _RUNTIME_CACHE_TTL_SECONDS:
+    if not strict and entry is not None and now - entry[0] < _RUNTIME_CACHE_TTL_SECONDS:
         return entry[1]
     out: dict[str, Any] = {"provider": provider, "model": model}
     try:
@@ -284,19 +284,44 @@ def _slot_runtime(slot: dict[str, Any], *, strict: bool = False) -> dict[str, An
     return out
 
 
-def materialize_moa_slot_runtimes(preset_name: str) -> None:
-    """Resolve and cache every enabled advisor and aggregator before route readiness."""
+def _route_slot_runtime(slot: dict[str, Any], agent: Any = None) -> dict[str, Any]:
+    """Use the route's immutable slot snapshot; never resolve again once ready."""
+    provider = str(slot.get("provider") or "").strip()
+    model = str(slot.get("model") or "").strip()
+    pinned = getattr(agent, "_moa_slot_runtimes", None) if agent is not None else None
+    if isinstance(pinned, dict) and (provider, model) in pinned:
+        return dict(pinned[(provider, model)])
+    if agent is not None and getattr(agent, "_route_client_ready", False):
+        raise RuntimeError(f"Ready MoA route has no materialized runtime for {_slot_label(slot)}")
+    return _slot_runtime(slot)
+
+
+def materialize_moa_slot_runtimes(agent: Any, preset_name: str) -> None:
+    """Resolve and pin every unique enabled advisor and aggregator before readiness."""
     preset, _moa_raw = _resolve_preset_cached(preset_name)
+    if not preset.get("enabled", True):
+        raise RuntimeError(f"MoA preset {preset_name!r} is disabled")
     slots = [
         slot for slot in (preset.get("reference_models") or []) if slot.get("enabled", True)
-    ] if preset.get("enabled", True) else []
+    ]
     aggregator = preset.get("aggregator") or {}
     if aggregator:
         slots.append(aggregator)
     if not slots:
         raise RuntimeError(f"MoA preset {preset_name!r} has no enabled runtime slots")
+    resolved: dict[tuple[str, str], dict[str, Any]] = {}
     for slot in slots:
-        _slot_runtime(slot, strict=True)
+        if not isinstance(slot, dict):
+            raise RuntimeError(f"MoA preset {preset_name!r} contains a malformed runtime slot")
+        provider = slot.get("provider")
+        model = slot.get("model")
+        if not isinstance(provider, str) or not provider.strip() or not isinstance(model, str) or not model.strip():
+            raise RuntimeError("MoA runtime slots require non-empty provider and model")
+        key = (provider.strip(), model.strip())
+        if key in resolved:
+            continue
+        resolved[key] = dict(_slot_runtime(slot, strict=True))
+    agent._moa_slot_runtimes = resolved
 
 
 def _merge_slot_extra_body(slot_extra_body: Any, caller_extra_body: Any) -> Any:
@@ -421,7 +446,7 @@ def _run_reference(
     """Call one reference model; return ``(label, text, accounting)``. Never raises:
     a failed reference becomes a labelled ``[failed: …]`` note. Runs in a thread pool."""
     label = _slot_label(slot)
-    runtime = _slot_runtime(slot)
+    runtime = _route_slot_runtime(slot, agent)
     trace_fields = {"model": slot.get("model"), "provider": runtime.get("provider") or slot.get("provider"), "temperature": temperature}
     # The advisory view already stripped the agent's system prompt; this is the only one.
     messages = [{"role": "system", "content": _REFERENCE_SYSTEM_PROMPT}, *ref_messages]
@@ -966,7 +991,7 @@ def aggregate_moa_context(
     )
 
     agg_label = _slot_label(aggregator)
-    agg_runtime = _slot_runtime(aggregator)
+    agg_runtime = _route_slot_runtime(aggregator, agent)
     _touch_fanout_progress(
         agent, f"MoA: synthesizing aggregator guidance ({agg_label})"
     )
@@ -1212,7 +1237,7 @@ class MoAChatCompletions:
         aggregator = prepared["aggregator"]
         if aggregator.get("provider") == "moa":
             raise RuntimeError("MoA aggregator cannot be another MoA preset")
-        agg_runtime = _slot_runtime(aggregator)
+        agg_runtime = _route_slot_runtime(aggregator, getattr(self, "_agent", None))
         agg_messages, tools = self._plan_aggregator_cache(
             prepared["messages"], api_kwargs.get("tools"), prepared.get("guidance"), agg_runtime
         )
@@ -1565,3 +1590,9 @@ def bind_moa_runtime(agent, preset_name: Any, api_key: Any = None, *, owner: Any
     agent.base_url = "moa://local"
     agent._client_kwargs = {}
     agent.client = build_moa_facade(owner or agent, agent.model)
+
+
+def bind_materialized_moa_runtime(agent, preset_name: Any, api_key: Any = None) -> None:
+    """Install the MoA facade and strictly pin every dependency before use."""
+    bind_moa_runtime(agent, preset_name, api_key)
+    materialize_moa_slot_runtimes(agent, agent.model)

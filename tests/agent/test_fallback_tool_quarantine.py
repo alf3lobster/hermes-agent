@@ -100,6 +100,39 @@ def test_partial_runtime_fallback_activation_fails_closed():
     assert agent._provider_fallback_tool_policy == "inherit"
 
 
+def test_committed_inert_fallback_is_not_reported_as_activated(monkeypatch):
+    """Post-commit maintenance failure stops the chain without claiming a usable fallback."""
+    from agent.chat_completion_helpers import try_activate_fallback
+
+    agent = SimpleNamespace(
+        _fallback_chain=[{"provider": "custom", "model": "restricted", "tool_policy": "none"}],
+        _fallback_index=0,
+        _unavailable_fallback_keys=set(),
+        _route_client_ready=True,
+        model="primary",
+        provider="custom",
+    )
+    notices = MagicMock()
+
+    def commit_inert(target, *_args, **_kwargs):
+        target.model = "restricted"
+        target.provider = "custom"
+        target._route_client_ready = False
+        return "primary", "custom"
+
+    monkeypatch.setattr("agent.fallback_cooldown.switch_deferred_by_reset", lambda *_args: False)
+    monkeypatch.setattr("agent.fallback_cooldown._arm_rate_limit_cooldown", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr("agent.chat_completion_helpers._should_skip_fallback_candidate", lambda *_args: False)
+    monkeypatch.setattr("agent.route_binding.bind_route_entry", commit_inert)
+    monkeypatch.setattr("agent.chat_completion_helpers._buffer_fallback_notice", notices)
+
+    assert try_activate_fallback(agent) is False
+    assert agent.model == "restricted"
+    assert agent._route_client_ready is False
+    assert agent._fallback_index == 1
+    notices.assert_not_called()
+
+
 def test_failed_fallback_capability_resolution_does_not_publish_route(monkeypatch):
     """All route metadata must resolve before the prepared fallback becomes live."""
     from agent import route_binding
@@ -303,6 +336,7 @@ def test_post_publication_notice_failure_keeps_committed_fallback(monkeypatch):
         target._provider_fallback_active = True
         target._provider_fallback_route = (model, provider)
         target._provider_fallback_tool_policy = "none"
+        target._route_client_ready = True
         return old
 
     with (
@@ -353,6 +387,7 @@ def test_failed_same_provider_candidate_does_not_masquerade_as_committed(monkeyp
         target.provider = provider
         target._provider_fallback_active = True
         target._provider_fallback_route = (model, provider)
+        target._route_client_ready = True
         return old
 
     monkeypatch.setattr("agent.fallback_cooldown.switch_deferred_by_reset", lambda *_args: False)
@@ -639,6 +674,142 @@ def test_moa_materialization_resolves_every_slot_before_readiness(monkeypatch):
 
     assert agent._route_client_ready is True
     assert resolve.call_count == 2
+
+    resolve.reset_mock(side_effect=True)
+    resolve.side_effect = RuntimeError("request-time credential resolution")
+    pinned = moa_loop._route_slot_runtime(preset["reference_models"][0], agent)
+    assert pinned["api_key"] == "test-key"
+    resolve.assert_not_called()
+
+
+def test_moa_materialization_rejects_disabled_preset(monkeypatch):
+    from agent import moa_loop
+
+    agent = SimpleNamespace()
+    resolve = MagicMock()
+    monkeypatch.setattr(
+        moa_loop,
+        "_resolve_preset_cached",
+        lambda _name: (
+            {
+                "enabled": False,
+                "reference_models": [{"provider": "custom", "model": "advisor"}],
+                "aggregator": {"provider": "custom", "model": "aggregator"},
+            },
+            {},
+        ),
+    )
+    monkeypatch.setattr("hermes_cli.runtime_provider.resolve_runtime_provider", resolve)
+
+    with pytest.raises(RuntimeError, match="disabled"):
+        moa_loop.materialize_moa_slot_runtimes(agent, "disabled")
+
+    resolve.assert_not_called()
+    assert not hasattr(agent, "_moa_slot_runtimes")
+
+
+def test_moa_materialization_rejects_malformed_slot(monkeypatch):
+    from agent import moa_loop
+
+    agent = SimpleNamespace()
+    resolve = MagicMock()
+    monkeypatch.setattr(
+        moa_loop,
+        "_resolve_preset_cached",
+        lambda _name: (
+            {
+                "enabled": True,
+                "reference_models": [{"provider": "custom", "model": ""}],
+                "aggregator": {"provider": "custom", "model": "aggregator"},
+            },
+            {},
+        ),
+    )
+    monkeypatch.setattr("hermes_cli.runtime_provider.resolve_runtime_provider", resolve)
+
+    with pytest.raises(RuntimeError, match="provider and model"):
+        moa_loop.materialize_moa_slot_runtimes(agent, "malformed")
+
+    resolve.assert_not_called()
+    assert not hasattr(agent, "_moa_slot_runtimes")
+
+
+def test_moa_materialization_deduplicates_identical_slots(monkeypatch):
+    from agent import moa_loop
+
+    agent = SimpleNamespace()
+    preset = {
+        "enabled": True,
+        "reference_models": [
+            {"provider": "custom", "model": "advisor"},
+            {"provider": "custom", "model": "advisor"},
+        ],
+        "aggregator": {"provider": "custom", "model": "aggregator"},
+    }
+    resolve = MagicMock(
+        side_effect=lambda requested, target_model: {
+            "provider": requested,
+            "model": target_model,
+            "api_key": "test-key",
+        }
+    )
+    monkeypatch.setattr(moa_loop, "_resolve_preset_cached", lambda _name: (preset, {}))
+    monkeypatch.setattr("hermes_cli.runtime_provider.resolve_runtime_provider", resolve)
+
+    moa_loop.materialize_moa_slot_runtimes(agent, "duplicate")
+
+    assert resolve.call_count == 2
+    assert set(agent._moa_slot_runtimes) == {
+        ("custom", "advisor"),
+        ("custom", "aggregator"),
+    }
+
+
+def test_initial_moa_materialization_failure_keeps_route_unready(monkeypatch):
+    from agent.agent_init import _init_moa_client
+    from agent import moa_loop
+
+    agent = SimpleNamespace(model="review", quiet_mode=True)
+    preset = {
+        "enabled": True,
+        "reference_models": [{"provider": "custom", "model": "advisor"}],
+        "aggregator": {"provider": "custom", "model": "aggregator"},
+    }
+    monkeypatch.setattr(moa_loop, "_resolve_preset_cached", lambda _name: (preset, {}))
+    monkeypatch.setattr(
+        "hermes_cli.runtime_provider.resolve_runtime_provider",
+        MagicMock(side_effect=RuntimeError("credential resolution failed")),
+    )
+
+    with pytest.raises(RuntimeError, match="could not be resolved"):
+        _init_moa_client(agent, "moa-virtual-provider")
+
+    assert getattr(agent, "_route_client_ready", False) is False
+    assert not hasattr(agent, "_moa_slot_runtimes")
+
+
+def test_primary_moa_rebuild_materializes_slots_before_readiness(monkeypatch):
+    """Primary/snapshot restoration obeys the same MoA materialisation boundary."""
+    from agent import agent_runtime_helpers, moa_loop
+
+    events = []
+    agent = SimpleNamespace(provider="moa", model="council", _route_client_ready=False)
+    monkeypatch.setattr(moa_loop, "build_moa_facade", lambda *_args, **_kwargs: events.append("facade") or object())
+    monkeypatch.setattr(
+        moa_loop,
+        "materialize_moa_slot_runtimes",
+        lambda *_args, **_kwargs: events.append("slots"),
+    )
+
+    agent_runtime_helpers._rebuild_primary_client(
+        agent,
+        {},
+        reason="restore_primary",
+        owner=agent,
+    )
+
+    assert events == ["facade", "slots"]
+    assert agent._route_client_ready is True
 
 
 def test_runtime_snapshot_maintenance_failure_leaves_route_inert(monkeypatch):

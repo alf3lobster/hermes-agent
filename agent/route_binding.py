@@ -208,8 +208,8 @@ def _materialize_route_client_in_place(agent: Any, entry: dict[str, Any], provid
     if provider == "moa":
         from agent.moa_loop import bind_moa_runtime, materialize_moa_slot_runtimes
         bind_moa_runtime(agent, agent.model, owner=agent)
-        materialize_moa_slot_runtimes(agent.model)
-        return  # The facade resolves its advisors/aggregator lazily on the committed route.
+        materialize_moa_slot_runtimes(agent, agent.model)
+        return  # Every enabled advisor and aggregator is pinned before readiness.
     from agent.auxiliary_client import resolve_provider_client
     from agent.chat_completion_helpers import (
         _fallback_api_mode_resolved, _rebind_fallback_credential_pool,

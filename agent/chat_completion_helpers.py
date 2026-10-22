@@ -2072,6 +2072,13 @@ def try_activate_fallback(agent, reason: FailoverReason | None = None, reset_at=
             old_model, old_provider = bound
             route_committed = True
             fb_model = agent.model  # normalized by the binder
+            if not getattr(agent, "_route_client_ready", False):
+                logger.warning(
+                    "Fallback route %s/%s was committed but materialization is incomplete; route remains inert",
+                    fb_provider,
+                    fb_model,
+                )
+                return False
 
             notice = (
                 f"⚠️ Model fallback: {old_model} via {old_provider} unavailable "

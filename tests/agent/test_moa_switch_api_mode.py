@@ -61,6 +61,10 @@ def test_switch_to_moa_pins_chat_completions(monkeypatch, incoming_api_mode):
     # pool reload, context-compressor refresh, primary-runtime bookkeeping).
     # We only assert the api_mode invariant set in the moa client-build branch.
     monkeypatch.setattr(arh, "load_pool", lambda *a, **k: None, raising=False)
+    monkeypatch.setattr(
+        "agent.moa_loop.materialize_moa_slot_runtimes",
+        lambda agent, preset: setattr(agent, "_moa_slot_runtimes", {}),
+    )
 
     agent = _make_fake_agent()
     try:
@@ -88,3 +92,29 @@ def test_switch_to_moa_pins_chat_completions(monkeypatch, incoming_api_mode):
     )
     # The MoAClient facade should be installed as the client.
     assert type(agent.client).__name__ == "MoAClient"
+
+
+def test_failed_moa_materialization_rolls_back_manual_switch(monkeypatch):
+    """A manual switch cannot advertise a MoA route whose slots were not resolved."""
+    from agent import agent_runtime_helpers as arh
+
+    agent = _make_fake_agent()
+    monkeypatch.setattr(
+        "agent.moa_loop.materialize_moa_slot_runtimes",
+        lambda *_args: (_ for _ in ()).throw(RuntimeError("slot resolution failed")),
+    )
+
+    with pytest.raises(RuntimeError, match="slot resolution failed"):
+        arh.switch_model(
+            agent,
+            new_model="frontier",
+            new_provider="moa",
+            api_key="moa-virtual-provider",
+            base_url="moa://local",
+            api_mode="chat_completions",
+        )
+
+    assert agent.model == "minimax-m3"
+    assert agent.provider == "opencode-go"
+    assert agent.api_mode == "anthropic_messages"
+    assert getattr(agent, "_route_client_ready", False) is False

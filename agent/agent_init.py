@@ -792,7 +792,7 @@ def _init_anthropic_client(agent, api_key, base_url, _provider_timeout):
 
 def _init_moa_client(agent, api_key):
     """provider == "moa": virtual Mixture-of-Agents facade, no real HTTP client."""
-    from agent.moa_loop import bind_moa_runtime
+    from agent.moa_loop import bind_materialized_moa_runtime
     # build_moa_facade relays "moa.*" events through tool_progress_callback so every surface
     # shows each reference's answer before the aggregator acts. Display-only; shared with
     # fallback-restore so a restored facade keeps emitting.
@@ -802,7 +802,7 @@ def _init_moa_client(agent, api_key):
     # facade emits "moa.reference", "moa.progress", "moa.phase", and "moa.aggregating" events, forwarded
     # through the same callback the tool lifecycle uses. Best-effort and cache-safe — display-only events,
     # they never touch the message history. See #53802.
-    bind_moa_runtime(agent, agent.model, api_key)
+    bind_materialized_moa_runtime(agent, agent.model, api_key)
     if not agent.quiet_mode:
         print(f"🤖 AI Agent initialized with MoA preset: {agent.model}")
 
@@ -897,8 +897,8 @@ def _routed_client_kwargs(agent, fallback_model, _provider_timeout) -> Optional[
             # The chokepoint handed back the preset's aggregator client, which only proves the
             # preset resolves and its aggregator has credentials. A MoA entry means the preset
             # itself (same as ``provider: moa`` in config), so bind the facade, not the aggregator.
-            from agent.moa_loop import bind_moa_runtime
-            bind_moa_runtime(agent, _fb["model"])
+            from agent.moa_loop import bind_materialized_moa_runtime
+            bind_materialized_moa_runtime(agent, _fb["model"])
             return None
         agent.provider = agent.requested_provider = _fb["provider"]
         agent.model = _fb_model or _fb["model"]

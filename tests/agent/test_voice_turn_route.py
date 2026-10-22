@@ -90,6 +90,34 @@ def test_undersized_voice_route_is_rejected_before_publication(tmp_path, monkeyp
         assert agent._fallback_activated is False
 
 
+def test_inert_committed_voice_route_is_not_reported_as_routed(tmp_path, monkeypatch, caplog):
+    """A committed voice identity with failed maintenance remains inert and is not success-labelled."""
+    from agent.voice_turn_route import begin_voice_turn_route
+
+    with FakeLLMServer([]) as main, FakeLLMServer([]) as voice:
+        home = write_hermes_home(tmp_path / ".hermes", main.base_url, extra_config=(
+            "auxiliary:\n  voice_chat:\n    provider: custom\n"
+            f"    base_url: {voice.base_url}\n    model: voice-model\n    api_key: «redacted:sk-…»\n"
+        ))
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        agent = _agent(home, main.base_url)
+        agent._voice_turn_pending = True
+
+        def commit_inert(target, *_args, **_kwargs):
+            target.model = "voice-model"
+            target.provider = "custom"
+            target._route_client_ready = False
+            return "fake-model", "custom"
+
+        monkeypatch.setattr("agent.route_binding.bind_route_entry", commit_inert)
+        begin_voice_turn_route(agent, [{"role": "user", "content": "hi"}], "system")
+
+        assert agent.model == "voice-model"
+        assert agent._route_client_ready is False
+        assert getattr(agent, "_turn_route_task", None) is None
+        assert "Voice turn routed" not in caplog.text
+
+
 @pytest.mark.parametrize("model,api_mode,expected", [
     ("gpt-6-astra", "codex_responses", "low"),        # Responses ladder has no "none"
     ("claude-opus-5-5", "anthropic_messages", "low"),  # mandatory thinking

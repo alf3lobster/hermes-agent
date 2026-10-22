@@ -162,6 +162,13 @@ def begin_voice_turn_route(agent: Any, messages: list[dict[str, Any]], system_pr
                 reason = "provider not configured"
             else:
                 route_bound = True
+                if not getattr(agent, "_route_client_ready", False):
+                    logger.warning(
+                        "Voice route %s/%s was committed but materialization is incomplete; route remains inert",
+                        target["provider"],
+                        target["model"],
+                    )
+                    return agent._cached_system_prompt or system_prompt
         except Exception as exc:  # health: allow BLE001 -- any bind failure falls back to the main model with a notice
             reason = str(exc).splitlines()[0] if str(exc) else type(exc).__name__
         if reason:
