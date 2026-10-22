@@ -1183,6 +1183,7 @@ def _rebuild_primary_client(agent, rt: dict[str, Any], *, reason: str, owner: An
         _build_anthropic_client_from_runtime(agent, rt)
     else:
         agent.client = agent._create_openai_client(dict(rt["client_kwargs"]), reason=reason, shared=True)
+    agent._route_client_ready = True
 
 
 def try_recover_primary_transport(
@@ -2366,6 +2367,7 @@ def _finish_switch(agent, new_provider, old_norm, new_norm) -> None:
         _apply_switched_provider_request_overrides(agent, new_provider)
     except Exception:
         logger.debug("switch_model: request_overrides re-derivation failed", exc_info=True)
+    agent._route_client_ready = True
 
 
 def _persist_switch_billing_route(agent) -> None:

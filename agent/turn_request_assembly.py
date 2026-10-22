@@ -111,6 +111,8 @@ def assemble_api_request(
     """Assemble the request in the original order. ORDER IS LOAD-BEARING: cache breakpoints
     are injected only after whitespace normalization, the orphan sweep, thinking-only drop /
     user merge and surrogate stripping, so the same row's bytes never vary across turns."""
+    if getattr(agent, "_route_client_ready", True) is not True:
+        raise RuntimeError("provider route is committed but client materialisation is incomplete")
     from agent.conversation_loop import (
         _CODEX_INCOMPLETE_NUDGE, _apply_context_engine_selection, _canonicalize_api_tool_calls,
         _clone_message_for_send, _midturn_request_pressure_tokens, _pressure_with_real_floor,

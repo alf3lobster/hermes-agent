@@ -369,8 +369,9 @@ class TestRestorePrimaryRuntime:
             assert agent._try_activate_fallback() is True
 
         load_pool = MagicMock(side_effect=AssertionError("pool opened before primary publication"))
+        build_client = MagicMock(return_value=MagicMock())
         with (
-            patch("agent.process_bootstrap.OpenAI", return_value=MagicMock()),
+            patch("agent.process_bootstrap.OpenAI", build_client),
             patch("agent.credential_pool.load_pool", load_pool),
             patch(
                 "agent.route_binding._commit_route_agent",
@@ -380,8 +381,41 @@ class TestRestorePrimaryRuntime:
             assert agent._restore_primary_runtime() is False
 
         load_pool.assert_not_called()
+        build_client.assert_not_called()
         assert agent.provider == "deepseek"
         assert agent._provider_fallback_tool_policy == "none"
+
+    def test_postcommit_primary_client_failure_keeps_committed_route_inert(self):
+        agent = _make_agent(
+            provider="openai-api",
+            base_url="https://api.openai.com/v1",
+            fallback_model={
+                "provider": "deepseek",
+                "model": "deepseek-v4-flash",
+                "tool_policy": "none",
+            },
+        )
+        fallback_client = _mock_resolve(base_url="https://api.deepseek.com/v1")
+        with patch(
+            "agent.auxiliary_client.resolve_provider_client",
+            return_value=(fallback_client, "deepseek-v4-flash"),
+        ):
+            assert agent._try_activate_fallback() is True
+
+        observed = []
+
+        def fail_after_commit(target, *_args, **_kwargs):
+            observed.append((target.provider, target._provider_fallback_active))
+            raise RuntimeError("injected postcommit client failure")
+
+        with patch("agent.agent_runtime_helpers._rebuild_primary_client", side_effect=fail_after_commit):
+            assert agent._restore_primary_runtime() is True
+
+        assert observed == [("openai-api", False)]
+        assert agent.provider == "openai-api"
+        assert agent._provider_fallback_active is False
+        assert agent._provider_fallback_tool_policy == "inherit"
+        assert agent._route_client_ready is False
 
     def test_restore_swaps_matching_custom_pool_entry(self):
         """Custom primary + custom:<name> entry whose base_url resolves to the

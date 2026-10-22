@@ -71,6 +71,8 @@ def perform_api_call(
     interrupted: Any,
 ) -> ApiCallVerdict:
     """Issue the request (see ``_should_stream`` for the streaming decision)."""
+    if getattr(agent, "_route_client_ready", True) is not True:
+        raise RuntimeError("provider route is committed but client materialisation is incomplete")
     response = None
 
     def _verdict(action: str) -> ApiCallVerdict:

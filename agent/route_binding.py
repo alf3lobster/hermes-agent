@@ -73,6 +73,7 @@ def _prepared_route_client(entry: dict[str, Any], provider: str) -> Optional[Any
 
 def _install_prepared_route_client(agent: Any, client: Any, base_url: str, api_mode: str) -> None:
     """Install a deliberately unusable client shell without invoking provider auth builders."""
+    agent._route_client_ready = False
     agent.api_key = _DEFERRED_ROUTE_CREDENTIAL
     agent._client_kwargs = {
         "api_key": _DEFERRED_ROUTE_CREDENTIAL,
@@ -177,6 +178,7 @@ def _bind_route_entry_in_place(
     agent._fallback_activated = True
 
     _rebind_fallback_credential_pool(agent, provider, model, load_if_missing=False)
+    agent._route_client_ready = False
     if provider == "moa":
         from agent.moa_loop import bind_moa_runtime
         bind_moa_runtime(agent, model, owner=owner)
@@ -197,6 +199,9 @@ def _bind_route_entry_in_place(
 def _materialize_route_client(agent: Any, entry: dict[str, Any], provider: str) -> None:
     """Install real credentials/client after the restrictive route is already live."""
     if provider == "moa":
+        from agent.moa_loop import bind_moa_runtime
+        bind_moa_runtime(agent, agent.model, owner=agent)
+        agent._route_client_ready = True
         return  # The facade resolves its advisors/aggregator lazily on the committed route.
     from agent.auxiliary_client import resolve_provider_client
     from agent.chat_completion_helpers import (
@@ -230,6 +235,7 @@ def _materialize_route_client(agent: Any, entry: dict[str, Any], provider: str) 
     agent.base_url, agent.api_mode = base_url, api_mode
     from agent.client_lifecycle import _swap_fallback_clients
     _swap_fallback_clients(agent, client, provider, agent.model, base_url, api_mode)
+    agent._route_client_ready = True
     _rebind_fallback_credential_pool(agent, provider, agent.model)
     from agent.agent_runtime_helpers import sync_credential_pool_entry_id
     sync_credential_pool_entry_id(agent)
@@ -282,7 +288,9 @@ def bind_route_entry(
     return bound
 
 
-def _reinstall_runtime_snapshot_in_place(agent: Any, rt: dict[str, Any]) -> None:
+def _reinstall_runtime_snapshot_in_place(
+    agent: Any, rt: dict[str, Any], *, defer_client: bool = False,
+) -> None:
     """Put ``agent`` on the runtime recorded in ``rt`` (a ``_primary_runtime``-shaped snapshot):
     identity, client, caching flags, compressor, reasoning and prompt identity. Credential pool
     and fallback bookkeeping are the caller's. Raises on failure."""
@@ -309,9 +317,14 @@ def _reinstall_runtime_snapshot_in_place(agent: Any, rt: dict[str, Any]) -> None
     if getattr(agent, "_cache_disabled", False):
         agent._use_prompt_caching = False
         agent._use_native_cache_layout = False
-    _rebuild_primary_client(
-        agent, rt, reason="restore_primary", owner=getattr(agent, "_route_owner", None)
-    )
+    if defer_client:
+        shell = SimpleNamespace(base_url=agent.base_url, api_key=_DEFERRED_ROUTE_CREDENTIAL)
+        _install_prepared_route_client(agent, shell, agent.base_url, agent.api_mode)
+    else:
+        _rebuild_primary_client(
+            agent, rt, reason="restore_primary", owner=getattr(agent, "_route_owner", None)
+        )
+        agent._route_client_ready = True
     agent.context_compressor.update_model(
         model=rt["compressor_model"], context_length=rt["compressor_context_length"],
         base_url=rt["compressor_base_url"], api_key=rt["compressor_api_key"],
@@ -341,7 +354,7 @@ def reinstall_runtime_snapshot(agent: Any, rt: dict[str, Any]) -> None:
     staged = _stage_route_agent(agent)
     staged._route_owner = agent
     try:
-        _reinstall_runtime_snapshot_in_place(staged, rt)
+        _reinstall_runtime_snapshot_in_place(staged, rt, defer_client=True)
     except Exception:
         agent._provider_fallback_tool_policy = (
             "none" if "none" in (current_tool_policy, target_tool_policy) else "inherit"
@@ -349,6 +362,17 @@ def reinstall_runtime_snapshot(agent: Any, rt: dict[str, Any]) -> None:
         raise
     del staged._route_owner
     _commit_route_agent(agent, staged)
+    try:
+        from agent.agent_runtime_helpers import _rebuild_primary_client
+        _rebuild_primary_client(agent, rt, reason="restore_snapshot", owner=agent)
+        agent._route_client_ready = True
+    except Exception:
+        logger.warning(
+            "Runtime route committed but client maintenance failed for %s/%s",
+            rt.get("provider", ""),
+            rt.get("model", ""),
+            exc_info=True,
+        )
 
 
 def reinstall_primary_runtime(
@@ -361,7 +385,7 @@ def reinstall_primary_runtime(
     staged = _stage_route_agent(agent)
     staged._route_owner = agent
     try:
-        _reinstall_runtime_snapshot_in_place(staged, rt)
+        _reinstall_runtime_snapshot_in_place(staged, rt, defer_client=True)
         staged._fallback_activated = False
         staged._fallback_index = 0
         staged._rate_limit_backoff_count = 0
@@ -375,6 +399,9 @@ def reinstall_primary_runtime(
     del staged._route_owner
     _commit_route_agent(agent, staged)
     try:
+        from agent.agent_runtime_helpers import _rebuild_primary_client
+        _rebuild_primary_client(agent, rt, reason="restore_primary", owner=agent)
+        agent._route_client_ready = True
         rebind_primary_credential_pool(
             agent, primary_provider, primary_model, matches_primary,
             load_primary_pool, prefetched_pool, prefetched,
@@ -382,7 +409,7 @@ def reinstall_primary_runtime(
         agent._primary_credential_pool = getattr(agent, "_credential_pool", None)
     except Exception:
         logger.warning(
-            "Primary route committed but credential-pool maintenance failed for %s/%s",
+            "Primary route committed but client/credential maintenance failed for %s/%s",
             primary_provider,
             primary_model,
             exc_info=True,

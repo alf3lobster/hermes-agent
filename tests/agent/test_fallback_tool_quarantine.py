@@ -456,7 +456,7 @@ def test_failed_primary_route_preparation_does_not_advance_live_credential_pool(
     monkeypatch.setattr(
         route_binding,
         "_reinstall_runtime_snapshot_in_place",
-        lambda *_args: (_ for _ in ()).throw(RuntimeError("injected primary route failure")),
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("injected primary route failure")),
     )
 
     with pytest.raises(RuntimeError, match="primary route failure"):
@@ -496,7 +496,12 @@ def test_successful_primary_restore_selects_pool_only_after_route_commit(monkeyp
         _provider_fallback_route=("restricted", "custom"),
         _provider_fallback_tool_policy="none",
     )
-    monkeypatch.setattr(route_binding, "_reinstall_runtime_snapshot_in_place", lambda *_args: None)
+    monkeypatch.setattr(
+        route_binding, "_reinstall_runtime_snapshot_in_place", lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        "agent.agent_runtime_helpers._rebuild_primary_client", lambda *_args, **_kwargs: None,
+    )
 
     route_binding.reinstall_primary_runtime(
         agent,
@@ -531,12 +536,15 @@ def test_post_commit_pool_failure_keeps_primary_route(monkeypatch):
         context_compressor=None,
     )
 
-    def restore_route(staged, _rt):
+    def restore_route(staged, _rt, **_kwargs):
         staged.model = "primary-model"
         staged.provider = "primary-provider"
         staged._provider_fallback_tool_policy = "inherit"
 
     monkeypatch.setattr(route_binding, "_reinstall_runtime_snapshot_in_place", restore_route)
+    monkeypatch.setattr(
+        "agent.agent_runtime_helpers._rebuild_primary_client", lambda *_args, **_kwargs: None,
+    )
     monkeypatch.setattr(
         route_binding,
         "rebind_primary_credential_pool",
@@ -597,6 +605,49 @@ def test_post_commit_fallback_pool_failure_keeps_committed_route(monkeypatch):
     assert agent._provider_fallback_tool_policy == "none"
 
 
+def test_unmaterialized_committed_route_cannot_call_provider():
+    """A post-commit client failure leaves a route that is safe rather than network-capable."""
+    from agent.turn_api_call import perform_api_call
+
+    agent = SimpleNamespace(_route_client_ready=False)
+    with pytest.raises(RuntimeError, match="materialisation is incomplete"):
+        perform_api_call(
+            agent,
+            api_kwargs={},
+            _original_api_kwargs={},
+            _llm_middleware_trace=[],
+            _moa_prepared_request=None,
+            _retry=None,
+            thinking_spinner=None,
+            retry_count=0,
+            api_call_count=0,
+            api_request_id="test-request",
+            effective_task_id=None,
+            turn_id="test-turn",
+            interrupted=False,
+        )
+
+
+def test_unmaterialized_committed_route_cannot_prepare_moa_or_middleware():
+    """Request assembly stops before MoA preparation and other model-facing hooks."""
+    from agent.turn_request_assembly import assemble_api_request
+
+    agent = SimpleNamespace(_route_client_ready=False)
+    with pytest.raises(RuntimeError, match="materialisation is incomplete"):
+        assemble_api_request(
+            agent,
+            messages=[],
+            current_turn_user_idx=-1,
+            _ext_prefetch_cache=None,
+            _plugin_user_context=None,
+            moa_config=None,
+            active_system_prompt=None,
+            original_user_message=None,
+            pending_moa_prepared_request=None,
+            request_logger=MagicMock(),
+        )
+
+
 def test_post_commit_compressor_persistence_failure_keeps_committed_route(monkeypatch):
     """A durable-state reporting error after publication cannot make the route look rejected."""
     from agent import route_binding
@@ -641,7 +692,7 @@ def test_runtime_snapshot_restore_is_transactional_on_late_failure(
         "fallback_tool_policy": target_policy,
     }
 
-    def fail_after_partial_stage(staged, _snapshot):
+    def fail_after_partial_stage(staged, _snapshot, **_kwargs):
         staged.model = "target"
         staged.base_url = "https://target.invalid/v1"
         staged.client = object()
