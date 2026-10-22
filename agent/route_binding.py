@@ -16,24 +16,39 @@ from utils import base_url_host_matches
 logger = logging.getLogger(__name__)
 
 
-def _stage_route_agent(agent: Any) -> Any:
-    """A copy-on-write agent used to construct one complete route before it becomes live."""
-    staged = copy.copy(agent)
-    compressor = getattr(agent, "context_compressor", None)
-    if compressor is not None:
-        staged.context_compressor = copy.copy(compressor)
-    if hasattr(agent, "_transport_cache"):
-        staged._transport_cache = dict(agent._transport_cache)
-    for name in ("request_overrides", "reasoning_config", "runtime_capabilities"):
-        value = getattr(agent, name, None)
-        if isinstance(value, dict):
-            setattr(staged, name, copy.deepcopy(value))
-    return staged
+class _RouteTransaction:
+    """Rollback state for one synchronous route transition.
 
+    Client/facade builders must receive the real agent (MoA captures it for interrupts and display),
+    so route construction cannot safely run on a copied agent. No turn can observe the agent while
+    this synchronous transaction is open; on failure this restores the complete pre-transition
+    identity, client, policy and mutable compressor/cache state without invoking another route.
+    """
 
-def _commit_route_agent(agent: Any, staged: Any) -> None:
-    """Publish the already-built route, including its policy, in one state update."""
-    vars(agent).update(vars(staged))
+    def __init__(self, agent: Any) -> None:
+        self.agent = agent
+        self.fields = dict(vars(agent))
+        self.compressor = getattr(agent, "context_compressor", None)
+        self.compressor_copy = copy.copy(self.compressor) if self.compressor is not None else None
+        cache = getattr(agent, "_transport_cache", None)
+        self.transport_cache = dict(cache) if isinstance(cache, dict) else None
+
+    def rollback(self) -> None:
+        live = vars(self.agent)
+        live.clear()
+        live.update(self.fields)
+        if self.compressor is not None and self.compressor_copy is not None:
+            try:
+                original = vars(self.compressor)
+                original.clear()
+                original.update(vars(self.compressor_copy))
+                self.agent.context_compressor = self.compressor
+            except TypeError:
+                self.agent.context_compressor = self.compressor_copy
+        cache = getattr(self.agent, "_transport_cache", None)
+        if isinstance(cache, dict) and self.transport_cache is not None:
+            cache.clear()
+            cache.update(self.transport_cache)
 
 
 def _bind_route_entry_in_place(
@@ -117,13 +132,17 @@ def _bind_route_entry_in_place(
 
 
 def bind_route_entry(agent: Any, entry: dict[str, Any], provider: str, model: str) -> Optional[tuple[str, str]]:
-    """Construct a complete route off-agent and publish it only after every bind step succeeds."""
+    """Publish a complete route or restore the previous route without a second transition."""
     from hermes_cli.fallback_config import fallback_tool_policy
-    staged = _stage_route_agent(agent)
-    staged._provider_fallback_tool_policy = fallback_tool_policy(entry)
-    bound = _bind_route_entry_in_place(staged, entry, provider, model)
-    if bound is not None:
-        _commit_route_agent(agent, staged)
+    transaction = _RouteTransaction(agent)
+    try:
+        agent._provider_fallback_tool_policy = fallback_tool_policy(entry)
+        bound = _bind_route_entry_in_place(agent, entry, provider, model)
+    except Exception:
+        transaction.rollback()
+        raise
+    if bound is None:
+        transaction.rollback()
     return bound
 
 
@@ -181,15 +200,15 @@ def reinstall_runtime_snapshot(agent: Any, rt: dict[str, Any]) -> None:
     """Build a restored route off-agent; a failed restore leaves the live identity untouched."""
     current_tool_policy = getattr(agent, "_provider_fallback_tool_policy", "inherit")
     target_tool_policy = rt.get("fallback_tool_policy", "inherit")
-    staged = _stage_route_agent(agent)
+    transaction = _RouteTransaction(agent)
     try:
-        _reinstall_runtime_snapshot_in_place(staged, rt)
+        _reinstall_runtime_snapshot_in_place(agent, rt)
     except Exception:
+        transaction.rollback()
         agent._provider_fallback_tool_policy = (
             "none" if "none" in (current_tool_policy, target_tool_policy) else "inherit"
         )
         raise
-    _commit_route_agent(agent, staged)
 
 
 def reinstall_primary_runtime(
@@ -200,18 +219,18 @@ def reinstall_primary_runtime(
     from agent.agent_runtime_helpers import _rebind_primary_credential_pool
     current_tool_policy = getattr(agent, "_provider_fallback_tool_policy", "inherit")
     target_tool_policy = rt.get("fallback_tool_policy", "inherit")
-    staged = _stage_route_agent(agent)
+    transaction = _RouteTransaction(agent)
     try:
-        _reinstall_runtime_snapshot_in_place(staged, rt)
+        _reinstall_runtime_snapshot_in_place(agent, rt)
         _rebind_primary_credential_pool(
-            staged, primary_provider, primary_model, matches_primary, load_primary_pool, prefetched_pool, prefetched
+            agent, primary_provider, primary_model, matches_primary, load_primary_pool, prefetched_pool, prefetched
         )
-        staged._fallback_activated = False
-        staged._fallback_index = 0
-        staged._rate_limit_backoff_count = 0
+        agent._fallback_activated = False
+        agent._fallback_index = 0
+        agent._rate_limit_backoff_count = 0
     except Exception:
+        transaction.rollback()
         agent._provider_fallback_tool_policy = (
             "none" if "none" in (current_tool_policy, target_tool_policy) else "inherit"
         )
         raise
-    _commit_route_agent(agent, staged)
