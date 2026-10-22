@@ -1974,19 +1974,21 @@ def _should_skip_fallback_candidate(agent, fb: dict, fb_key: tuple, fb_provider:
     return False
 
 
-def _update_fallback_context_compressor(agent) -> None:
+def _update_fallback_context_compressor(agent, *, allow_probe: bool = True) -> None:
     """Point compression limits at the fallback model's context window (not the primary's),
     respecting the explicit model.context_length config override."""
     compressor = getattr(agent, "context_compressor", None)
     if not compressor:
         return
     from agent.model_metadata import get_model_context_length
-    fb_context_length = get_model_context_length(
+    from agent.model_metadata_static import get_model_context_length_static
+    resolver = get_model_context_length if allow_probe else get_model_context_length_static
+    fb_context_length = resolver(
         agent.model, base_url=agent.base_url,
-        api_key=agent.api_key if isinstance(agent.api_key, str) else "",  # callable (Entra ID) → probes need str
         provider=agent.provider,
         config_context_length=getattr(agent, "_config_context_length", None),
         custom_providers=getattr(agent, "_custom_providers", None),
+        **({"api_key": agent.api_key if isinstance(agent.api_key, str) else ""} if allow_probe else {}),
     )
     compressor.update_model(  # callable api_key preserved → call_llm
         model=agent.model, context_length=fb_context_length, base_url=agent.base_url,
@@ -1995,7 +1997,7 @@ def _update_fallback_context_compressor(agent) -> None:
     # Fallback activation is an error path: refresh an EXISTING verdict eagerly (the ceiling was voided by
     # update_model()), but a session that never probed keeps its lazy compaction-time probe rather than
     # resolving an auxiliary client while the primary route is failing (#114707).
-    if getattr(agent, "_compression_feasibility_checked", False) is True:
+    if allow_probe and getattr(agent, "_compression_feasibility_checked", False) is True:
         from agent.conversation_compression import revalidate_compression_feasibility
         revalidate_compression_feasibility(agent)
 

@@ -159,7 +159,10 @@ def test_rejected_fallback_real_resolver_does_not_load_or_select_credential_pool
     monkeypatch.setattr(auxiliary_client, "_create_openai_client", lambda **_kwargs: fake_client)
     monkeypatch.setattr("agent.client_lifecycle._swap_fallback_clients", lambda *_args: None)
     monkeypatch.setattr("agent.agent_runtime_helpers.sync_credential_pool_entry_id", lambda *_args: None)
-    monkeypatch.setattr("agent.chat_completion_helpers._update_fallback_context_compressor", lambda *_args: None)
+    monkeypatch.setattr(
+        "agent.chat_completion_helpers._update_fallback_context_compressor",
+        lambda *_args, **_kwargs: None,
+    )
     monkeypatch.setattr("agent.chat_completion_helpers._reresolve_fallback_reasoning_config", lambda *_args: None)
     monkeypatch.setattr("agent.chat_completion_helpers._rescope_fallback_extra_body", lambda *_args: None)
     monkeypatch.setattr(agent, "_ensure_lmstudio_runtime_loaded", lambda: None)
@@ -646,6 +649,53 @@ def test_unmaterialized_committed_route_cannot_prepare_moa_or_middleware():
             pending_moa_prepared_request=None,
             request_logger=MagicMock(),
         )
+
+
+def test_context_metadata_probe_runs_only_after_fallback_publication(monkeypatch):
+    """Context-window discovery may touch a provider, so candidate preparation uses static metadata."""
+    from agent import route_binding
+
+    agent = _agent()
+    agent._compression_feasibility_checked = True
+    events = []
+    real_commit = route_binding._commit_route_agent
+
+    def commit(target, staged):
+        real_commit(target, staged)
+        events.append("commit")
+
+    def provider_probe(*_args, **_kwargs):
+        assert events == ["commit"]
+        events.append("probe")
+        return 131_072
+
+    def revalidate(_agent):
+        assert events == ["commit", "probe"]
+        events.append("feasibility")
+
+    client = SimpleNamespace(base_url="https://fallback.invalid/v1", api_key="runtime-key")
+    monkeypatch.setattr(route_binding, "_commit_route_agent", commit)
+    monkeypatch.setattr("agent.model_metadata.get_model_context_length", provider_probe)
+    monkeypatch.setattr(
+        "agent.conversation_compression.revalidate_compression_feasibility", revalidate,
+    )
+    monkeypatch.setattr(
+        "agent.auxiliary_client.resolve_provider_client",
+        lambda *_args, **_kwargs: (client, "restricted"),
+    )
+
+    assert route_binding.bind_route_entry(
+        agent,
+        {
+            "provider": "custom",
+            "model": "restricted",
+            "base_url": "https://fallback.invalid/v1",
+            "tool_policy": "none",
+        },
+        "custom",
+        "restricted",
+    ) == ("", "")
+    assert events == ["commit", "probe", "feasibility"]
 
 
 def test_post_commit_compressor_persistence_failure_keeps_committed_route(monkeypatch):

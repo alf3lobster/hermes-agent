@@ -190,7 +190,7 @@ def _bind_route_entry_in_place(
 
     agent._use_prompt_caching, agent._use_native_cache_layout = agent._anthropic_prompt_cache_policy(
         provider=provider, base_url=base_url, api_mode=api_mode, model=model)
-    _update_fallback_context_compressor(agent)
+    _update_fallback_context_compressor(agent, allow_probe=False)
     _reresolve_fallback_reasoning_config(agent)
     _rescope_fallback_extra_body(agent, old_model, old_provider, old_base_url)
     return old_model, old_provider
