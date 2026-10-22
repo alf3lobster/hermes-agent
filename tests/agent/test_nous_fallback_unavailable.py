@@ -1,9 +1,4 @@
-"""Tests for Nous fallback local-availability suppression.
-
-Blocker if Nous token material is missing locally: the fallback chain
-should not repeatedly attempt Nous resolution; it must skip and continue
-to the next provider.
-"""
+"""Tests for post-publication Nous fallback credential maintenance."""
 
 from __future__ import annotations
 
@@ -42,8 +37,8 @@ def _mock_client(base_url="https://chatgpt.com/backend-api/codex", api_key="fb-k
 
 
 class TestNousFallbackLocalAvailability:
-    def test_missing_nous_token_is_skipped_once(self):
-        """Nous fallback is skipped when no access/refresh token is stored."""
+    def test_missing_nous_token_does_not_skip_candidate_before_publication(self):
+        """Credential presence cannot choose a different candidate before commit."""
         agent = _make_agent(
             fallback_model=[
                 {"provider": "nous", "model": "anthropic/claude-sonnet-4.6"},
@@ -59,7 +54,8 @@ class TestNousFallbackLocalAvailability:
         ):
             activated = agent._try_activate_fallback(None)
         assert activated is True
-        assert agent.model == "gpt-5.5"
+        assert agent.provider == "nous"
+        assert agent.model == "anthropic/claude-sonnet-4.6"
 
 
     def test_present_nous_token_allows_activation(self):

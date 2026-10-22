@@ -187,15 +187,24 @@ def test_rejected_fallback_real_resolver_does_not_load_or_select_credential_pool
     select_pool.assert_not_called()
 
 
-def test_candidate_screening_does_not_load_or_heal_credential_pool(monkeypatch):
-    """Candidate admission may inspect an attached pool but must not open the credential store."""
+def test_candidate_screening_does_not_touch_attached_credential_pool(monkeypatch):
+    """Candidate admission defers even retained-pool inspection until after publication."""
     from agent.chat_completion_helpers import _candidate_pool_exhausted
 
-    agent = SimpleNamespace(_credential_pool=None)
+    pool = SimpleNamespace(
+        provider="custom",
+        has_credentials=MagicMock(side_effect=AssertionError("candidate screening inspected credentials")),
+        has_available=MagicMock(side_effect=AssertionError("candidate screening healed credentials")),
+        next_available_at=MagicMock(side_effect=AssertionError("candidate screening inspected cooldowns")),
+    )
+    agent = SimpleNamespace(_credential_pool=pool)
     load_pool = MagicMock(side_effect=AssertionError("candidate screening loaded credentials"))
     monkeypatch.setattr("agent.credential_pool.load_pool", load_pool)
 
     assert _candidate_pool_exhausted(agent, "custom", "candidate") is False
+    pool.has_credentials.assert_not_called()
+    pool.has_available.assert_not_called()
+    pool.next_available_at.assert_not_called()
     load_pool.assert_not_called()
 
 
@@ -432,7 +441,7 @@ def test_failed_primary_restore_retains_restrictive_active_policy(active_policy,
     with (
         patch("agent.fallback_cooldown._is_entitlement_rejected", return_value=False),
         patch("hermes_cli.chat_catalog.is_known_non_chat_model", return_value=False),
-        patch("agent.agent_runtime_helpers._primary_quota_reopened_early", return_value=False),
+        patch("agent.agent_runtime_helpers._primary_quota_reopen_probe_due", return_value=False),
         patch("agent.agent_runtime_helpers._primary_reset_gate_blocks", return_value=(False, None, False)),
         patch("agent.route_binding.reinstall_primary_runtime", side_effect=partial_restore),
     ):
@@ -696,6 +705,17 @@ def test_context_metadata_probe_runs_only_after_fallback_publication(monkeypatch
         "restricted",
     ) == ("", "")
     assert events == ["commit", "probe", "feasibility"]
+
+
+def test_nous_candidate_validation_does_not_open_auth_store():
+    """Credential presence is post-commit maintenance, not candidate-admission evidence."""
+    from agent.chat_completion_helpers import _fallback_entry_unavailable_without_network
+
+    with patch("hermes_cli.auth.get_provider_auth_state", return_value={"access_token": "[REDACTED]"}) as load_auth:
+        assert _fallback_entry_unavailable_without_network(
+            SimpleNamespace(), {"provider": "nous", "model": "example/model"},
+        ) is None
+    load_auth.assert_not_called()
 
 
 def test_post_commit_compressor_persistence_failure_keeps_committed_route(monkeypatch):

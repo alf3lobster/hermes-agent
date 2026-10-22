@@ -1765,17 +1765,13 @@ def _fallback_entry_key(fb: dict) -> tuple[str, str, str]:
             str(fb.get("base_url") or "").strip().rstrip("/"))
 
 
-def _fallback_entry_unavailable_without_network(agent, fb: dict) -> Optional[str]:
-    """Return a skip reason for fallback entries known to be unusable locally."""
-    if (fb.get("provider") or "").strip().lower() != "nous":
-        return None
-    try:
-        from hermes_cli.auth import get_provider_auth_state
-        state = get_provider_auth_state("nous") or {}
-    except Exception as exc:
-        return f"nous_auth_unreadable:{type(exc).__name__}"
-    has_token = any(isinstance(t, str) and t.strip() for t in (state.get("access_token"), state.get("refresh_token")))
-    return None if has_token else "nous_token_missing"
+def _fallback_entry_unavailable_without_network(_agent, _fb: dict) -> Optional[str]:
+    """Return a metadata-only skip reason without opening any credential store.
+
+    Credential presence and provider authentication are deliberately resolved only after
+    publication; a missing token leaves the committed restrictive route inert.
+    """
+    return None
 
 
 _FALLBACK_REASON_LABELS = {
@@ -1925,17 +1921,13 @@ def _fallback_chain_exhausted(agent, reason: FailoverReason | None) -> bool:
     return False
 
 
-def _candidate_pool_exhausted(agent, fb_provider: str, fb_model: str) -> bool:
-    """True when every credential the candidate would use sits in an exhaustion cooldown longer
-    than the retry loop's longest wait (the 600s Retry-After cap): switching to it only fails the
-    turn the same way the primary just did (#89401). A short throttle still gets its chance."""
-    pool = getattr(agent, "_credential_pool", None)
-    if pool is None or (getattr(pool, "provider", "") or "").strip().lower() != fb_provider:
-        return False
-    if pool is None or not pool.has_credentials() or pool.has_available(model=fb_model):
-        return False
-    until = pool.next_available_at(model=fb_model)
-    return until is None or until - time.time() > 600
+def _candidate_pool_exhausted(_agent, _fb_provider: str, _fb_model: str) -> bool:
+    """Defer credential availability checks until after restrictive publication.
+
+    Even retained-pool availability helpers may resynchronise credentials, prune entries,
+    or persist cooldown state. A post-commit miss therefore leaves the safe route inert.
+    """
+    return False
 
 
 def _should_skip_fallback_candidate(agent, fb: dict, fb_key: tuple, fb_provider: str, fb_model: str, unavailable: set) -> bool:

@@ -71,11 +71,26 @@ def _pin_to_fallback(agent):
 
 
 def _restore(agent, quota_restored):
+    from agent import route_binding
+
+    events = []
+    commit = route_binding._commit_route_agent
+
+    def recorded_commit(*args, **kwargs):
+        events.append("commit")
+        return commit(*args, **kwargs)
+
+    def recorded_probe(*_args, **_kwargs):
+        events.append("probe")
+        return quota_restored
+
     with (
-        patch("hermes_cli.auth._probe_codex_quota_restored", return_value=quota_restored),
+        patch("hermes_cli.auth._probe_codex_quota_restored", side_effect=recorded_probe),
+        patch("agent.route_binding._commit_route_agent", side_effect=recorded_commit),
         patch("agent.process_bootstrap.OpenAI", return_value=MagicMock()),
     ):
-        return agent._restore_primary_runtime()
+        result = agent._restore_primary_runtime()
+    return result, events
 
 
 def test_returns_to_primary_when_quota_reopens_before_declared_reset(tmp_path, monkeypatch):
@@ -83,7 +98,9 @@ def test_returns_to_primary_when_quota_reopens_before_declared_reset(tmp_path, m
     _write_exhausted_codex_pool(tmp_path, reset_in_seconds=3 * 86400)
     agent = _fallback_agent()
 
-    assert _restore(agent, quota_restored=True) is True
+    restored, events = _restore(agent, quota_restored=True)
+    assert restored is True
+    assert events[:2] == ["commit", "probe"]
     assert agent._fallback_activated is False
 
 
@@ -91,9 +108,14 @@ def test_stays_on_fallback_while_quota_is_still_spent(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     _write_exhausted_codex_pool(tmp_path, reset_in_seconds=3 * 86400)
     agent = _fallback_agent()
+    agent._emit_diagnostic_status = MagicMock()
 
-    assert _restore(agent, quota_restored=False) is False
-    assert agent._fallback_activated is True
+    restored, events = _restore(agent, quota_restored=False)
+    assert restored is True
+    assert events[:2] == ["commit", "probe"]
+    assert agent._fallback_activated is False
+    assert agent._route_client_ready is False
+    agent._emit_diagnostic_status.assert_not_called()
 
 
 def test_a_wrong_restored_verdict_does_not_flip_back_every_turn(tmp_path, monkeypatch):
@@ -101,11 +123,14 @@ def test_a_wrong_restored_verdict_does_not_flip_back_every_turn(tmp_path, monkey
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     _write_exhausted_codex_pool(tmp_path, reset_in_seconds=3 * 86400)
     agent = _fallback_agent()
-    assert _restore(agent, quota_restored=True) is True
+    restored, _events = _restore(agent, quota_restored=True)
+    assert restored is True
 
     # The primary 429s again: the pool re-benches the entry and the session falls back.
     _write_exhausted_codex_pool(tmp_path, reset_in_seconds=3 * 86400)
     _pin_to_fallback(agent)
 
-    assert _restore(agent, quota_restored=True) is False
+    restored, events = _restore(agent, quota_restored=True)
+    assert restored is False
+    assert events == []
     assert agent._fallback_activated is True

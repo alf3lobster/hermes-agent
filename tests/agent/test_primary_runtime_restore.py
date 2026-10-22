@@ -368,11 +368,19 @@ class TestRestorePrimaryRuntime:
         ):
             assert agent._try_activate_fallback() is True
 
+        agent._compression_feasibility_checked = True
+        retained_pool = MagicMock()
+        retained_pool.provider = "openai-api"
+        retained_pool.next_available_at.side_effect = AssertionError("primary preparation inspected cooldowns")
+        retained_pool.lift_reopened_cooldowns.side_effect = AssertionError("primary preparation probed quota")
+        agent._primary_credential_pool = retained_pool
         load_pool = MagicMock(side_effect=AssertionError("pool opened before primary publication"))
         build_client = MagicMock(return_value=MagicMock())
+        revalidate = MagicMock(side_effect=AssertionError("compression probe before primary publication"))
         with (
             patch("agent.process_bootstrap.OpenAI", build_client),
             patch("agent.credential_pool.load_pool", load_pool),
+            patch("agent.conversation_compression.revalidate_compression_feasibility", revalidate),
             patch(
                 "agent.route_binding._commit_route_agent",
                 side_effect=RuntimeError("injected primary publication rejection"),
@@ -381,7 +389,10 @@ class TestRestorePrimaryRuntime:
             assert agent._restore_primary_runtime() is False
 
         load_pool.assert_not_called()
+        retained_pool.next_available_at.assert_not_called()
+        retained_pool.lift_reopened_cooldowns.assert_not_called()
         build_client.assert_not_called()
+        revalidate.assert_not_called()
         assert agent.provider == "deepseek"
         assert agent._provider_fallback_tool_policy == "none"
 

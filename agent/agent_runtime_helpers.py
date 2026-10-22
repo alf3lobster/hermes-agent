@@ -1288,10 +1288,10 @@ def drop_thinking_only_and_merge_users(
 
 
 def _primary_reset_gate_blocks(agent, rt, primary_provider, matches_primary, retained_pool):
-    """Inspect an already-retained primary pool without opening the credential store.
+    """Carry an already-retained primary pool without consulting credential state.
 
-    Returns ``(blocked, pool, retained)`` so post-commit maintenance can reuse the
-    shared pool object. Missing/mismatched state fails open to a primary attempt.
+    Availability helpers can resynchronise, heal, prune, probe, or persist. Route admission
+    therefore treats the pool as an opaque post-commit maintenance handle.
     """
     pool = (
         retained_pool
@@ -1300,21 +1300,6 @@ def _primary_reset_gate_blocks(agent, rt, primary_provider, matches_primary, ret
     )
     if pool is None or not matches_primary(pool):
         return False, None, False
-    try:
-        primary_model = str(rt.get("model") or "").strip()
-        next_at = getattr(pool, "next_available_at", lambda **_kwargs: None)(model=primary_model or None)
-        if next_at is not None and next_at > time.time():
-            if not getattr(agent, "_restore_wait_logged", False):
-                agent._restore_wait_logged = True
-                logger.info(
-                    "Primary %s rate-limited until %s; staying on fallback "
-                    "%s/%s until the reset elapses", primary_provider or "?",
-                    datetime.fromtimestamp(next_at).isoformat(timespec="seconds"), agent.provider,
-                    agent.model,
-                )
-            return True, pool, True
-    except Exception:
-        logger.debug("Reset-aware restore gate failed; falling back to per-turn retry", exc_info=True)
     return False, pool, True
 
 
@@ -1354,35 +1339,15 @@ def _revert_credential_rotation(agent) -> None:
     agent._credential_pool_revert_id = None
 
 
-def _primary_quota_reopened_early(agent, primary_provider, primary_model, matches_primary, retained_pool) -> bool:
-    """True when a retained Codex primary pool proves its quota window reopened early.
-
-    No pool is loaded here: this is a pre-publication admission check. If the
-    primary snapshot did not retain its shared pool, the ordinary cooldown wins.
-    """
+def _primary_quota_reopen_probe_due(agent, primary_provider) -> bool:
+    """Return whether a Codex reopen probe is due, without touching credentials."""
     if primary_provider != "openai-codex":
         return False
     from hermes_cli.auth_codex import CODEX_QUOTA_PROBE_MIN_INTERVAL_SECONDS
     now = time.monotonic()
     if now - getattr(agent, "_codex_reopen_checked_at", float("-inf")) < CODEX_QUOTA_PROBE_MIN_INTERVAL_SECONDS:
         return False
-    agent._codex_reopen_checked_at = now
-    pool = (
-        retained_pool
-        if retained_pool is not None and matches_primary(retained_pool)
-        else getattr(agent, "_credential_pool", None)
-    )
-    if pool is None or not matches_primary(pool):
-        return False
-    try:
-        model = primary_model or None
-        benched_until = pool.next_available_at(model=model)
-        if benched_until is None or benched_until <= time.time():
-            return False
-        return pool.lift_reopened_cooldowns(model=model)
-    except Exception:
-        logger.debug("Early quota-reopen check failed; keeping the cooldown", exc_info=True)
-        return False
+    return True
 
 
 def restore_primary_runtime(agent) -> bool:
@@ -1416,11 +1381,9 @@ def restore_primary_runtime(agent) -> bool:
         loaded = load_runtime_pool(primary_provider, primary_runtime_base_url, (rt or {}).get("requested_provider"), rt or {})
         return loaded if loaded is not None and _matches_primary(loaded) else None
     retained_primary_pool = getattr(agent, "_primary_credential_pool", None)
-    if _primary_quota_reopened_early(
-        agent, primary_provider, primary_model, _matches_primary, retained_primary_pool,
-    ):
-        agent._rate_limited_until = 0
-    if getattr(agent, "_rate_limited_until", 0) > time.monotonic():
+    cooldown_active = getattr(agent, "_rate_limited_until", 0) > time.monotonic()
+    probe_codex_reopen = cooldown_active and _primary_quota_reopen_probe_due(agent, primary_provider)
+    if cooldown_active and not probe_codex_reopen:
         return False  # primary still in rate-limit cooldown, stay on fallback
     blocked, prefetched_pool, prefetched = _primary_reset_gate_blocks(
         agent, rt, primary_provider, _matches_primary, retained_primary_pool,
@@ -1440,14 +1403,22 @@ def restore_primary_runtime(agent) -> bool:
         from agent.route_binding import reinstall_primary_runtime
         reinstall_primary_runtime(
             agent, rt, primary_provider, primary_model, _matches_primary, _load_primary_pool, prefetched_pool, prefetched,
+            probe_codex_reopen=probe_codex_reopen,
         )
-        logger.info("Primary runtime restored for new turn: %s (%s)", agent.model, agent.provider)
-        if provider_fallback_active:
-            with contextlib.suppress(Exception):
-                agent._emit_diagnostic_status(
-                    f"✅ Primary model restored: {agent.model} via {agent.provider}; "
-                    f"fallback {previous_model} via {previous_provider} is no longer active."
-                )
+        if getattr(agent, "_route_client_ready", False):
+            logger.info("Primary runtime restored for new turn: %s (%s)", agent.model, agent.provider)
+            if provider_fallback_active:
+                with contextlib.suppress(Exception):
+                    agent._emit_diagnostic_status(
+                        f"✅ Primary model restored: {agent.model} via {agent.provider}; "
+                        f"fallback {previous_model} via {previous_provider} is no longer active."
+                    )
+        else:
+            logger.warning(
+                "Primary route committed for %s (%s), but post-commit maintenance left its client inert",
+                agent.model,
+                agent.provider,
+            )
         return True
     except Exception as e:
         agent._provider_fallback_tool_policy = failed_restore_tool_policy

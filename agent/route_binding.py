@@ -109,6 +109,13 @@ def _stage_route_agent(agent: Any) -> Any:
     return staged
 
 
+def _revalidate_committed_compression(agent: Any) -> None:
+    """Refresh an existing feasibility verdict only after route publication."""
+    if getattr(agent, "_compression_feasibility_checked", False) is True:
+        from agent.conversation_compression import revalidate_compression_feasibility
+        revalidate_compression_feasibility(agent)
+
+
 def _commit_route_agent(agent: Any, staged: Any) -> None:
     """Publish one prepared route, then persist its already-decided compressor reset state."""
     live_compressor = getattr(agent, "context_compressor", None)
@@ -330,8 +337,8 @@ def _reinstall_runtime_snapshot_in_place(
         base_url=rt["compressor_base_url"], api_key=rt["compressor_api_key"],
         provider=rt["compressor_provider"], api_mode=rt.get("compressor_api_mode", ""),
     )
-    # Same rule as fallback activation: refresh an existing verdict only; never-probed sessions stay lazy.
-    if getattr(agent, "_compression_feasibility_checked", False) is True:
+    # A staged restore cannot resolve auxiliary clients or probe providers before publication.
+    if not defer_client and getattr(agent, "_compression_feasibility_checked", False) is True:
         from agent.conversation_compression import revalidate_compression_feasibility
         revalidate_compression_feasibility(agent)
     # Older snapshots have no reasoning_config; keep the current value.
@@ -366,6 +373,7 @@ def reinstall_runtime_snapshot(agent: Any, rt: dict[str, Any]) -> None:
         from agent.agent_runtime_helpers import _rebuild_primary_client
         _rebuild_primary_client(agent, rt, reason="restore_snapshot", owner=agent)
         agent._route_client_ready = True
+        _revalidate_committed_compression(agent)
     except Exception:
         logger.warning(
             "Runtime route committed but client maintenance failed for %s/%s",
@@ -378,6 +386,7 @@ def reinstall_runtime_snapshot(agent: Any, rt: dict[str, Any]) -> None:
 def reinstall_primary_runtime(
     agent: Any, rt: dict[str, Any], primary_provider: str, primary_model: str, matches_primary,
     load_primary_pool, prefetched_pool=None, prefetched: bool = False,
+    *, probe_codex_reopen: bool = False,
 ) -> None:
     """Put ``agent`` back on its ``_primary_runtime`` snapshot ``rt`` and clear the fallback state."""
     current_tool_policy = getattr(agent, "_provider_fallback_tool_policy", "inherit")
@@ -399,9 +408,24 @@ def reinstall_primary_runtime(
     del staged._route_owner
     _commit_route_agent(agent, staged)
     try:
+        if probe_codex_reopen:
+            import time
+
+            agent._codex_reopen_checked_at = time.monotonic()
+            pool = prefetched_pool if prefetched else load_primary_pool()
+            if pool is None or not matches_primary(pool) or not pool.lift_reopened_cooldowns(
+                model=primary_model or None,
+            ):
+                logger.info(
+                    "Primary Codex route committed but quota remains unavailable; client stays inert",
+                )
+                return
+            agent._rate_limited_until = 0
+            prefetched_pool, prefetched = pool, True
         from agent.agent_runtime_helpers import _rebuild_primary_client
         _rebuild_primary_client(agent, rt, reason="restore_primary", owner=agent)
         agent._route_client_ready = True
+        _revalidate_committed_compression(agent)
         rebind_primary_credential_pool(
             agent, primary_provider, primary_model, matches_primary,
             load_primary_pool, prefetched_pool, prefetched,

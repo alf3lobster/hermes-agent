@@ -234,7 +234,7 @@ class TestNextAvailableAt:
 class TestResetAwareRestoreGate:
     FB = {"provider": "openrouter", "model": "anthropic/claude-sonnet-4"}
 
-    def test_stays_on_fallback_until_reset(self):
+    def test_pool_reset_state_is_not_consulted_before_primary_publication(self):
         agent = _make_agent(fallback_model=self.FB)
         _activate_fallback(agent)
         agent._rate_limited_until = 0  # 60s transient cooldown already cleared
@@ -243,10 +243,11 @@ class TestResetAwareRestoreGate:
         # serve until an hour from now.
         agent._credential_pool = _FakePool("custom", next_at=time.time() + 3600)
 
-        assert agent._restore_primary_runtime() is False
-        assert agent._fallback_activated is True
-        assert agent.provider == "openrouter"
-        assert agent.model == "anthropic/claude-sonnet-4"
+        with patch("agent.process_bootstrap.OpenAI", return_value=MagicMock()):
+            assert agent._restore_primary_runtime() is True
+        assert agent._credential_pool.next_available_calls == 0
+        assert agent._fallback_activated is False
+        assert agent.provider == "custom"
 
     def test_restores_once_reset_elapsed(self):
         agent = _make_agent(fallback_model=self.FB)
@@ -285,9 +286,8 @@ class TestResetAwareRestoreGate:
             assert agent._restore_primary_runtime() is True
         assert agent._fallback_activated is False
 
-    def test_cross_provider_fallback_loads_primary_pool(self):
-        """After a cross-provider fallback the attached pool belongs to the
-        fallback provider; the gate must consult the PRIMARY's pool."""
+    def test_cross_provider_fallback_loads_primary_pool_only_after_publication(self):
+        """A mismatched fallback pool is replaced during post-commit maintenance."""
         agent = _make_agent(fallback_model=self.FB)
         _activate_fallback(agent)
         agent._rate_limited_until = 0
@@ -296,11 +296,14 @@ class TestResetAwareRestoreGate:
         agent._credential_pool = _FakePool("openrouter", next_at=None)
         primary_pool = _FakePool("custom", next_at=time.time() + 3600)
 
-        with patch("agent.credential_pool.load_pool", return_value=primary_pool) as lp:
-            assert agent._restore_primary_runtime() is False
+        with (
+            patch("agent.credential_pool.load_pool", return_value=primary_pool) as lp,
+            patch("agent.process_bootstrap.OpenAI", return_value=MagicMock()),
+        ):
+            assert agent._restore_primary_runtime() is True
         assert any(c.args == ("custom",) for c in lp.call_args_list)
-        assert primary_pool.next_available_calls == 1
-        assert agent._fallback_activated is True
+        assert primary_pool.next_available_calls == 0
+        assert agent._fallback_activated is False
 
 
 
