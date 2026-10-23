@@ -693,6 +693,9 @@ class CLIModelSwitchMixin:
         return {
             **_runtime_fields(self),
             "reasoning_config": copy.deepcopy(getattr(self, "reasoning_config", None)),
+            # Opaque live handle: preserve identity without deepcopying CredentialPool's RLock.
+            "agent_primary_credential_pool": getattr(agent, "_primary_credential_pool", None)
+            if agent is not None else None,
             "agent_primary_runtime": clone_primary_runtime_snapshot(
                 getattr(agent, "_primary_runtime", None)
             ) if agent is not None else None}
@@ -722,6 +725,8 @@ class CLIModelSwitchMixin:
             try:
                 from agent.primary_runtime_snapshot import clone_primary_runtime_snapshot
                 agent._primary_runtime = clone_primary_runtime_snapshot(primary)
+                if "agent_primary_credential_pool" in snapshot:
+                    agent._primary_credential_pool = snapshot["agent_primary_credential_pool"]
                 agent._fallback_activated = True
                 agent._rate_limited_until = 0
                 if agent._restore_primary_runtime():

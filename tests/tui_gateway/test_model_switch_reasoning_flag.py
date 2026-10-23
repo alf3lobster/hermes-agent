@@ -101,6 +101,40 @@ def test_tui_one_turn_snapshot_preserves_noncopyable_pool_identity():
     assert agent._primary_runtime["credential_pool"] is pool
 
 
+def test_tui_one_turn_snapshot_restores_legacy_retained_primary_pool_identity():
+    import threading
+
+    from tui_gateway import model_switch
+
+    primary_pool = SimpleNamespace(lock=threading.RLock())
+    one_turn_pool = SimpleNamespace(lock=threading.RLock())
+    agent = SimpleNamespace(
+        model="old/model",
+        provider="openrouter",
+        api_key="key-A",
+        base_url="https://openrouter.ai/api/v1",
+        api_mode="chat_completions",
+        reasoning_config=None,
+        _primary_runtime={"model": "old/model", "provider": "openrouter"},
+        _primary_credential_pool=primary_pool,
+        _rate_limited_until=0,
+    )
+
+    snapshot = model_switch._snapshot_agent_model_runtime(agent)
+    assert snapshot["primary_credential_pool"] is primary_pool
+
+    def restore_primary():
+        assert agent._primary_credential_pool is primary_pool
+        return True
+
+    agent._primary_runtime = {"model": "temporary"}
+    agent._primary_credential_pool = one_turn_pool
+    agent._restore_primary_runtime = restore_primary
+    model_switch._restore_agent_model_runtime(agent, snapshot)
+
+    assert agent._primary_credential_pool is primary_pool
+
+
 def test_tui_committed_restore_failure_does_not_widen_via_switch_model(monkeypatch):
     from agent.route_binding import RouteCommittedError
     from tui_gateway import model_switch

@@ -191,6 +191,39 @@ def test_cli_one_turn_snapshot_preserves_noncopyable_pool_identity():
     assert stub.agent._primary_runtime["credential_pool"] is pool
 
 
+def test_cli_one_turn_snapshot_restores_legacy_retained_primary_pool_identity():
+    import threading
+
+    import cli as cli_mod
+
+    primary_pool = SimpleNamespace(lock=threading.RLock())
+    one_turn_pool = SimpleNamespace(lock=threading.RLock())
+
+    class Agent(_FakeAgent):
+        _rate_limited_until = 0
+
+        def __init__(self):
+            super().__init__()
+            self._primary_runtime = {"model": self.model, "provider": self.provider}
+            self._primary_credential_pool = primary_pool
+
+        def _restore_primary_runtime(self):
+            assert self._primary_credential_pool is primary_pool
+            return True
+
+    stub = _StubCLI()
+    stub.agent = Agent()
+
+    snapshot = cli_mod.HermesCLI._snapshot_model_runtime(stub)
+    assert snapshot["agent_primary_credential_pool"] is primary_pool
+
+    stub.agent._primary_runtime = {"model": "temporary"}
+    stub.agent._primary_credential_pool = one_turn_pool
+    cli_mod.HermesCLI._restore_model_runtime_snapshot(stub, snapshot)
+
+    assert stub.agent._primary_credential_pool is primary_pool
+
+
 def test_cli_committed_restore_failure_does_not_widen_via_switch_model():
     from agent.route_binding import RouteCommittedError
     import cli as cli_mod

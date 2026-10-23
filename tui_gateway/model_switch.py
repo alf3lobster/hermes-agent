@@ -21,6 +21,8 @@ def _snapshot_agent_model_runtime(agent) -> dict:
 
     return {**{k: getattr(agent, k, "") for k in _RUNTIME_KEYS},
             "reasoning_config": copy.deepcopy(getattr(agent, "reasoning_config", None)),
+            # Opaque live handle: preserve identity without deepcopying CredentialPool's RLock.
+            "primary_credential_pool": getattr(agent, "_primary_credential_pool", None),
             "primary_runtime": clone_primary_runtime_snapshot(getattr(agent, "_primary_runtime", None))}
 
 
@@ -38,6 +40,8 @@ def _restore_agent_model_runtime(agent, snapshot: dict | None) -> None:
         try:
             from agent.primary_runtime_snapshot import clone_primary_runtime_snapshot
             agent._primary_runtime = clone_primary_runtime_snapshot(primary)
+            if "primary_credential_pool" in snapshot:
+                agent._primary_credential_pool = snapshot["primary_credential_pool"]
             agent._fallback_activated = True
             agent._rate_limited_until = 0
             if agent._restore_primary_runtime():
