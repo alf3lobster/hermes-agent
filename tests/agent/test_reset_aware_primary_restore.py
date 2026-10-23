@@ -241,11 +241,13 @@ class TestResetAwareRestoreGate:
 
         # Attached pool matches the primary provider and says: nobody can
         # serve until an hour from now.
-        agent._credential_pool = _FakePool("custom", next_at=time.time() + 3600)
+        attached_pool = _FakePool("custom", next_at=time.time() + 3600)
+        agent._credential_pool = attached_pool
 
         with patch("agent.process_bootstrap.OpenAI", return_value=MagicMock()):
             assert agent._restore_primary_runtime() is True
-        assert agent._credential_pool.next_available_calls == 0
+        assert attached_pool.next_available_calls == 0
+        assert agent._credential_pool is None
         assert agent._fallback_activated is False
         assert agent.provider == "custom"
 
@@ -286,8 +288,8 @@ class TestResetAwareRestoreGate:
             assert agent._restore_primary_runtime() is True
         assert agent._fallback_activated is False
 
-    def test_cross_provider_fallback_loads_primary_pool_only_after_publication(self):
-        """A mismatched fallback pool is replaced during post-commit maintenance."""
+    def test_cross_provider_fallback_does_not_attach_pool_absent_from_snapshot(self):
+        """A mismatched fallback pool cannot trigger live pool discovery after publication."""
         agent = _make_agent(fallback_model=self.FB)
         _activate_fallback(agent)
         agent._rate_limited_until = 0
@@ -301,8 +303,9 @@ class TestResetAwareRestoreGate:
             patch("agent.process_bootstrap.OpenAI", return_value=MagicMock()),
         ):
             assert agent._restore_primary_runtime() is True
-        assert any(c.args == ("custom",) for c in lp.call_args_list)
+        lp.assert_not_called()
         assert primary_pool.next_available_calls == 0
+        assert agent._credential_pool is None
         assert agent._fallback_activated is False
 
 
