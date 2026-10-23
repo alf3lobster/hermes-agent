@@ -1145,10 +1145,13 @@ def _apply_primary_runtime_fields(agent, rt: dict[str, Any]) -> None:
     agent.api_mode = "chat_completions" if is_actual_route(agent.provider, agent.base_url) else rt["api_mode"]
     if hasattr(agent, "_transport_cache"):
         agent._transport_cache.clear()
-    agent.api_key = rt["api_key"]
+    is_moa = (agent.provider or "").strip().lower() == "moa"
+    agent.api_key = rt.get("api_key", "") if is_moa else rt["api_key"]
     agent._reasoning_echo_flag = rt.get("reasoning_echo_flag", False)
     agent.request_overrides = dict(rt.get("request_overrides") or {})
-    agent._client_kwargs = dict(rt["client_kwargs"])
+    agent._client_kwargs = (
+        dict(rt.get("client_kwargs") or {}) if is_moa else dict(rt["client_kwargs"])
+    )
 
 
 def _build_anthropic_client_from_runtime(agent, rt: dict[str, Any]) -> None:

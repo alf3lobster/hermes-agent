@@ -631,6 +631,35 @@ class TestRestorePrimaryRuntime:
         assert cloned["request_overrides"] == runtime["request_overrides"]
         assert cloned["request_overrides"] is not runtime["request_overrides"]
 
+    def test_sparse_legacy_moa_snapshot_restores_through_route_transaction(self):
+        from agent import moa_loop, route_binding
+
+        agent = _make_agent()
+        runtime = dict(agent._primary_runtime)
+        runtime.update({
+            "model": "council",
+            "provider": "moa",
+            "requested_provider": "moa",
+            "base_url": "",
+            "api_mode": "chat_completions",
+        })
+        runtime.pop("api_key", None)
+        runtime.pop("client_kwargs", None)
+
+        events = []
+        with (
+            patch.object(moa_loop, "build_moa_facade", side_effect=lambda *_args, **_kwargs: events.append("facade") or object()),
+            patch.object(moa_loop, "materialize_moa_slot_runtimes", side_effect=lambda *_args, **_kwargs: events.append("slots")),
+        ):
+            route_binding.reinstall_runtime_snapshot(agent, runtime)
+
+        assert events == ["facade", "slots"]
+        assert agent.provider == "moa"
+        assert agent.model == "council"
+        assert agent.api_key == ""
+        assert agent._client_kwargs == {}
+        assert agent._route_client_ready is True
+
     def test_restore_does_not_attach_wrong_endpoint_pool_absent_from_snapshot(self):
         pool = MagicMock()
         pool.provider = "custom:gemini-no-filter"
