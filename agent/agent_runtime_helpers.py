@@ -1452,7 +1452,7 @@ def restore_primary_runtime(agent) -> bool:
             agent.model,
             agent.provider,
         )
-        return True
+        raise
     except Exception as e:
         agent._provider_fallback_tool_policy = failed_restore_tool_policy
         logger.warning("Failed to restore primary runtime: %s", e)

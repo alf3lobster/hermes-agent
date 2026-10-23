@@ -718,6 +718,7 @@ class CLIModelSwitchMixin:
             restore_reasoning(snapshot["reasoning_config"])
         primary = snapshot.get("agent_primary_runtime")
         if primary and hasattr(agent, "_restore_primary_runtime"):
+            from agent.route_binding import RouteCommittedError
             try:
                 from agent.primary_runtime_snapshot import clone_primary_runtime_snapshot
                 agent._primary_runtime = clone_primary_runtime_snapshot(primary)
@@ -725,6 +726,12 @@ class CLIModelSwitchMixin:
                 agent._rate_limited_until = 0
                 if agent._restore_primary_runtime():
                     return
+            except RouteCommittedError:
+                logger.debug(
+                    "CLI one-turn primary route committed but remained inert",
+                    exc_info=True,
+                )
+                return
             except Exception:
                 logger.debug("CLI one-turn model restore via primary runtime failed", exc_info=True)
         if hasattr(agent, "switch_model"):

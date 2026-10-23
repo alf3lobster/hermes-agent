@@ -34,6 +34,7 @@ def _restore_agent_model_runtime(agent, snapshot: dict | None) -> None:
         agent.reasoning_config = snapshot["reasoning_config"]
     primary = snapshot.get("primary_runtime")
     if primary and hasattr(agent, "_restore_primary_runtime"):
+        from agent.route_binding import RouteCommittedError
         try:
             from agent.primary_runtime_snapshot import clone_primary_runtime_snapshot
             agent._primary_runtime = clone_primary_runtime_snapshot(primary)
@@ -43,6 +44,12 @@ def _restore_agent_model_runtime(agent, snapshot: dict | None) -> None:
                 if "reasoning_config" in snapshot:
                     agent.reasoning_config = snapshot["reasoning_config"]
                 return
+        except RouteCommittedError:
+            logger.debug(
+                "TUI one-turn primary route committed but remained inert",
+                exc_info=True,
+            )
+            return
         except Exception:
             logger.debug("TUI one-turn model restore via primary runtime failed", exc_info=True)
     if hasattr(agent, "switch_model"):

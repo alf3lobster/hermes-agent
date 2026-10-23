@@ -424,7 +424,8 @@ def test_committed_primary_restore_failure_closes_retry_and_credential_revert(mo
     monkeypatch.setattr("agent.agent_runtime_helpers._revert_credential_rotation", revert)
     monkeypatch.setattr("agent.route_binding.reinstall_primary_runtime", commit_then_fail)
 
-    assert restore_primary_runtime(agent) is True
+    with pytest.raises(RouteCommittedError, match="client maintenance failed"):
+        restore_primary_runtime(agent)
     assert agent._route_client_ready is False
     assert agent._fallback_activated is False
     assert agent._fallback_index == len(agent._fallback_chain)
@@ -655,6 +656,7 @@ def test_successful_primary_restore_selects_pool_only_after_route_commit(monkeyp
     class Agent(SimpleNamespace):
         def _swap_credential(self, selected):
             self.selected = selected.id
+            return True
 
     agent = Agent(
         _credential_pool=pool,

@@ -12,7 +12,9 @@ Verifies that:
 import time
 from unittest.mock import MagicMock, patch
 
+import pytest
 
+from agent.route_binding import RouteCommittedError
 from run_agent import AIAgent
 
 
@@ -179,7 +181,8 @@ class TestRestorePrimaryRuntime:
             raise RouteCommittedError("committed route maintenance failed")
 
         with patch("agent.route_binding.reinstall_primary_runtime", side_effect=commit_then_fail):
-            assert agent._restore_primary_runtime() is True
+            with pytest.raises(RouteCommittedError, match="committed route maintenance failed"):
+                agent._restore_primary_runtime()
 
         assert agent.model == "primary-model"
         assert agent._provider_fallback_tool_policy == "inherit"
@@ -450,7 +453,8 @@ class TestRestorePrimaryRuntime:
             raise RuntimeError("injected postcommit client failure")
 
         with patch("agent.agent_runtime_helpers._rebuild_primary_client", side_effect=fail_after_commit):
-            assert agent._restore_primary_runtime() is True
+            with pytest.raises(RouteCommittedError, match="postcommit client failure"):
+                agent._restore_primary_runtime()
 
         assert observed == [("openai-api", False)]
         assert agent.provider == "openai-api"
@@ -594,7 +598,7 @@ class TestRestorePrimaryRuntime:
         fallback_pool.provider = "openrouter"
         agent._credential_pool = fallback_pool
         agent._credential_pool_entry_id = "fallback-entry"
-        agent._swap_credential = MagicMock()
+        agent._swap_credential = MagicMock(return_value=True)
 
         primary_pool = MagicMock()
         primary_pool.provider = "openrouter"

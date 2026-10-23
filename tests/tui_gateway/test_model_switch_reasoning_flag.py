@@ -99,3 +99,42 @@ def test_tui_one_turn_snapshot_preserves_noncopyable_pool_identity():
     model_switch._restore_agent_model_runtime(agent, snapshot)
 
     assert agent._primary_runtime["credential_pool"] is pool
+
+
+def test_tui_committed_restore_failure_does_not_widen_via_switch_model(monkeypatch):
+    from agent.route_binding import RouteCommittedError
+    from tui_gateway import model_switch
+
+    monkeypatch.setattr(
+        model_switch,
+        "logger",
+        SimpleNamespace(debug=lambda *_args, **_kwargs: None),
+        raising=False,
+    )
+    calls = []
+
+    def committed_failure():
+        raise RouteCommittedError("committed route remains inert")
+
+    agent = SimpleNamespace(
+        reasoning_config=None,
+        _primary_runtime={"model": "temporary"},
+        _fallback_activated=False,
+        _rate_limited_until=0,
+        _route_client_ready=False,
+        _restore_primary_runtime=committed_failure,
+        switch_model=lambda **kwargs: calls.append(kwargs),
+    )
+    snapshot = {
+        "model": "primary",
+        "provider": "openrouter",
+        "api_key": "",
+        "base_url": "https://example.invalid/v1",
+        "api_mode": "chat_completions",
+        "primary_runtime": {"model": "primary"},
+    }
+
+    model_switch._restore_agent_model_runtime(agent, snapshot)
+
+    assert agent._route_client_ready is False
+    assert calls == []

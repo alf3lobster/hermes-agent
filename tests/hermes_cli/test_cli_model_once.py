@@ -189,3 +189,36 @@ def test_cli_one_turn_snapshot_preserves_noncopyable_pool_identity():
     cli_mod.HermesCLI._restore_model_runtime_snapshot(stub, snapshot)
 
     assert stub.agent._primary_runtime["credential_pool"] is pool
+
+
+def test_cli_committed_restore_failure_does_not_widen_via_switch_model():
+    from agent.route_binding import RouteCommittedError
+    import cli as cli_mod
+
+    class Agent(_FakeAgent):
+        _rate_limited_until = 0
+        _route_client_ready = False
+
+        def __init__(self):
+            super().__init__()
+            self.reasoning_config = None
+            self._primary_runtime = {"model": "temporary"}
+
+        def _restore_primary_runtime(self):
+            raise RouteCommittedError("committed route remains inert")
+
+    stub = _StubCLI()
+    stub.agent = Agent()
+    snapshot = {
+        "model": "primary",
+        "provider": "openrouter",
+        "api_key": "",
+        "base_url": "https://example.invalid/v1",
+        "api_mode": "chat_completions",
+        "agent_primary_runtime": {"model": "primary"},
+    }
+
+    cli_mod.HermesCLI._restore_model_runtime_snapshot(stub, snapshot)
+
+    assert stub.agent._route_client_ready is False
+    assert stub.agent.calls == []

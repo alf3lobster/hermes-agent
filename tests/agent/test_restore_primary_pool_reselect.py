@@ -12,6 +12,9 @@ pool may belong to a same-provider fallback route.
 import time
 from unittest.mock import MagicMock
 
+import pytest
+
+from agent.route_binding import RouteCommittedError
 
 from agent.credential_pool import (
     AUTH_TYPE_OAUTH,
@@ -149,3 +152,16 @@ class TestRestorePrimaryPoolReselect:
         assert result is True
         assert "custom-endpoint.example.com" in agent.base_url
         assert "custom-endpoint.example.com" in agent._client_kwargs["base_url"]
+
+    def test_restore_stays_inert_when_retained_pool_entry_cannot_bind(self):
+        """A failed credential swap is failed maintenance, never readiness."""
+        pool = _build_mock_pool([_make_entry("entry-1", "key-1")])
+        agent = self._make_agent(pool)
+        agent._swap_credential = MagicMock(return_value=False)
+
+        with pytest.raises(RouteCommittedError, match="credential-pool rebinding failed"):
+            agent._restore_primary_runtime()
+
+        assert agent._route_client_ready is False
+        assert agent._fallback_activated is False
+        agent._swap_credential.assert_called_once()

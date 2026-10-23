@@ -82,7 +82,8 @@ def rebind_primary_credential_pool(
     ):
         return
     if matches_primary(entry):
-        agent._swap_credential(entry)
+        if agent._swap_credential(entry) is not True:
+            raise RuntimeError("credential-pool rebinding failed")
         logger.info(
             "Restore re-selected pool entry %s (%s)",
             getattr(entry, "id", "?"),
