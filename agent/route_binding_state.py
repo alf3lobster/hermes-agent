@@ -77,23 +77,18 @@ def rebind_primary_credential_pool(
         return
     agent._credential_pool = pool
     entry = pool.select(model=primary_model or None) if pool is not None else None
-    if entry is None or not (
+    if entry is None:
+        raise RuntimeError("primary credential pool has no selectable credential")
+    if not (
         getattr(entry, "runtime_api_key", None) or getattr(entry, "access_token", "")
     ):
-        return
-    if matches_primary(entry):
-        if agent._swap_credential(entry) is not True:
-            raise RuntimeError("credential-pool rebinding failed")
-        logger.info(
-            "Restore re-selected pool entry %s (%s)",
-            getattr(entry, "id", "?"),
-            getattr(entry, "label", "?"),
-        )
-    else:
-        logger.info(
-            "Restore skipped pool entry %s (%s): provider %s does not match primary provider %s",
-            getattr(entry, "id", "?"),
-            getattr(entry, "label", "?"),
-            str(getattr(entry, "provider", "") or "").strip().lower() or "?",
-            primary_provider or "?",
-        )
+        raise RuntimeError("primary credential pool selected an unusable credential")
+    if not matches_primary(entry):
+        raise RuntimeError("primary credential pool selected a mismatched credential")
+    if agent._swap_credential(entry) is not True:
+        raise RuntimeError("credential-pool rebinding failed")
+    logger.info(
+        "Restore re-selected pool entry %s (%s)",
+        getattr(entry, "id", "?"),
+        getattr(entry, "label", "?"),
+    )

@@ -165,3 +165,17 @@ class TestRestorePrimaryPoolReselect:
         assert agent._route_client_ready is False
         assert agent._fallback_activated is False
         agent._swap_credential.assert_called_once()
+
+    def test_restore_stays_inert_when_retained_pool_has_no_selectable_entry(self):
+        """An attached primary pool without a usable selection cannot publish readiness."""
+        pool = MagicMock()
+        pool.provider = "openai-codex"
+        pool.select.return_value = None
+        agent = self._make_agent(pool)
+
+        with pytest.raises(RouteCommittedError, match="no selectable credential"):
+            agent._restore_primary_runtime()
+
+        assert agent._route_client_ready is False
+        assert agent._fallback_activated is False
+        pool.select.assert_called_once_with(model="gpt-5.5")

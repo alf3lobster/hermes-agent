@@ -403,6 +403,8 @@ class TestPerProviderReasoningEcho:
             "api_mode": "chat_completions",
             "api_key": "sk-test",
             "client_kwargs": {"api_key": "sk-test", "base_url": "https://gw.example.com/v1"},
+            "credential_pool": None,
+            "credential_pool_entry_id": None,
             "use_prompt_caching": True,
             "use_native_cache_layout": False,
             "reasoning_echo_flag": True,  # snapshot saved by switch_model

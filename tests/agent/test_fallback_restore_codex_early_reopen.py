@@ -9,6 +9,9 @@ import json
 import time
 from unittest.mock import MagicMock, patch
 
+import pytest
+
+from agent.route_binding import RouteCommittedError
 from run_agent import AIAgent
 
 CODEX_URL = "https://chatgpt.com/backend-api/codex"
@@ -104,15 +107,14 @@ def test_returns_to_primary_when_quota_reopens_before_declared_reset(tmp_path, m
     assert agent._fallback_activated is False
 
 
-def test_stays_on_fallback_while_quota_is_still_spent(tmp_path, monkeypatch):
+def test_committed_primary_stays_inert_while_quota_is_still_spent(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     _write_exhausted_codex_pool(tmp_path, reset_in_seconds=3 * 86400)
     agent = _fallback_agent()
     agent._emit_diagnostic_status = MagicMock()
 
-    restored, events = _restore(agent, quota_restored=False)
-    assert restored is True
-    assert events[:2] == ["commit", "probe"]
+    with pytest.raises(RouteCommittedError, match="quota probe"):
+        _restore(agent, quota_restored=False)
     assert agent._fallback_activated is False
     assert agent._route_client_ready is False
     agent._emit_diagnostic_status.assert_not_called()
