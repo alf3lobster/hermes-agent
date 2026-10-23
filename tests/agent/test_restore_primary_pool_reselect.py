@@ -1,11 +1,12 @@
 # Copyright 2025 Nous Research (Licensed under the Apache License, Version 2.0)
-"""Test that _restore_primary_runtime re-selects from the credential pool
-instead of using a stale snapshot key.
+"""Test that legacy primary restore re-selects from its retained primary pool.
 
 Bug: when a credential pool entry is revoked/marked-exhausted during a turn,
 _restore_primary_runtime restores the original (now-stale) api_key from the
-construction-time snapshot. The next turn immediately hits the same error,
-exhausting remaining entries and falling through to cross-provider fallback.
+construction-time snapshot. The next turn immediately hits the same error.
+Legacy snapshots predate embedded pool identity, so re-selection is allowed
+only from the separately retained primary-pool handle; the currently active
+pool may belong to a same-provider fallback route.
 """
 
 import time
@@ -55,7 +56,7 @@ def _build_mock_pool(entries: list[dict], *, strategy: str = "round_robin"):
 
 
 class TestRestorePrimaryPoolReselect:
-    """_restore_primary_runtime should re-select from the credential pool."""
+    """Legacy restore should re-select from the retained primary pool."""
 
     def _make_agent(self, pool):
         """Create a minimal AIAgent with the given credential pool."""
@@ -72,6 +73,7 @@ class TestRestorePrimaryPoolReselect:
             "base_url": "https://chatgpt.com/backend-api/codex",
         }
         agent._credential_pool = pool
+        agent._primary_credential_pool = pool
         agent._fallback_activated = True
         agent._fallback_index = 1
         agent._rate_limited_until = 0
