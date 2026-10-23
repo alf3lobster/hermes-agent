@@ -69,16 +69,19 @@ def recompute_init_fallback_api_mode(agent, fb_client, entry: dict[str, Any] | N
     than inheriting the unreachable primary route's API mode.
     """
     from agent.chat_completion_helpers import _fallback_api_mode_hint, _fallback_api_mode_resolved
+    from hermes_cli.providers import is_actual_route
     try:
+        client_base_url = str(getattr(fb_client, "base_url", "") or "")
         explicit, hinted_mode = _fallback_api_mode_hint(
             entry or {}, agent.provider, str((entry or {}).get("base_url") or "") or None,
         )
         agent.api_mode = (
-            hinted_mode
+            "chat_completions"
+            if is_actual_route(agent.provider, client_base_url)
+            else hinted_mode
             if explicit or hinted_mode != "chat_completions"
             else _fallback_api_mode_resolved(
-                agent, agent.provider, agent.model,
-                str(getattr(fb_client, "base_url", "") or ""),
+                agent, agent.provider, agent.model, client_base_url,
             )
         )
     except Exception as exc:

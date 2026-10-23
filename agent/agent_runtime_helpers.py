@@ -1186,6 +1186,12 @@ def _rebuild_primary_client(
         _build_anthropic_client_from_runtime(agent, rt)
     else:
         agent.client = agent._create_openai_client(dict(rt["client_kwargs"]), reason=reason, shared=True)
+    # Credential-inert route preparation deliberately replaces these mirrors with
+    # a dead placeholder. Publish the frozen snapshot values only after the real
+    # client has materialised successfully. Current snapshots already bind the
+    # exact pool entry; only legacy snapshots may need post-publication rebinding.
+    agent.api_key = rt["api_key"]
+    agent._client_kwargs = dict(rt["client_kwargs"])
     if mark_ready:
         agent._route_client_ready = True
 

@@ -22,8 +22,12 @@ def test_guard_rollback_and_streaks_are_durable_receipts(worker):
     store.set_compression_fallback_streak('owned', 4)
     store.set_compression_ineffective_count('owned', 3)
     store.set_compression_recovery_deadline('owned', deadline)
+    store.set_compression_overload_streak('owned', 2)
+    assert store.get_compression_overload_streak('owned') == 2
+    assert store.increment_compression_overload_streak('owned') == 3
     assert (db.get_compression_fallback_streak('owned'), db.get_compression_ineffective_count('owned'),
-            db.get_compression_recovery_deadline('owned')) == (4, 3, deadline)
+            db.get_compression_recovery_deadline('owned'), db.get_compression_overload_streak('owned')) == (
+                4, 3, deadline, 3)
     seq = store.journal['next_sequence']
     with pytest.raises(Exception, match='cannot restore absent'):
         mutate_worker_execution(db, **store.scope, sequence=seq, operation='compression.cooldown.restore',

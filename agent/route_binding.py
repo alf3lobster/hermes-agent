@@ -357,11 +357,13 @@ def _reinstall_runtime_snapshot_in_place(
             agent, rt, reason="restore_primary", owner=getattr(agent, "_route_owner", None)
         )
         agent._route_client_ready = True
-    agent.context_compressor.update_model(
-        model=rt["compressor_model"], context_length=rt["compressor_context_length"],
-        base_url=rt["compressor_base_url"], api_key=rt["compressor_api_key"],
-        provider=rt["compressor_provider"], api_mode=rt.get("compressor_api_mode", ""),
-    )
+    compressor = getattr(agent, "context_compressor", None)
+    if compressor is not None:
+        compressor.update_model(
+            model=rt["compressor_model"], context_length=rt["compressor_context_length"],
+            base_url=rt["compressor_base_url"], api_key=rt["compressor_api_key"],
+            provider=rt["compressor_provider"], api_mode=rt.get("compressor_api_mode", ""),
+        )
     # A staged restore cannot resolve auxiliary clients or probe providers before publication.
     if not defer_client and getattr(agent, "_compression_feasibility_checked", False) is True:
         from agent.conversation_compression import revalidate_compression_feasibility
@@ -454,10 +456,15 @@ def reinstall_primary_runtime(
         agent._route_client_ready = False
         _rebuild_primary_client(agent, rt, reason="restore_primary", owner=agent, mark_ready=False)
         _revalidate_committed_compression(agent)
-        rebind_primary_credential_pool(
-            agent, primary_provider, primary_model, matches_primary,
-            load_primary_pool, prefetched_pool, prefetched,
-        )
+        if "credential_pool" not in rt:
+            # Legacy snapshots did not bind credential identity, so retain the old
+            # post-commit discovery path. Current snapshots publish the exact pool
+            # (including an intentional None) and entry ID atomically with the route;
+            # reselecting here could widen the committed endpoint or account.
+            rebind_primary_credential_pool(
+                agent, primary_provider, primary_model, matches_primary,
+                load_primary_pool, prefetched_pool, prefetched,
+            )
         agent._primary_credential_pool = getattr(agent, "_credential_pool", None)
         agent._route_client_ready = True
     except RouteCommittedError:

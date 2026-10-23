@@ -100,6 +100,25 @@ def worker_compression_counter(db, conn, sid, payload, *, column):
     return {'value': None}
 
 
+def worker_overload_streak_get(db, conn, sid, payload):
+    _fields(payload, ())
+    row = conn.execute(
+        'SELECT compression_overload_streak FROM sessions WHERE id=?', (sid,),
+    ).fetchone()
+    return {'value': int(row[0] or 0) if row is not None else 0}
+
+
+def worker_overload_streak_increment(db, conn, sid, payload):
+    _fields(payload, ())
+    row = conn.execute(
+        'UPDATE sessions SET compression_overload_streak='
+        'COALESCE(compression_overload_streak,0)+1 WHERE id=? '
+        'RETURNING compression_overload_streak',
+        (sid,),
+    ).fetchone()
+    return {'value': int(row[0]) if row is not None else None}
+
+
 class CompressionSnapshot:
     """Reuse production read algorithms on the receipt connection, never a second handle.
 
@@ -470,6 +489,10 @@ WORKER_COMPRESSION_HANDLERS = {
     'compression.cooldown.record': worker_cooldown_record,
     'compression.cooldown.restore': worker_cooldown_restore,
     'compression.cooldown.clear': worker_cooldown_clear,
+    'compression.overload.get': worker_overload_streak_get,
+    'compression.overload.set': partial(
+        worker_compression_counter, column='compression_overload_streak'),
+    'compression.overload.increment': worker_overload_streak_increment,
     **{'compression.' + name: partial(worker_compression_counter, column=column)
        for name, column in (('fallback', 'compression_fallback_streak'),
                             ('ineffective', 'compression_ineffective_count'),

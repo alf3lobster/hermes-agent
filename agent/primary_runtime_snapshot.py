@@ -17,8 +17,9 @@ def _snapshot_primary_runtime(agent):
     # Per-turn restoration snapshot: after a fallback, the next turn restores these so the
     # preferred model gets a fresh attempt.
     _cc = agent.context_compressor
-    # Kept outside the serializable/deep-copyable runtime dict: CredentialPool owns locks,
-    # but the shared object is safe to inspect before restoration without reopening auth.json.
+    # CredentialPool owns locks, so the snapshot retains the shared object rather than
+    # copying it. Route restoration must preserve this exact pool/entry identity instead
+    # of selecting a different credential after the route has been published.
     agent._primary_credential_pool = getattr(agent, "_credential_pool", None)
     agent._primary_runtime = {
         "model": agent.model,
@@ -28,6 +29,8 @@ def _snapshot_primary_runtime(agent):
         "base_url": agent.base_url,
         "api_mode": agent.api_mode,
         "api_key": getattr(agent, "api_key", ""),
+        "credential_pool": getattr(agent, "_credential_pool", None),
+        "credential_pool_entry_id": getattr(agent, "_credential_pool_entry_id", None),
         "request_overrides": dict(getattr(agent, "request_overrides", {}) or {}),
         "fallback_tool_policy": getattr(agent, "_provider_fallback_tool_policy", "inherit"),
         "client_kwargs": dict(agent._client_kwargs),

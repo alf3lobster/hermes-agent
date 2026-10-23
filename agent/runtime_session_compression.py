@@ -150,6 +150,18 @@ class RuntimeSessionCompressionMixin:
         self._session(session_id)
         self._apply('compression.ineffective', {'value': max(0, int(count))})
 
+    def get_compression_overload_streak(self, session_id):
+        self._session(session_id)
+        return self._apply('compression.overload.get', {})['value']
+
+    def set_compression_overload_streak(self, session_id, streak):
+        self._session(session_id)
+        self._apply('compression.overload.set', {'value': max(0, int(streak))})
+
+    def increment_compression_overload_streak(self, session_id):
+        self._session(session_id)
+        return self._apply('compression.overload.increment', {})['value']
+
     def set_compression_recovery_deadline(self, session_id, deadline):
         self._session(session_id)
         try:

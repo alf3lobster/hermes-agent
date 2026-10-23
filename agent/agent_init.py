@@ -900,13 +900,15 @@ def _routed_client_kwargs(agent, fallback_model, _provider_timeout) -> Optional[
             raise RuntimeError(
                 f"post-commit init fallback client resolution failed for {_fb_provider}"
             )
+        if _fb_provider.strip().lower() == "moa":
+            from agent.moa_loop import bind_materialized_moa_runtime
+            # A MoA fallback's model is the virtual preset identity. The router's
+            # resolved model is the aggregator slot and must never replace it.
+            bind_materialized_moa_runtime(agent, str(_fb["model"]))
+            return None
         if _fb_model:
             agent.model = _fb_model
             agent._provider_fallback_route = (str(agent.model), str(agent.provider))
-        if _fb_provider.strip().lower() == "moa":
-            from agent.moa_loop import bind_materialized_moa_runtime
-            bind_materialized_moa_runtime(agent, agent.model)
-            return None
         recompute_init_fallback_api_mode(agent, _fb_client, _fb)
         agent.base_url = str(_fb_client.base_url)
         from agent.client_lifecycle import _swap_fallback_clients

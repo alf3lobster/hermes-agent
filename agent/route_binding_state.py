@@ -68,6 +68,12 @@ def rebind_primary_credential_pool(
 ) -> None:
     """Select primary credentials only after the complete primary route is already live."""
     pool = getattr(agent, "_credential_pool", None)
+    entry_id = getattr(agent, "_credential_pool_entry_id", None)
+    if pool is not None and entry_id is not None and matches_primary(pool):
+        # The published snapshot already binds this exact pool entry, and the client
+        # was rebuilt from the same frozen credential. Selecting again here could
+        # silently widen the committed route to another account or endpoint.
+        return
     if pool is None or not matches_primary(pool):
         agent._credential_pool = None
         agent._credential_pool_entry_id = None

@@ -818,13 +818,15 @@ class TestStreamingFallback:
 
         agent = AIAgent(
             model="default",
-            provider="moa",
+            provider="custom",
             api_key="test-key",
-            base_url="moa://local",
+            base_url="https://example.invalid/v1",
             quiet_mode=True,
             skip_context_files=True,
             skip_memory=True,
         )
+        agent.provider = agent.requested_provider = "moa"
+        agent.base_url = "moa://local"
         agent.api_mode = "chat_completions"
         agent._interrupt_requested = False
         agent.client = mock_client

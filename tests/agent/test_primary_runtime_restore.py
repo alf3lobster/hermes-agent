@@ -352,11 +352,11 @@ class TestRestorePrimaryRuntime:
         assert agent.provider == primary_provider
         assert agent.base_url == primary_base_url
         assert "deepseek" not in str(agent.base_url)
-        assert agent._credential_pool is primary_pool
-        load_pool.assert_called_once_with(primary_provider)
+        assert agent._credential_pool is None
+        load_pool.assert_not_called()
         agent._swap_credential.assert_not_called()
 
-    def test_restore_clears_fallback_pool_when_primary_pool_reload_fails(self):
+    def test_restore_preserves_snapshot_with_no_pool_without_reloading(self):
         """A fallback pool must never remain attached to the restored primary."""
         agent = _make_agent(
             provider="openai-api",
@@ -458,9 +458,8 @@ class TestRestorePrimaryRuntime:
         assert agent._provider_fallback_tool_policy == "inherit"
         assert agent._route_client_ready is False
 
-    def test_restore_swaps_matching_custom_pool_entry(self):
-        """Custom primary + custom:<name> entry whose base_url resolves to the
-        SAME custom key must swap (legitimate same-endpoint rotation)."""
+    def test_restore_does_not_attach_pool_absent_from_snapshot(self):
+        """A pool attached after the snapshot must not change the committed route."""
 
         class _Entry:
             provider = "custom:myllm"
@@ -494,7 +493,8 @@ class TestRestorePrimaryRuntime:
             result = agent._restore_primary_runtime()
 
         assert result is True
-        agent._swap_credential.assert_called_once()
+        assert agent._credential_pool is None
+        agent._swap_credential.assert_not_called()
 
     def test_restore_reloads_named_custom_pool_by_scoped_key(self):
         class _Entry:
@@ -543,11 +543,37 @@ class TestRestorePrimaryRuntime:
             result = agent._restore_primary_runtime()
 
         assert result is True
-        assert agent._credential_pool is primary_pool
-        load_pool.assert_called_once_with("gemini-no-filter")
-        agent._swap_credential.assert_called_once_with(primary_pool.select.return_value)
+        assert agent._credential_pool is None
+        load_pool.assert_not_called()
+        agent._swap_credential.assert_not_called()
 
-    def test_restore_named_custom_pool_wrong_endpoint_fails_closed(self):
+    def test_restore_preserves_exact_snapshotted_pool_entry_without_reselection(self):
+        from agent.primary_runtime_snapshot import _snapshot_primary_runtime
+
+        agent = _make_agent()
+        agent._swap_credential = MagicMock()
+        primary_pool = MagicMock()
+        primary_pool.provider = agent.provider
+        primary_pool.model = agent.model
+        primary_pool.select.return_value = MagicMock(entry_id="different-entry")
+        agent._credential_pool = primary_pool
+        agent._credential_pool_entry_id = "frozen-entry"
+        _snapshot_primary_runtime(agent)
+
+        agent._credential_pool = MagicMock()
+        agent._credential_pool_entry_id = "fallback-entry"
+        agent._fallback_activated = True
+        agent.provider = "deepseek"
+        agent.model = "deepseek-chat"
+        agent.base_url = "https://api.deepseek.com/v1"
+
+        assert agent._restore_primary_runtime() is True
+        assert agent._credential_pool is primary_pool
+        assert agent._credential_pool_entry_id == "frozen-entry"
+        primary_pool.select.assert_not_called()
+        agent._swap_credential.assert_not_called()
+
+    def test_restore_does_not_attach_wrong_endpoint_pool_absent_from_snapshot(self):
         pool = MagicMock()
         pool.provider = "custom:gemini-no-filter"
         agent = _make_agent(
@@ -575,7 +601,7 @@ class TestRestorePrimaryRuntime:
 
         assert result is True
         assert agent._credential_pool is None
-        load_pool.assert_called_once_with("gemini-no-filter")
+        load_pool.assert_not_called()
         agent._swap_credential.assert_not_called()
 
 

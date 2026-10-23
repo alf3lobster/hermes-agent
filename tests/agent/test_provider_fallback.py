@@ -125,7 +125,6 @@ class TestFallbackChainAdvancement:
         agent = _make_agent(fallback_model=fbs)
         with patch("agent.auxiliary_client.resolve_provider_client") as mock_rpc:
             mock_rpc.side_effect = [
-                (None, None),                    # broken provider
                 (_mock_client(), "gpt-4o"),       # fallback succeeds
             ]
             assert agent._try_activate_fallback(FailoverReason.rate_limit) is True
@@ -145,26 +144,30 @@ class TestFallbackChainAdvancement:
         ])
         agent.provider = "nous"
         with patch("agent.auxiliary_client.resolve_provider_client",
-                   side_effect=[(None, None), (_mock_client(base_url="https://api.z.ai/v1"), "glm-5.2")]):
+                   return_value=(_mock_client(base_url="https://api.z.ai/v1"), "glm-5.2")):
             assert agent._try_activate_fallback(FailoverReason.rate_limit) is True
 
         assert [(kw["from_provider"], kw["to_provider"]) for kw in calls] == [("nous", "zai")]
         assert fallback_fields(**calls[0])["error_class"] == "rate_limit"
 
-    def test_skips_provider_that_raises_to_next(self):
-        """If resolve_provider_client raises, skip to next in chain."""
+    def test_postcommit_provider_failure_does_not_advance_to_next(self):
+        """Once a recognized route is published, failed maintenance leaves it inert."""
         fbs = [
             {"provider": "broken", "model": "nope"},
             {"provider": "openai", "model": "gpt-4o"},
+            {"provider": "deepseek", "model": "deepseek-v4-flash"},
         ]
         agent = _make_agent(fallback_model=fbs)
         with patch("agent.auxiliary_client.resolve_provider_client") as mock_rpc:
             mock_rpc.side_effect = [
                 RuntimeError("auth failed"),
-                (_mock_client(), "gpt-4o"),
+                (_mock_client(), "deepseek-v4-flash"),
             ]
-            assert agent._try_activate_fallback() is True
+            assert agent._try_activate_fallback() is False
             assert agent.model == "gpt-4o"
+            assert agent._route_client_ready is False
+            assert agent._fallback_index == len(agent._fallback_chain)
+            assert mock_rpc.call_count == 1
 
     def test_resolves_key_env_for_fallback_provider(self):
         fbs = [
@@ -511,6 +514,19 @@ def _assert_bound_to_moa_preset(agent, preset="default"):
     assert _moa_client_consumes_prepared_request(agent.client)
 
 
+def _moa_slot_runtime(requested, target_model=None, **_kwargs):
+    """Credential-free deterministic runtime for every slot in the test preset."""
+    assert requested == "xai"
+    assert target_model in {"grok-4-fast", "grok-4.6"}
+    return {
+        "provider": requested,
+        "model": target_model,
+        "base_url": "https://api.x.ai/v1",
+        "api_key": "xai-key",
+        "api_mode": "chat_completions",
+    }
+
+
 class TestMoaPresetFallback:
     def test_runtime_fallback_to_moa_preset_binds_the_facade(self, tmp_path, monkeypatch):
         """#112525 / #112623: a ``{provider: moa, model: <preset>}`` fallback entry activates the
@@ -519,8 +535,12 @@ class TestMoaPresetFallback:
         _write_moa_home(tmp_path, monkeypatch)
         agent = _make_agent(fallback_model={"provider": "moa", "model": "default"})
         aggregator_client = _mock_client(base_url="https://api.x.ai/v1/", api_key="xai-key")
-        with patch("agent.auxiliary_client.resolve_provider_client",
-                   return_value=(aggregator_client, "grok-4.6")):
+        with (
+            patch("agent.auxiliary_client.resolve_provider_client",
+                  return_value=(aggregator_client, "grok-4.6")),
+            patch("hermes_cli.runtime_provider.resolve_runtime_provider",
+                  side_effect=_moa_slot_runtime),
+        ):
             assert agent._try_activate_fallback() is True
         _assert_bound_to_moa_preset(agent)
         assert agent.client is not aggregator_client
@@ -539,6 +559,8 @@ class TestMoaPresetFallback:
             patch("model_tools.get_tool_definitions", return_value=[]),
             patch("model_tools.check_toolset_requirements", return_value={}),
             patch("agent.auxiliary_client.resolve_provider_client", side_effect=_route),
+            patch("hermes_cli.runtime_provider.resolve_runtime_provider",
+                  side_effect=_moa_slot_runtime),
         ):
             agent = AIAgent(model="anthropic/claude-sonnet-4.5", provider="openrouter",
                             quiet_mode=True, skip_context_files=True, skip_memory=True,

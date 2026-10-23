@@ -527,9 +527,8 @@ def test_a_snapshot_without_recorded_ownership_keeps_its_own_credential(tmp_path
 
 
 @pytest.mark.parametrize("builder", SNAPSHOT_BUILDERS)
-def test_restore_still_reselects_the_owners_own_pool_row(tmp_path, monkeypatch, builder):
-    """Recorded ownership scopes the pool, it doesn't drop it: the entry's ``hermes auth add`` row
-    replaces a stale snapshot key on restore, and the built-in's row stays out."""
+def test_restore_does_not_attach_pool_absent_from_snapshot(tmp_path, monkeypatch, builder):
+    """A later pool row must not replace the credential frozen into the route snapshot."""
     manual = {"id": "m1", "label": "manual", "auth_type": "api_key", "priority": 0, "source": "manual",
               "access_token": MANUAL_KEY}
     _home(tmp_path, monkeypatch, "deepseek", "DEEPSEEK_API_KEY", pool={"deepseek": [manual]})
@@ -539,5 +538,5 @@ def test_restore_still_reselects_the_owners_own_pool_row(tmp_path, monkeypatch, 
     agent = _snapshotted_agent(builder, initial, "custom:deepseek", api_key="stale-snapshot-key-0123")
     agent._swap_credential = lambda entry: setattr(agent, "api_key", entry.runtime_api_key)
     assert agent._restore_primary_runtime() is True
-    assert agent.api_key == MANUAL_KEY
-    assert {e.access_token for e in agent._credential_pool.entries()} == {MANUAL_KEY}
+    assert agent.api_key == "stale-snapshot-key-0123"
+    assert agent._credential_pool is None
