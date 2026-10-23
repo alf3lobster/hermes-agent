@@ -924,7 +924,7 @@ def test_primary_moa_rebuild_materializes_slots_before_readiness(monkeypatch):
 
     agent_runtime_helpers._rebuild_primary_client(
         agent,
-        {},
+        {"api_key": "", "client_kwargs": {}},
         reason="restore_primary",
         owner=agent,
     )
