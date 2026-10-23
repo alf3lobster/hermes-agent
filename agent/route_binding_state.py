@@ -10,7 +10,8 @@ logger = logging.getLogger(__name__)
 
 def require_route_client_ready(agent: Any) -> None:
     """Refuse provider/client paths while a published route is incomplete."""
-    if getattr(agent, "_route_client_ready", True) is not True:
+    readiness = getattr(agent, "__dict__", {}).get("_route_client_ready", True)
+    if readiness is not True:
         raise RuntimeError("route client is not ready")
 
 
