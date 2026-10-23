@@ -67,19 +67,15 @@ def rebind_primary_credential_pool(
     prefetched: bool,
 ) -> None:
     """Select primary credentials only after the complete primary route is already live."""
-    pool = getattr(agent, "_credential_pool", None)
-    entry_id = getattr(agent, "_credential_pool_entry_id", None)
-    if pool is not None and entry_id is not None and matches_primary(pool):
-        # The published snapshot already binds this exact pool entry, and the client
-        # was rebuilt from the same frozen credential. Selecting again here could
-        # silently widen the committed route to another account or endpoint.
-        return
-    if pool is None or not matches_primary(pool):
-        agent._credential_pool = None
-        agent._credential_pool_entry_id = None
-        agent._credential_pool = prefetched_pool if prefetched else load_primary_pool()
+    # This helper is used only for legacy snapshots, which carry no frozen pool
+    # authority.  Never trust the currently attached pool merely because its provider
+    # matches: a same-provider fallback may own a different account/entry ID.
+    agent._credential_pool = None
     agent._credential_pool_entry_id = None
-    pool = getattr(agent, "_credential_pool", None)
+    pool = prefetched_pool if prefetched else load_primary_pool()
+    if pool is None or not matches_primary(pool):
+        return
+    agent._credential_pool = pool
     entry = pool.select(model=primary_model or None) if pool is not None else None
     if entry is None or not (
         getattr(entry, "runtime_api_key", None) or getattr(entry, "access_token", "")

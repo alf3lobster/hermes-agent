@@ -1168,7 +1168,8 @@ def _rebuild_primary_client(
     agent, rt: dict[str, Any], *, reason: str, owner: Any = None, mark_ready: bool = True,
 ) -> None:
     """Rebuild the primary client from a ``_primary_runtime`` snapshot (MoA facade / native Anthropic / OpenAI wire)."""
-    if (agent.provider or "").strip().lower() == "moa":
+    is_moa = (agent.provider or "").strip().lower() == "moa"
+    if is_moa:
         # MoA has empty client_kwargs; rebuild via the shared facade factory so the
         # reference_callback relay survives recovery.
         from agent.moa_loop import build_moa_facade, materialize_moa_slot_runtimes
@@ -1190,8 +1191,14 @@ def _rebuild_primary_client(
     # a dead placeholder. Publish the frozen snapshot values only after the real
     # client has materialised successfully. Current snapshots already bind the
     # exact pool entry; only legacy snapshots may need post-publication rebinding.
-    agent.api_key = rt["api_key"]
-    agent._client_kwargs = dict(rt["client_kwargs"])
+    if is_moa:
+        # Legacy MoA snapshots predate OpenAI-wire mirror fields. The facade and
+        # materialised slots own its credentials, so missing mirrors mean empty.
+        agent.api_key = rt.get("api_key", "")
+        agent._client_kwargs = dict(rt.get("client_kwargs") or {})
+    else:
+        agent.api_key = rt["api_key"]
+        agent._client_kwargs = dict(rt["client_kwargs"])
     if mark_ready:
         agent._route_client_ready = True
 
@@ -1303,12 +1310,16 @@ def _primary_reset_gate_blocks(agent, rt, primary_provider, matches_primary, ret
     Availability helpers can resynchronise, heal, prune, probe, or persist. Route admission
     therefore treats the pool as an opaque post-commit maintenance handle.
     """
-    pool = (
-        retained_pool
-        if retained_pool is not None and matches_primary(retained_pool)
-        else getattr(agent, "_credential_pool", None)
-    )
-    if pool is None or not matches_primary(pool):
+    pool = None
+    if retained_pool is not None and matches_primary(retained_pool):
+        pool = retained_pool
+    elif "credential_pool" in (rt or {}):
+        # Current snapshots bind the live pool handle explicitly. Legacy snapshots do
+        # not: their currently attached same-provider pool may belong to the fallback.
+        current_pool = getattr(agent, "_credential_pool", None)
+        if current_pool is not None and matches_primary(current_pool):
+            pool = current_pool
+    if pool is None:
         return False, None, False
     return False, pool, True
 

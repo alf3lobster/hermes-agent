@@ -153,3 +153,39 @@ def test_cli_restore_model_runtime_prefers_primary_runtime():
     assert stub.agent.model == "old/model"
     assert stub.agent.provider == "openrouter"
     assert stub.agent.calls == []
+
+
+def test_cli_one_turn_snapshot_preserves_noncopyable_pool_identity():
+    import threading
+
+    import cli as cli_mod
+
+    pool = SimpleNamespace(lock=threading.RLock())
+
+    class Agent(_FakeAgent):
+        _rate_limited_until = 0
+
+        def __init__(self):
+            super().__init__()
+            self._primary_runtime = {
+                "model": self.model,
+                "provider": self.provider,
+                "credential_pool": pool,
+                "request_overrides": {"extra_body": {"reasoning": {"effort": "high"}}},
+            }
+
+        def _restore_primary_runtime(self):
+            assert self._primary_runtime["credential_pool"] is pool
+            return True
+
+    stub = _StubCLI()
+    stub.agent = Agent()
+
+    snapshot = cli_mod.HermesCLI._snapshot_model_runtime(stub)
+    assert snapshot["agent_primary_runtime"]["credential_pool"] is pool
+    assert snapshot["agent_primary_runtime"]["request_overrides"] is not stub.agent._primary_runtime["request_overrides"]
+
+    stub.agent._primary_runtime = {"model": "temporary"}
+    cli_mod.HermesCLI._restore_model_runtime_snapshot(stub, snapshot)
+
+    assert stub.agent._primary_runtime["credential_pool"] is pool

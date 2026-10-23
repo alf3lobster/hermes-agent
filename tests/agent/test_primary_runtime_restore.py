@@ -573,6 +573,64 @@ class TestRestorePrimaryRuntime:
         primary_pool.select.assert_not_called()
         agent._swap_credential.assert_not_called()
 
+    def test_legacy_restore_rebinds_same_provider_fallback_entry(self):
+        """Legacy snapshots have no frozen pool authority; same-provider fallback state is not primary."""
+
+        class _Entry:
+            provider = "openrouter"
+            id = "primary-entry"
+            label = "primary"
+            runtime_api_key = "primary-key"
+            runtime_base_url = "https://openrouter.ai/api/v1"
+            access_token = "primary-key"
+
+        agent = _make_agent(provider="openrouter")
+        agent._primary_runtime.pop("credential_pool", None)
+        agent._primary_runtime.pop("credential_pool_entry_id", None)
+        agent._primary_credential_pool = None
+        agent._fallback_activated = True
+
+        fallback_pool = MagicMock()
+        fallback_pool.provider = "openrouter"
+        agent._credential_pool = fallback_pool
+        agent._credential_pool_entry_id = "fallback-entry"
+        agent._swap_credential = MagicMock()
+
+        primary_pool = MagicMock()
+        primary_pool.provider = "openrouter"
+        primary_pool.select.return_value = _Entry()
+
+        with (
+            patch("agent.credential_pool.load_pool", return_value=primary_pool) as load_pool,
+            patch("agent.process_bootstrap.OpenAI", return_value=MagicMock()),
+        ):
+            assert agent._restore_primary_runtime() is True
+
+        load_pool.assert_called_once()
+        primary_pool.select.assert_called_once_with(model=None)
+        agent._swap_credential.assert_called_once()
+        assert agent._credential_pool is primary_pool
+
+    def test_runtime_snapshot_clone_preserves_opaque_pool_and_copies_mutables(self):
+        import threading
+        from types import SimpleNamespace
+
+        from agent.primary_runtime_snapshot import clone_primary_runtime_snapshot
+
+        pool = SimpleNamespace(lock=threading.RLock())
+        runtime = {
+            "credential_pool": pool,
+            "credential_pool_entry_id": "primary-entry",
+            "request_overrides": {"extra_body": {"reasoning": {"effort": "high"}}},
+        }
+
+        cloned = clone_primary_runtime_snapshot(runtime)
+
+        assert cloned is not runtime
+        assert cloned["credential_pool"] is pool
+        assert cloned["request_overrides"] == runtime["request_overrides"]
+        assert cloned["request_overrides"] is not runtime["request_overrides"]
+
     def test_restore_does_not_attach_wrong_endpoint_pool_absent_from_snapshot(self):
         pool = MagicMock()
         pool.provider = "custom:gemini-no-filter"

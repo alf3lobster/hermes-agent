@@ -17,9 +17,11 @@ _RUNTIME_KEYS = ("model", "provider", "api_key", "base_url", "api_mode")
 
 def _snapshot_agent_model_runtime(agent) -> dict:
     """Capture the current agent model runtime for a one-turn restore."""
+    from agent.primary_runtime_snapshot import clone_primary_runtime_snapshot
+
     return {**{k: getattr(agent, k, "") for k in _RUNTIME_KEYS},
             "reasoning_config": copy.deepcopy(getattr(agent, "reasoning_config", None)),
-            "primary_runtime": copy.deepcopy(getattr(agent, "_primary_runtime", None))}
+            "primary_runtime": clone_primary_runtime_snapshot(getattr(agent, "_primary_runtime", None))}
 
 
 def _restore_agent_model_runtime(agent, snapshot: dict | None) -> None:
@@ -33,7 +35,8 @@ def _restore_agent_model_runtime(agent, snapshot: dict | None) -> None:
     primary = snapshot.get("primary_runtime")
     if primary and hasattr(agent, "_restore_primary_runtime"):
         try:
-            agent._primary_runtime = copy.deepcopy(primary)
+            from agent.primary_runtime_snapshot import clone_primary_runtime_snapshot
+            agent._primary_runtime = clone_primary_runtime_snapshot(primary)
             agent._fallback_activated = True
             agent._rate_limited_until = 0
             if agent._restore_primary_runtime():

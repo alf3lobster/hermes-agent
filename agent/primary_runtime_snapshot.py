@@ -8,9 +8,31 @@ removed mid-session can't hand the session another account's key.
 
 from __future__ import annotations
 
+import copy
 from typing import Any
 
 from agent.custom_entry_pool import SNAPSHOT_OWNER_KEY, runtime_entry_owner
+
+
+_MISSING = object()
+
+
+def clone_primary_runtime_snapshot(runtime: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Copy mutable snapshot state while retaining the opaque credential-pool handle.
+
+    ``CredentialPool`` owns an ``RLock`` and deliberately represents shared runtime
+    authority.  It cannot be deep-copied, and replacing it would break the exact
+    pool/entry binding that restoration must preserve.
+    """
+    if runtime is None:
+        return None
+    pool = runtime.get("credential_pool", _MISSING)
+    clone_source = dict(runtime)
+    clone_source.pop("credential_pool", None)
+    cloned = copy.deepcopy(clone_source)
+    if pool is not _MISSING:
+        cloned["credential_pool"] = pool
+    return cloned
 
 
 def _snapshot_primary_runtime(agent):

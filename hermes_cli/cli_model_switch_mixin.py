@@ -686,12 +686,14 @@ class CLIModelSwitchMixin:
 
     def _snapshot_model_runtime(self) -> dict:
         """Capture current CLI and agent model runtime for one-turn restore."""
+        from agent.primary_runtime_snapshot import clone_primary_runtime_snapshot
+
         agent = getattr(self, "agent", None)
         # ``reasoning_config`` is a mutable dict: deepcopy it so a later in-place edit cannot alias the snapshot.
         return {
             **_runtime_fields(self),
             "reasoning_config": copy.deepcopy(getattr(self, "reasoning_config", None)),
-            "agent_primary_runtime": copy.deepcopy(
+            "agent_primary_runtime": clone_primary_runtime_snapshot(
                 getattr(agent, "_primary_runtime", None)
             ) if agent is not None else None}
 
@@ -717,7 +719,8 @@ class CLIModelSwitchMixin:
         primary = snapshot.get("agent_primary_runtime")
         if primary and hasattr(agent, "_restore_primary_runtime"):
             try:
-                agent._primary_runtime = copy.deepcopy(primary)
+                from agent.primary_runtime_snapshot import clone_primary_runtime_snapshot
+                agent._primary_runtime = clone_primary_runtime_snapshot(primary)
                 agent._fallback_activated = True
                 agent._rate_limited_until = 0
                 if agent._restore_primary_runtime():

@@ -62,3 +62,40 @@ def test_reasoning_flag_with_global_writes_config_and_drops_the_pin(_quiet_switc
 
     with pytest.raises(ValueError):
         server._apply_model_switch("sid", {"agent": _Agent()}, "new/model --reasoning turbo")
+
+
+def test_tui_one_turn_snapshot_preserves_noncopyable_pool_identity():
+    import threading
+
+    from tui_gateway import model_switch
+
+    pool = SimpleNamespace(lock=threading.RLock())
+    agent = SimpleNamespace(
+        model="old/model",
+        provider="openrouter",
+        api_key="key",
+        base_url="https://openrouter.ai/api/v1",
+        api_mode="chat_completions",
+        reasoning_config={"enabled": True, "effort": "medium"},
+        _primary_runtime={
+            "model": "old/model",
+            "provider": "openrouter",
+            "credential_pool": pool,
+            "request_overrides": {"extra_body": {"reasoning": {"effort": "high"}}},
+        },
+        _rate_limited_until=0,
+    )
+
+    snapshot = model_switch._snapshot_agent_model_runtime(agent)
+    assert snapshot["primary_runtime"]["credential_pool"] is pool
+    assert snapshot["primary_runtime"]["request_overrides"] is not agent._primary_runtime["request_overrides"]
+
+    def restore_primary():
+        assert agent._primary_runtime["credential_pool"] is pool
+        return True
+
+    agent._primary_runtime = {"model": "temporary"}
+    agent._restore_primary_runtime = restore_primary
+    model_switch._restore_agent_model_runtime(agent, snapshot)
+
+    assert agent._primary_runtime["credential_pool"] is pool
