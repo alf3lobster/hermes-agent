@@ -31,6 +31,7 @@ def test_failure_notice_reaches_the_queue_while_the_batch_keeps_running_and_form
     assert evt["type"] == "async_delegation" and evt["task_failure_notice"] is True
     assert (evt["session_key"], evt["origin_ui_session_id"], evt["parent_session_id"]) == ("sk", "ui", "root")
     text = format_process_notification(evt)
+    assert text is not None
     assert text.startswith("[ASYNC DELEGATION TASK FAILED — deleg_x, task 2/3]")
     assert "Task: b" in text and "401 authentication_error" in text and "/tmp/live/task-1.log" in text
     assert "consolidated results will still arrive" in text
