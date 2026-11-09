@@ -110,9 +110,8 @@ def _delegation_config() -> dict:
 
 
 def _delegation_model_not_found(results, config) -> bool:
-    """True when a result reflects a config-level model_not_found rejection: needs a
-    model-not-found phrase AND the currently-configured model name in the same text,
-    so a stale task failing on a removed model is not mis-attributed to the config."""
+    """True when every result carries a structured model-not-found failure and names
+    the configured model. Free-form summaries are corroboration, never authority."""
     model = str((config or {}).get("model") or "").lower()
     if not model:
         return False
@@ -121,6 +120,7 @@ def _delegation_model_not_found(results, config) -> bool:
              for r in results or []]
     return bool(texts) and all(
         str(result.get("status") or "").lower() in _MODEL_REJECTION_STATUSES
+        and str(result.get("failure_reason") or "").lower() == "model_not_found"
         and model in text
         and any(pattern in text for pattern in patterns)
         for result, text in zip(results, texts, strict=True)
@@ -136,15 +136,14 @@ def _delegation_model_not_found_notice(results, *, is_batch: bool) -> list[str] 
     provider = config.get("provider") or "configured provider"
     lines = [
         "⚠ SUBAGENT MODEL REJECTED: the configured Subagent Model "
-        f'"{model}" was rejected by provider "{provider}" '
-        "(HTTP 400: not a valid model ID).",
-        ("Every task in this batch failed for this reason before doing any work."
-         if is_batch else "This task failed for this reason before doing any work."),
+        f'"{model}" ended with a classified model-not-found failure at provider "{provider}".',
+        ("Every reported task in this batch ended with this classified failure."
+         if is_batch else "This task ended with this classified failure."),
         "Configuration reference: Settings → Advanced → Subagent Model; CLI key: delegation.model."]
     with suppress(Exception):
         from hermes_cli.fallback_config import get_fallback_chain
         if not get_fallback_chain(config):
-            lines.append("No fallback chain is configured, so no failover was attempted.")
+            lines.append("No fallback chain is configured.")
     return lines
 
 

@@ -696,23 +696,24 @@ def continue_codex_incomplete(
 
     if not reasoning_only:
         # Preserve the local pre-v0.23 contract for visible-but-incomplete responses: after
-        # three continuations, remove Codex-only replay scaffolding and give a configured
-        # fallback one bounded call before returning the partial sentinel.
-        while messages:
-            tail = messages[-1]
-            if (
-                isinstance(tail, dict)
-                and tail.get("role") == "assistant"
-                and tail.get("finish_reason") == "incomplete"
-            ) or (
-                isinstance(tail, dict)
-                and tail.get("role") == "user"
-                and tail.get("content") == _CODEX_INCOMPLETE_NUDGE
-            ):
-                messages.pop()
-                continue
-            break
+        # three continuations, give a configured fallback one bounded call. Remove Codex-only
+        # replay scaffolding only after the handoff is accepted; otherwise the terminal partial
+        # result must retain the visible answer.
         if agent._try_activate_fallback(reason=FailoverReason.rate_limit):
+            while messages:
+                tail = messages[-1]
+                if (
+                    isinstance(tail, dict)
+                    and tail.get("role") == "assistant"
+                    and tail.get("finish_reason") == "incomplete"
+                ) or (
+                    isinstance(tail, dict)
+                    and tail.get("role") == "user"
+                    and tail.get("content") == _CODEX_INCOMPLETE_NUDGE
+                ):
+                    messages.pop()
+                    continue
+                break
             if api_call_count >= agent.max_iterations or agent.iteration_budget.remaining <= 0:
                 agent._budget_grace_call = True
             agent._codex_incomplete_retries = 0

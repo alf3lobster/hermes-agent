@@ -54,3 +54,43 @@ def test_string_false_disables_per_turn_extraction():
     provider = _provider({"auto_extract": "false", "auto_extract_trigger": "per_turn"})
     provider.sync_turn("remember this", "ack", session_id="s")
     assert provider._turn_counts == {}
+
+
+def test_session_dry_run_blocks_short_conversation_regex_writes(tmp_path):
+    provider = _provider({
+        "db_path": str(tmp_path / "memory.db"),
+        "auto_extract_dry_run": True,
+        "auto_extract_min_turns": 5,
+    })
+    provider.initialize("session")
+
+    provider._auto_extract_facts([
+        {"role": "user", "content": "I prefer concise updates with clear evidence."},
+    ])
+
+    assert provider._store is not None
+    count = provider._store._conn.execute("SELECT COUNT(*) FROM facts").fetchone()[0]
+    assert count == 0
+
+
+def test_session_dry_run_blocks_regex_writes_after_model_error(tmp_path, monkeypatch):
+    provider = _provider({
+        "db_path": str(tmp_path / "memory.db"),
+        "auto_extract_dry_run": True,
+        "auto_extract_min_turns": 2,
+    })
+    provider.initialize("session")
+    monkeypatch.setattr(
+        provider,
+        "_call_extraction_model",
+        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("provider unavailable")),
+    )
+
+    provider._auto_extract_facts([
+        {"role": "user", "content": "I prefer concise updates with clear evidence."},
+        {"role": "assistant", "content": "Understood."},
+    ])
+
+    assert provider._store is not None
+    count = provider._store._conn.execute("SELECT COUNT(*) FROM facts").fetchone()[0]
+    assert count == 0

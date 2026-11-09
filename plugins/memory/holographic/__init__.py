@@ -667,7 +667,7 @@ Output only FACT lines. No preamble, no explanation."""
                 relevant_count,
                 min_turns,
             )
-            self._auto_extract_facts_regex(messages)
+            self._auto_extract_facts_regex(messages, dry_run=dry_run)
             return
 
         try:
@@ -710,9 +710,9 @@ Output only FACT lines. No preamble, no explanation."""
             logger.warning(
                 "Holographic LLM auto-extraction failed (%s), falling back to regex", exc
             )
-            self._auto_extract_facts_regex(messages)
+            self._auto_extract_facts_regex(messages, dry_run=dry_run)
 
-    def _auto_extract_facts_regex(self, messages: list) -> None:
+    def _auto_extract_facts_regex(self, messages: list, *, dry_run: bool = False) -> None:
         """Regex-based fallback extraction — sparse but zero-dependency."""
         # Local import (pattern used in initialize()): the compressor module is
         # heavier than this plugin and is only needed when auto_extract is on.
@@ -760,6 +760,13 @@ Output only FACT lines. No preamble, no explanation."""
                 continue
             for pattern in _PREF_PATTERNS:
                 if pattern.search(content):
+                    if dry_run:
+                        logger.info(
+                            "Holographic regex fallback [DRY RUN] would store: [user_pref] %s",
+                            content[:400],
+                        )
+                        extracted += 1
+                        break
                     try:
                         self._store.add_fact(content[:400], category="user_pref")
                         extracted += 1
@@ -768,13 +775,20 @@ Output only FACT lines. No preamble, no explanation."""
                     break
             for pattern in _DECISION_PATTERNS:
                 if pattern.search(content):
+                    if dry_run:
+                        logger.info(
+                            "Holographic regex fallback [DRY RUN] would store: [project] %s",
+                            content[:400],
+                        )
+                        extracted += 1
+                        break
                     try:
                         self._store.add_fact(content[:400], category="project")
                         extracted += 1
                     except Exception:
                         pass
                     break
-        if extracted:
+        if extracted and not dry_run:
             logger.info("Holographic regex fallback extracted %d facts", extracted)
 
 

@@ -856,6 +856,7 @@ def test_batch_model_rejection_notice_prepended(monkeypatch):
             {
                 "task_index": 0,
                 "status": "failed",
+                "failure_reason": "model_not_found",
                 "summary": rejection,
                 "api_calls": 1,
                 "duration_seconds": 0.74,
@@ -865,6 +866,7 @@ def test_batch_model_rejection_notice_prepended(monkeypatch):
             {
                 "task_index": 1,
                 "status": "failed",
+                "failure_reason": "model_not_found",
                 "summary": rejection,
                 "api_calls": 1,
                 "duration_seconds": 0.71,
@@ -971,14 +973,16 @@ def test_single_model_rejection_notice_uses_single_task_language(monkeypatch):
         results=[{
             "task_index": 0,
             "status": "failed",
+            "failure_reason": "model_not_found",
             "error": rejection,
         }],
         model="upstage/solar-pro-4",
     ))
     assert text is not None
     assert "SUBAGENT MODEL REJECTED" in text
-    assert "This task failed for this reason before doing any work" in text
-    assert "Every task in this batch failed" not in text
+    assert "This task ended with this classified failure" in text
+    assert "before doing any work" not in text
+    assert "Every reported task in this batch" not in text
 
 
 def test_model_rejection_notice_requires_failure_status(monkeypatch):

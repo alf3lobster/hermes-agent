@@ -3048,6 +3048,7 @@ def test_model_not_found_notice_single_failure_once(monkeypatch):
         {
             "task_index": 0,
             "status": "failed",
+            "failure_reason": "model_not_found",
             "exit_reason": "error",
             "goal": "Create bridge module",
             "error": "HTTP 400: upstage/solar-pro-4 is not a valid model ID",
@@ -3107,6 +3108,31 @@ def test_model_not_found_notice_absent_for_non_model_errors(monkeypatch):
     assert "SUBAGENT MODEL REJECTED" not in text
 
 
+def test_model_not_found_notice_ignores_historical_diagnostic_after_timeout(monkeypatch):
+    evt = _make_delegation_batch_evt([
+        {
+            "task_index": 0,
+            "status": "timeout",
+            "exit_reason": "timeout",
+            "failure_reason": "timeout",
+            "api_calls": 4,
+            "goal": "A",
+            "error": "tool execution timed out",
+            "summary": (
+                "Completed useful work before timing out. An earlier diagnostic said "
+                "HTTP 400: upstage/solar-pro-4 is not a valid model ID."
+            ),
+        }
+    ])
+    _patch_delegation_config(monkeypatch)
+
+    text = _format_async(evt)
+
+    assert "SUBAGENT MODEL REJECTED" not in text
+    assert "before doing any work" not in text
+    assert "no failover was attempted" not in text
+
+
 def test_model_not_found_notice_absent_when_configured_model_not_named(monkeypatch):
     evt = _make_delegation_batch_evt([
         {
@@ -3130,6 +3156,7 @@ def test_model_not_found_notice_single_dispatch(monkeypatch):
         "goal": "task A",
         "model": "upstage/solar-pro-4",
         "status": "failed",
+        "failure_reason": "model_not_found",
         "error": "HTTP 400: upstage/solar-pro-4 is not a valid model ID",
         "summary": "HTTP 400: upstage/solar-pro-4 is not a valid model ID",
     }
@@ -3144,6 +3171,7 @@ def test_model_not_found_notice_absent_when_fallback_chain_configured(monkeypatc
         {
             "task_index": 0,
             "status": "failed",
+            "failure_reason": "model_not_found",
             "goal": "A",
             "error": "HTTP 400: upstage/solar-pro-4 is not a valid model ID",
         }

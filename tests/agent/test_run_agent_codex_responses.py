@@ -1886,6 +1886,26 @@ def test_codex_incomplete_exhaustion_activates_fallback_and_cleans_replay_state(
     )
 
 
+def test_codex_incomplete_exhaustion_without_fallback_preserves_visible_partial(monkeypatch):
+    """A refused fallback must not erase the partial answer returned and persisted."""
+    agent = _build_agent(monkeypatch)
+    responses = [
+        _codex_incomplete_with_reasoning("Visible partial answer.", "rs_1"),
+        _codex_incomplete_with_reasoning("Visible partial answer.", "rs_2"),
+        _codex_incomplete_with_reasoning("Visible partial answer.", "rs_3"),
+    ]
+    monkeypatch.setattr(agent, "_interruptible_api_call", lambda api_kwargs: responses.pop(0))
+    monkeypatch.setattr(agent, "_try_activate_fallback", lambda **kwargs: False)
+    persisted = []
+    monkeypatch.setattr(agent, "_persist_session", lambda messages, history=None: persisted.append(list(messages)))
+
+    result = agent.run_conversation("retain the partial answer")
+
+    assert result["partial"] is True
+    assert any(m.get("content") == "Visible partial answer." for m in result["messages"])
+    assert persisted and any(m.get("content") == "Visible partial answer." for m in persisted[-1])
+
+
 def test_normalize_codex_response_marks_commentary_only_message_as_incomplete(monkeypatch):
     _build_agent(monkeypatch)
     from agent.codex_responses_adapter import _normalize_codex_response
