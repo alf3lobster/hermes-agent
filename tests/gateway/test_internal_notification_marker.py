@@ -118,14 +118,23 @@ def _user_entries(calls):
 @pytest.mark.asyncio
 async def test_internal_event_threads_marker_into_agent_run(monkeypatch, tmp_path):
     runner = _bootstrap(monkeypatch, tmp_path)
-    runner._run_agent = AsyncMock(
-        return_value={
+    captured_notes = []
+
+    async def fake_run_agent(**_kwargs):
+        # v0.23 clears turn-scoped state during finalization.  Observe the notes at
+        # the runner seam where production's run_sync consumes them, rather than
+        # after the turn has correctly torn them down.
+        captured_notes.extend(runner._consume_pending_turn_sidecar_notes(SESSION_KEY))
+        return {
             "final_response": "ack",
             "messages": [],
             "tools": [],
             "history_offset": 0,
             "last_prompt_tokens": 0,
         }
+
+    runner._run_agent = AsyncMock(
+        side_effect=fake_run_agent
     )
 
     await runner._handle_message_with_agent(
@@ -135,10 +144,9 @@ async def test_internal_event_threads_marker_into_agent_run(monkeypatch, tmp_pat
 
     kwargs = runner._run_agent.call_args.kwargs
     assert kwargs["persist_user_display_kind"] == "internal_notification"
-    notes = runner._consume_pending_turn_sidecar_notes(SESSION_KEY)
-    assert len(notes) == 1
-    assert "not a new user instruction" in notes[0].lower()
-    assert "must not start unrelated work" in notes[0].lower()
+    assert len(captured_notes) == 1
+    assert "not a new user instruction" in captured_notes[0].lower()
+    assert "must not start unrelated work" in captured_notes[0].lower()
 
 
 @pytest.mark.asyncio

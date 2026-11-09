@@ -212,6 +212,11 @@ class GatewayTurnMixin(GatewayBackgroundMixin, GatewayTurnPrepareMixin, GatewayT
         resolved = await self._hmwa_resolve_session(event, source)
         if resolved is None:
             return
+        if isinstance(resolved, str):
+            # Deterministic routing refusal (for example, a Telegram topic binding that
+            # cannot be verified durably).  Do not let an explanatory refusal fall
+            # through to tuple unpacking or, worse, continue into the model.
+            return resolved
         source, session_entry, session_key = resolved
         prepared, _session_env_tokens = await self._hmwa_prepare_turn(
             event, source, session_entry, session_key, _quick_key, run_generation,

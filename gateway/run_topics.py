@@ -153,7 +153,9 @@ class GatewayTopicThreadsMixin:
             profile_name=self._telegram_topic_profile_name(source),
         )
 
-    def _sync_telegram_topic_binding(self, source: SessionSource, session_entry, *, reason: str) -> None:
+    def _sync_telegram_topic_binding(
+        self, source: SessionSource, session_entry, *, reason: str, strict: bool = False,
+    ) -> None:
         """Update the topic binding to ``session_entry.session_id``: a stale binding after a mid-turn
         compression rotation reloads the oversized parent next message, retriggering compression.
 
@@ -165,6 +167,8 @@ class GatewayTopicThreadsMixin:
         try:
             self._record_telegram_topic_binding(source, session_entry)
         except Exception:
+            if strict:
+                raise
             logger.debug("telegram topic binding refresh failed (%s)", reason, exc_info=True)
 
     def _recover_telegram_topic_thread_id(self, source: SessionSource) -> Optional[str]:
