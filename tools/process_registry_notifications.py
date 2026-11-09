@@ -116,12 +116,13 @@ def _delegation_model_not_found(results, config) -> bool:
     if not model:
         return False
     patterns = _model_not_found_patterns()
-    texts = (" ".join(str(x) for x in (r.get("error"), r.get("summary")) if x).lower() for r in results or [])
-    return any(model in text and any(p in text for p in patterns) for text in texts)
+    texts = [" ".join(str(x) for x in (r.get("error"), r.get("summary")) if x).lower()
+             for r in results or []]
+    return bool(texts) and all(model in text and any(p in text for p in patterns) for text in texts)
 
 
-def _delegation_model_not_found_notice(results) -> list[str] | None:
-    """Config-level model_not_found notice lines, or None (fail-open) — once per batch."""
+def _delegation_model_not_found_notice(results, *, is_batch: bool) -> list[str] | None:
+    """Config-level model_not_found notice lines, or None (fail-open)."""
     config = _delegation_config()
     if not _delegation_model_not_found(results, config):
         return None
@@ -131,7 +132,8 @@ def _delegation_model_not_found_notice(results) -> list[str] | None:
         "⚠ SUBAGENT MODEL REJECTED: the configured Subagent Model "
         f'"{model}" was rejected by provider "{provider}" '
         "(HTTP 400: not a valid model ID).",
-        "Every task in this batch failed for this reason before doing any work.",
+        ("Every task in this batch failed for this reason before doing any work."
+         if is_batch else "This task failed for this reason before doing any work."),
         "Configuration reference: Settings → Advanced → Subagent Model; CLI key: delegation.model."]
     with suppress(Exception):
         from hermes_cli.fallback_config import get_fallback_chain
@@ -150,9 +152,9 @@ def _is_truncated(entry: dict) -> bool:
     return bool(entry.get("truncated") or entry.get("exit_reason") == "max_iterations")
 
 
-def _notice_lines(results) -> list[str]:
+def _notice_lines(results, *, is_batch: bool) -> list[str]:
     """Blank + model_not_found notice block, or [] when the notice does not apply."""
-    notice = _delegation_model_not_found_notice(results)
+    notice = _delegation_model_not_found_notice(results, is_batch=is_batch)
     return ["", *notice] if notice else []
 
 
@@ -231,7 +233,7 @@ def _format_batch_delegation(evt: dict, deleg_id: str, completed_at: float) -> s
         return "\n".join(lines)
     # Config-level rejection notice BEFORE the per-task wall — a rejected
     # delegation model fails every task identically and must not stay buried.
-    lines += _notice_lines(results)
+    lines += _notice_lines(results, is_batch=True)
     for r in sorted(results, key=lambda x: x.get("task_index", 0)):
         idx, r_truncated = r.get("task_index", 0), _is_truncated(r)
         r_status, r_summary, r_error = r.get("status", "?"), r.get("summary"), r.get("error")
@@ -295,7 +297,7 @@ def _format_async_delegation(evt: dict) -> str:
         "have moved on since dispatching it; the full task source is below for "
         "context within the still-current authorised task.",
         completed_at, with_goal=True)
-    lines += _notice_lines([evt]) + [
+    lines += _notice_lines([evt], is_batch=False) + [
         f"Status: {status}" + (f"   API calls: {evt['api_calls']}" if evt.get("api_calls") is not None else "")
         + f"   Duration: {evt.get('duration_seconds', '?')}s"
         + (" [TRUNCATED: hit max_iterations — work may be incomplete]" if truncated else ""),

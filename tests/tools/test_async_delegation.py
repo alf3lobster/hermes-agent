@@ -943,6 +943,40 @@ def test_batch_model_rejection_notice_absent_when_clean(monkeypatch):
     assert "SUBAGENT MODEL REJECTED" not in text
 
 
+def test_batch_model_rejection_notice_absent_when_only_one_task_rejected(monkeypatch):
+    rejection = "HTTP 400: upstage/solar-pro-4 is not a valid model ID"
+    _patch_delegation_cfg(monkeypatch)
+    evt = _make_async_evt(
+        is_batch=True,
+        model="upstage/solar-pro-4",
+        goals=["rejected task", "successful task"],
+        results=[
+            {"task_index": 0, "status": "failed", "error": rejection},
+            {"task_index": 1, "status": "completed", "summary": "completed evidence"},
+        ],
+    )
+    text = format_process_notification(evt)
+    assert text is not None
+    assert "completed evidence" in text
+    assert "SUBAGENT MODEL REJECTED" not in text
+    assert "Every task in this batch failed" not in text
+
+
+def test_single_model_rejection_notice_uses_single_task_language(monkeypatch):
+    rejection = "HTTP 400: upstage/solar-pro-4 is not a valid model ID"
+    _patch_delegation_cfg(monkeypatch)
+    text = format_process_notification(_make_async_evt(
+        model="upstage/solar-pro-4",
+        status="failed",
+        summary=None,
+        error=rejection,
+    ))
+    assert text is not None
+    assert "SUBAGENT MODEL REJECTED" in text
+    assert "This task failed for this reason before doing any work" in text
+    assert "Every task in this batch failed" not in text
+
+
 def test_batch_model_rejection_notice_requires_configured_model_in_text(monkeypatch):
     """A model_not_found pattern naming a DIFFERENT model than the configured
     delegation model is task-level noise, not a config-level rejection."""
