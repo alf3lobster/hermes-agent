@@ -325,6 +325,22 @@ class TestPrologueStamping:
 
         assert captured["user_originated"] is False
 
+    @pytest.mark.parametrize("is_bot", [None, 0, ""])
+    def test_pre_llm_hook_rejects_malformed_human_bot_flags(self, is_bot):
+        agent = _FakeAgent()
+        captured = {}
+
+        def _capture(hook, **kwargs):
+            if hook == "pre_llm_call":
+                captured.update(kwargs)
+            return []
+
+        author = {"id": "user", "name": "Example", "is_bot": is_bot}
+        with patch("hermes_cli.plugins.invoke_hook", side_effect=_capture):
+            _build(agent, turn_author=author)
+
+        assert captured["user_originated"] is False
+
     def test_pre_llm_hook_marks_typed_internal_turn_non_user_originated(self):
         agent = _FakeAgent()
         captured = {}
