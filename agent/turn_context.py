@@ -849,6 +849,7 @@ def _withhold_blocked_prompt(agent: Any, turn_user_msg: dict[str, Any], typed: A
 def _collect_pre_llm_call_context(
     agent: Any, *, effective_task_id: str, turn_id: str, original_user_message: Any,
     messages: list[Any], conversation_history: Optional[list[Any]], blocks: Optional[list[str]] = None,
+    user_originated: bool,
 ) -> str:
     """Run ``pre_llm_call`` plugins; their context is injected into the user message
     (never the system prompt). Oversized per-hook context is spilled to disk so a
@@ -873,7 +874,7 @@ def _collect_pre_llm_call_context(
             sender_id=getattr(agent, "_user_id", None) or "",
             chat_id=getattr(agent, "_chat_id", None) or "",
             chat_type=getattr(agent, "_chat_type", None) or "",
-            user_originated=(persist_user_display_kind is None),
+            user_originated=user_originated,
         )
         try:
             # Spill oversized per-hook context to disk so a runaway plugin can't inflate every subsequent
@@ -1240,6 +1241,7 @@ def build_turn_context(
         agent, effective_task_id=effective_task_id, turn_id=turn_id,
         original_user_message=original_user_message, messages=messages,
         conversation_history=conversation_history, blocks=_blocks,
+        user_originated=(persist_user_display_kind is None),
     )
     plugin_block_message = _blocks[0] if _blocks else ""  # first veto wins
     compaction = CompactionOutcome(

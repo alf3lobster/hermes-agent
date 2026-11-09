@@ -570,7 +570,8 @@ def continue_codex_incomplete(
     checkpoint) and, when a bare retry would be byte-identical, a user-role nudge — only
     after an assistant row, to preserve role alternation. Returns ``None`` to continue
     the turn loop, ``CODEX_FALLBACK_ACTIVATED`` when a reasoning-only stall was handed to
-    the next fallback provider, or the terminal ``partial`` result once retries are exhausted.
+    the next fallback provider, or the terminal ``partial`` result once retries are exhausted
+    and no configured fallback accepts the handoff.
 
     Reasoning-only stall ladder (#67321): a response with neither visible text nor a tool
     call advances ``_codex_reasoning_only_streak`` (a visible partial resets it; the aggregate
@@ -692,6 +693,32 @@ def continue_codex_incomplete(
         )
         agent._session_messages = messages
         return None
+
+    if not reasoning_only:
+        # Preserve the local pre-v0.23 contract for visible-but-incomplete responses: after
+        # three continuations, remove Codex-only replay scaffolding and give a configured
+        # fallback one bounded call before returning the partial sentinel.
+        while messages:
+            tail = messages[-1]
+            if (
+                isinstance(tail, dict)
+                and tail.get("role") == "assistant"
+                and tail.get("finish_reason") == "incomplete"
+            ) or (
+                isinstance(tail, dict)
+                and tail.get("role") == "user"
+                and tail.get("content") == _CODEX_INCOMPLETE_NUDGE
+            ):
+                messages.pop()
+                continue
+            break
+        if agent._try_activate_fallback(reason=FailoverReason.rate_limit):
+            if api_call_count >= agent.max_iterations or agent.iteration_budget.remaining <= 0:
+                agent._budget_grace_call = True
+            agent._codex_incomplete_retries = 0
+            agent._codex_reasoning_only_streak = 0
+            agent._session_messages = messages
+            return CODEX_FALLBACK_ACTIVATED
 
     agent._codex_incomplete_retries = 0
     agent._codex_reasoning_only_streak = 0
