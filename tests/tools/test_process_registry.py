@@ -3148,6 +3148,22 @@ def test_model_not_found_notice_absent_when_configured_model_not_named(monkeypat
     assert "SUBAGENT MODEL REJECTED" not in text
 
 
+def test_model_not_found_notice_requires_exact_configured_model_token(monkeypatch):
+    evt = _make_delegation_batch_evt([
+        {
+            "task_index": 0,
+            "status": "failed",
+            "failure_reason": "model_not_found",
+            "error": "HTTP 400: gpt-4o is not a valid model ID",
+        }
+    ])
+    _patch_delegation_config(monkeypatch, model="gpt-4")
+
+    text = _format_async(evt)
+
+    assert "SUBAGENT MODEL REJECTED" not in text
+
+
 def test_model_not_found_notice_single_dispatch(monkeypatch):
     evt = {
         "type": "async_delegation",

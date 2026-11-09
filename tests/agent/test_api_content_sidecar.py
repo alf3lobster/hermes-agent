@@ -290,12 +290,40 @@ class TestPrologueStamping:
             return []
 
         with patch("hermes_cli.plugins.invoke_hook", side_effect=_capture):
-            _build(agent)
+            _build(agent, turn_author={"id": "user", "name": "Example", "is_bot": False})
 
         assert captured["sender_id"] == "6282086430"
         assert captured["chat_id"] == "6282086430"
         assert captured["chat_type"] == "dm"
         assert captured["user_originated"] is True
+
+    def test_pre_llm_hook_marks_bot_author_non_user_originated_without_display_kind(self):
+        agent = _FakeAgent()
+        captured = {}
+
+        def _capture(hook, **kwargs):
+            if hook == "pre_llm_call":
+                captured.update(kwargs)
+            return []
+
+        with patch("hermes_cli.plugins.invoke_hook", side_effect=_capture):
+            _build(agent, turn_author={"id": "kanban-worker", "name": "Worker", "is_bot": True})
+
+        assert captured["user_originated"] is False
+
+    def test_pre_llm_hook_treats_missing_author_provenance_as_non_user_originated(self):
+        agent = _FakeAgent()
+        captured = {}
+
+        def _capture(hook, **kwargs):
+            if hook == "pre_llm_call":
+                captured.update(kwargs)
+            return []
+
+        with patch("hermes_cli.plugins.invoke_hook", side_effect=_capture):
+            _build(agent)
+
+        assert captured["user_originated"] is False
 
     def test_pre_llm_hook_marks_typed_internal_turn_non_user_originated(self):
         agent = _FakeAgent()

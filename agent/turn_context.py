@@ -1237,11 +1237,15 @@ def build_turn_context(
     # Before turn-start compaction: its summary request quotes recent user turns, this one included,
     # so a vetoed prompt skips it (the turn makes no model call at all).
     _blocks: list[str] = []
+    _human_display_kind = persist_user_display_kind in (None, "", "steer")
+    _explicit_human_author = (
+        isinstance(turn_author, dict) and turn_author.get("is_bot") is False
+    )
     plugin_user_context = _collect_pre_llm_call_context(
         agent, effective_task_id=effective_task_id, turn_id=turn_id,
         original_user_message=original_user_message, messages=messages,
         conversation_history=conversation_history, blocks=_blocks,
-        user_originated=(persist_user_display_kind is None),
+        user_originated=(_human_display_kind and _explicit_human_author),
     )
     plugin_block_message = _blocks[0] if _blocks else ""  # first veto wins
     compaction = CompactionOutcome(

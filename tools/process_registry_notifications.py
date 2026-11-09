@@ -3,6 +3,7 @@ watch_match, watch_disabled, watch_overflow_*, async_delegation) into the
 ``[IMPORTANT: ...]`` / ``[ASYNC DELEGATION ...]`` text the CLI drain loop, gateway and
 TUI inject into the agent conversation."""
 
+import re
 import time
 from dataclasses import dataclass
 from contextlib import suppress
@@ -116,12 +117,15 @@ def _delegation_model_not_found(results, config) -> bool:
     if not model:
         return False
     patterns = _model_not_found_patterns()
+    model_pattern = re.compile(
+        rf"(?<![A-Za-z0-9._:/-]){re.escape(model)}(?![A-Za-z0-9._:/-])"
+    )
     texts = [" ".join(str(x) for x in (r.get("error"), r.get("summary")) if x).lower()
              for r in results or []]
     return bool(texts) and all(
         str(result.get("status") or "").lower() in _MODEL_REJECTION_STATUSES
         and str(result.get("failure_reason") or "").lower() == "model_not_found"
-        and model in text
+        and model_pattern.search(text) is not None
         and any(pattern in text for pattern in patterns)
         for result, text in zip(results, texts, strict=True)
     )
