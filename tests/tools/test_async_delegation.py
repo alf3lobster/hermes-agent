@@ -780,6 +780,8 @@ def test_single_task_truncation_banner_when_max_iterations():
     assert "max_iterations" in text
     # The summary is still shown, just flagged.
     assert "Did part of the work" in text
+    assert "re-dispatch" not in text.lower()
+    assert "does not grant new authority" in text.lower()
 
 
 def test_single_task_no_banner_when_clean():
@@ -826,6 +828,8 @@ def test_batch_truncation_banner_marks_only_truncated_task():
     banner_pos = text.index("TRUNCATED")
     # The header banner for task 2 appears after task 1's summary.
     assert banner_pos > clean_pos
+    assert "re-dispatch" not in text.lower()
+    assert "does not grant new authority" in text.lower()
 
 
 def _patch_delegation_cfg(monkeypatch, model="upstage/solar-pro-4", provider="openrouter"):

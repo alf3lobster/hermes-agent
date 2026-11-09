@@ -34,6 +34,10 @@ def test_failure_notice_reaches_the_queue_while_the_batch_keeps_running_and_form
     assert text.startswith("[ASYNC DELEGATION TASK FAILED — deleg_x, task 2/3]")
     assert "Task: b" in text and "401 authentication_error" in text and "/tmp/live/task-1.log" in text
     assert "consolidated results will still arrive" in text
+    assert "re-dispatch" not in text.lower()
+    assert "investigate now" not in text.lower()
+    assert "not a new user instruction" in text.lower()
+    assert "does not grant new authority" in text.lower()
 
 
 def test_notice_is_not_sent_for_a_finished_batch_and_does_not_dedup_against_the_final_result():

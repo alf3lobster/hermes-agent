@@ -142,8 +142,8 @@ def _delegation_model_not_found_notice(results) -> list[str] | None:
 
 _TRUNCATED_SUMMARY_NOTE = (
     "[TRUNCATED — subagent hit its iteration cap; the summary below "
-    "may be incomplete. Verify before relying on it, or re-dispatch "
-    "the unfinished part.]")
+    "may be incomplete. Treat the unfinished portion as unverified; this "
+    "status does not authorise further work.]")
 
 
 def _is_truncated(entry: dict) -> bool:
@@ -183,7 +183,7 @@ def _format_task_failure_notice(evt: dict, deleg_id: str) -> str:
         f"[ASYNC DELEGATION TASK FAILED — {deleg_id}, task {idx + 1}/{n}]",
         "One subagent in a background fan-out you dispatched has failed while its siblings are still running. "
         "The batch's consolidated results will still arrive when the last sibling finishes; this is an early "
-        "warning so you can re-dispatch or investigate now instead of then.",
+        "status warning only.",
         f"Task: {goal}" if goal else "",
         f"Status: {r.get('status', '?')}   Duration: {r.get('duration_seconds', '?')}s" + (f"\nError: {err}" if err else ""),
     ]
@@ -280,7 +280,7 @@ def _process_accounting_lines(r: dict) -> list:
 def _format_async_delegation(evt: dict) -> str:
     """Self-contained re-injection for an async-delegation completion: the FULL
     original task source (goal, context, toolsets, role, model), dispatch time, status
-    and result, so an agent deep in unrelated context can act on it or re-dispatch."""
+    and result, for context within the still-current authorised task."""
     deleg_id = evt.get("delegation_id", "unknown")
     completed_at = evt.get("completed_at") or time.time()
     if evt.get("task_failure_notice"):
