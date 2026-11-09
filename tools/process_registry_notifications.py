@@ -221,8 +221,8 @@ def _format_batch_delegation(evt: dict, deleg_id: str, completed_at: float) -> s
         f"[ASYNC DELEGATION BATCH COMPLETE — {deleg_id}]",
         f"A background fan-out unit you dispatched earlier — {unit} — has finished; its consolidated results are "
         "below. Any other units from the same delegate_task call report separately as they finish. You may have "
-        "moved on since dispatching — act on these or re-dispatch if things have changed. If you are still waiting "
-        "on siblings, end your turn after acting on this one.",
+        "moved on since dispatching; treat these results as status evidence for the still-current authorised task. "
+        "Any unfinished sibling units will report separately.",
         completed_at, with_goal=False)
     lines[-1] += f"   Total duration: {evt.get('total_duration_seconds', evt.get('duration_seconds', '?'))}s"
     lines += _recovery_lines(evt)
@@ -293,8 +293,8 @@ def _format_async_delegation(evt: dict) -> str:
         evt,
         f"[ASYNC DELEGATION COMPLETE — {deleg_id}]",
         "A background subagent you dispatched earlier has finished. You may "
-        "have moved on since dispatching it; the full task source is below so "
-        "you can act on the result or re-dispatch if things have changed.",
+        "have moved on since dispatching it; the full task source is below for "
+        "context within the still-current authorised task.",
         completed_at, with_goal=True)
     lines += _notice_lines([evt]) + [
         f"Status: {status}" + (f"   API calls: {evt['api_calls']}" if evt.get("api_calls") is not None else "")
