@@ -412,16 +412,26 @@ class GatewayTurnPrepareMixin:
                 "⚠️ I could not verify this conversation route safely. "
                 "Your message was not processed. Please try again."
             )
-        if not (
+        if current_row is not None and not (
             isinstance(current_row, dict)
             and str(current_row.get("id") or "") == str(session_entry.session_id)
         ):
-            logger.warning("Refusing unverifiable current Telegram session %s", session_entry.session_id)
+            logger.warning("Refusing malformed current Telegram session %s", session_entry.session_id)
             return (
                 "⚠️ I could not verify this conversation route safely. "
                 "Your message was not processed. Please use /reset and resend it."
             )
-        if current_row.get("ended_at") and current_row.get("end_reason") == "session_reset":
+        if current_row is None and blocked_predecessors:
+            logger.warning("Verified hygiene replacement %s is not durable", session_entry.session_id)
+            return (
+                "⚠️ This conversation was retired, but its clean replacement could not be "
+                "verified durably. Your message was not processed. Please use /reset and resend it."
+            )
+        if (
+            isinstance(current_row, dict)
+            and current_row.get("ended_at")
+            and current_row.get("end_reason") == "session_reset"
+        ):
             logger.warning("Refusing current Telegram route to reset tombstone %s", session_entry.session_id)
             return (
                 "⚠️ This conversation route points to a retired session. "
