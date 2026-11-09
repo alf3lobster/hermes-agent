@@ -132,11 +132,16 @@ jobs:
         run: |
           set -euo pipefail
           tests/install/installer-script-e2e.sh \
-            --install-method '${{ inputs.install-method }}' \
-            --update-method '${{ inputs.update-method }}' \
-            --install-ref '${{ inputs.install-ref }}' \
-            --update-ref '${{ inputs.update-ref }}'
+            --install-method "$E2E_INSTALL_METHOD" \
+            --update-method "$E2E_UPDATE_METHOD" \
+            --install-ref "$E2E_INSTALL_REF" \
+            --update-ref "$E2E_UPDATE_REF"
         env:
+          # Workflow inputs are data, never interpolated into shell source.
+          E2E_INSTALL_METHOD: ${{ inputs.install-method }}
+          E2E_UPDATE_METHOD: ${{ inputs.update-method }}
+          E2E_INSTALL_REF: ${{ inputs.install-ref }}
+          E2E_UPDATE_REF: ${{ inputs.update-ref }}
           # Outside the workspace on purpose: logs written into the repo
           # would trip the driver's own dirty-tree guard.
           HERMES_E2E_LOG_DIR: ${{ runner.temp }}/e2e-logs
@@ -168,7 +173,9 @@ jobs:
         id: artifact
         run: |
           set -euo pipefail
-          echo "name=install-e2e-logs-${{ inputs.leg-id }}" >> "$GITHUB_OUTPUT"
+          echo "name=install-e2e-logs-${E2E_LEG_ID}" >> "$GITHUB_OUTPUT"
+        env:
+          E2E_LEG_ID: ${{ inputs.leg-id }}
 
       # The installer's own transcripts say far more than the assertion that
       # tripped when a real install breaks.
