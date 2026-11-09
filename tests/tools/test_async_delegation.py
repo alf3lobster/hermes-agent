@@ -880,6 +880,44 @@ def test_batch_model_rejection_notice_prepended(monkeypatch):
     assert "delegation.model" in text
     # The notice precedes the per-task blocks, not just trails them.
     assert text.index("SUBAGENT MODEL REJECTED") < text.index("TASK 1/2")
+    assert "check settings" not in text.lower()
+    assert "does not grant new authority" in text.lower()
+
+
+def test_batch_recovery_diagnostics_are_status_only():
+    evt = _make_async_evt(
+        is_batch=True,
+        goals=["recover task"],
+        last_known_status="running",
+        results=[{"task_index": 0, "status": "unknown", "error": "owner exited"}],
+    )
+    text = format_process_notification(evt)
+    assert text is not None
+    assert "unrecorded outcomes remain unknown" in text.lower()
+    assert "inspect evidence" not in text.lower()
+    assert "retrying side effects" not in text.lower()
+    assert "does not grant new authority" in text.lower()
+
+
+def test_batch_process_accounting_is_status_only():
+    evt = _make_async_evt(
+        is_batch=True,
+        goals=["background task"],
+        results=[{
+            "task_index": 0,
+            "status": "completed",
+            "summary": "partial status",
+            "handed_off_processes": [{"session_id": "proc_h", "command": "watch", "note": "CI"}],
+            "orphaned_processes": [{"session_id": "proc_o", "command": "build", "runtime_seconds": 9}],
+        }],
+    )
+    text = format_process_notification(evt)
+    assert text is not None
+    assert "completion notice will arrive here" in text.lower()
+    assert "were terminated" in text.lower()
+    assert "you own it now" not in text.lower()
+    assert "re-launch" not in text.lower()
+    assert "does not grant new authority" in text.lower()
 
 
 def test_batch_model_rejection_notice_absent_when_clean(monkeypatch):

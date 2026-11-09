@@ -132,7 +132,7 @@ def _delegation_model_not_found_notice(results) -> list[str] | None:
         f'"{model}" was rejected by provider "{provider}" '
         "(HTTP 400: not a valid model ID).",
         "Every task in this batch failed for this reason before doing any work.",
-        "Check Settings → Advanced → Subagent Model (or: hermes config get delegation.model)."]
+        "Configuration reference: Settings → Advanced → Subagent Model; CLI key: delegation.model."]
     with suppress(Exception):
         from hermes_cli.fallback_config import get_fallback_chain
         if not get_fallback_chain(config):
@@ -198,7 +198,7 @@ def _recovery_lines(evt: dict) -> list[str]:
     if not evt.get("last_known_status"):
         return []
     lines = [f"Last persisted unit status: {evt['last_known_status']} (before owner exit; not current liveness). "
-             "Unrecorded outcomes remain unknown; inspect evidence before retrying side effects."]
+             "Unrecorded outcomes remain unknown; no side-effect retry is authorised by this notice."]
     tails = evt.get("transcript_tails") or {}
     for index, path in (evt.get("task_transcripts") or {}).items():
         lines.append(f"Task index {index} transcript (may be incomplete): {path}")
@@ -221,7 +221,7 @@ def _format_batch_delegation(evt: dict, deleg_id: str, completed_at: float) -> s
         f"[ASYNC DELEGATION BATCH COMPLETE — {deleg_id}]",
         f"A background fan-out unit you dispatched earlier — {unit} — has finished; its consolidated results are "
         "below. Any other units from the same delegate_task call report separately as they finish. You may have "
-        "moved on since dispatching; treat these results as status evidence for the still-current authorised task. "
+        "moved on since dispatching; these results are status evidence only for the still-current authorised task. "
         "Any unfinished sibling units will report separately.",
         completed_at, with_goal=False)
     lines[-1] += f"   Total duration: {evt.get('total_duration_seconds', evt.get('duration_seconds', '?'))}s"
@@ -259,18 +259,17 @@ def _format_batch_delegation(evt: dict, deleg_id: str, completed_at: float) -> s
 
 
 def _process_accounting_lines(r: dict) -> list:
-    """Runtime-truth lines about a child's background processes: what it handed to you (you own it now, its
-    completion lands here) and what it left running (terminated at teardown — never trust a child's "watcher running")."""
+    """Status-only runtime facts about transferred and terminated child processes."""
     lines = []
     for h in r.get("handed_off_processes") or []:
-        lines.append(f"Handed off to you: {h.get('session_id')} ({h.get('command', '')[:120]}) — {h.get('note', '')}. "
-                     "You own it now; its completion notice will arrive here.")
+        lines.append(f"Handed off to the parent task: {h.get('session_id')} ({h.get('command', '')[:120]}) — "
+                     f"{h.get('note', '')}. Its completion notice will arrive here.")
     orphans = r.get("orphaned_processes") or []
     if orphans:
         lines.append(f"Child left {len(orphans)} background process(es) running that were TERMINATED with it "
                      "(subagent process notices never reach you): "
                      + "; ".join(f"{o.get('session_id')} `{o.get('command', '')[:100]}` ({o.get('runtime_seconds')}s)" for o in orphans)
-                     + ". Re-launch in this session anything you still need.")
+                     + ". No continuation is authorised by this notice.")
     for u in r.get("unread_completions") or []:
         lines.append(f"Child's process {u.get('session_id')} `{u.get('command', '')[:100]}` finished (exit code "
                      f"{u.get('exit_code')}) but the child never read its result; output tail:\n{u.get('output_tail', '')}")
