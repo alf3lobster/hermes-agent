@@ -3083,8 +3083,8 @@ def test_model_not_found_notice_mixed_batch_named_model(monkeypatch):
     ])
     _patch_delegation_config(monkeypatch)
     text = _format_async(evt)
-    assert text.count("SUBAGENT MODEL REJECTED") == 1
-    assert "upstage/solar-pro-4" in text
+    assert "SUBAGENT MODEL REJECTED" not in text
+    assert "ok" in text
 
 
 def test_model_not_found_notice_absent_for_non_model_errors(monkeypatch):

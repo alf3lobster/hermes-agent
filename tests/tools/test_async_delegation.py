@@ -855,21 +855,21 @@ def test_batch_model_rejection_notice_prepended(monkeypatch):
         results=[
             {
                 "task_index": 0,
-                "status": "completed",
+                "status": "failed",
                 "summary": rejection,
                 "api_calls": 1,
                 "duration_seconds": 0.74,
-                "exit_reason": "max_iterations",
-                "truncated": True,
+                "exit_reason": "error",
+                "truncated": False,
             },
             {
                 "task_index": 1,
-                "status": "completed",
+                "status": "failed",
                 "summary": rejection,
                 "api_calls": 1,
                 "duration_seconds": 0.71,
-                "exit_reason": "max_iterations",
-                "truncated": True,
+                "exit_reason": "error",
+                "truncated": False,
             },
         ],
     )
@@ -966,15 +966,49 @@ def test_single_model_rejection_notice_uses_single_task_language(monkeypatch):
     rejection = "HTTP 400: upstage/solar-pro-4 is not a valid model ID"
     _patch_delegation_cfg(monkeypatch)
     text = format_process_notification(_make_async_evt(
+        is_batch=True,
+        goals=["task A"],
+        results=[{
+            "task_index": 0,
+            "status": "failed",
+            "error": rejection,
+        }],
         model="upstage/solar-pro-4",
-        status="failed",
-        summary=None,
-        error=rejection,
     ))
     assert text is not None
     assert "SUBAGENT MODEL REJECTED" in text
     assert "This task failed for this reason before doing any work" in text
     assert "Every task in this batch failed" not in text
+
+
+def test_model_rejection_notice_requires_failure_status(monkeypatch):
+    rejection = "HTTP 400: upstage/solar-pro-4 is not a valid model ID"
+    _patch_delegation_cfg(monkeypatch)
+    for status in ("completed", "interrupted"):
+        text = format_process_notification(_make_async_evt(
+            model="upstage/solar-pro-4",
+            status=status,
+            summary=f"Observed diagnostic: {rejection}",
+            error=None,
+        ))
+        assert text is not None
+        assert "SUBAGENT MODEL REJECTED" not in text
+
+
+def test_batch_model_rejection_notice_requires_every_task_to_fail(monkeypatch):
+    rejection = "HTTP 400: upstage/solar-pro-4 is not a valid model ID"
+    _patch_delegation_cfg(monkeypatch)
+    text = format_process_notification(_make_async_evt(
+        is_batch=True,
+        model="upstage/solar-pro-4",
+        goals=["failed", "completed diagnostic"],
+        results=[
+            {"task_index": 0, "status": "failed", "error": rejection},
+            {"task_index": 1, "status": "completed", "summary": f"Discussed {rejection}"},
+        ],
+    ))
+    assert text is not None
+    assert "SUBAGENT MODEL REJECTED" not in text
 
 
 def test_batch_model_rejection_notice_requires_configured_model_in_text(monkeypatch):

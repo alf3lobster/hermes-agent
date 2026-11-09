@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from contextlib import suppress
 
 _DONE = ("completed", "success")
+_MODEL_REJECTION_STATUSES = frozenset({"failed", "error", "timeout", "rejected"})
 _REASON_STATUS = {"lost": "marked lost because the process backend disappeared", "failed_start": "failed to start"}
 
 
@@ -118,7 +119,12 @@ def _delegation_model_not_found(results, config) -> bool:
     patterns = _model_not_found_patterns()
     texts = [" ".join(str(x) for x in (r.get("error"), r.get("summary")) if x).lower()
              for r in results or []]
-    return bool(texts) and all(model in text and any(p in text for p in patterns) for text in texts)
+    return bool(texts) and all(
+        str(result.get("status") or "").lower() in _MODEL_REJECTION_STATUSES
+        and model in text
+        and any(pattern in text for pattern in patterns)
+        for result, text in zip(results, texts, strict=True)
+    )
 
 
 def _delegation_model_not_found_notice(results, *, is_batch: bool) -> list[str] | None:
@@ -233,7 +239,7 @@ def _format_batch_delegation(evt: dict, deleg_id: str, completed_at: float) -> s
         return "\n".join(lines)
     # Config-level rejection notice BEFORE the per-task wall — a rejected
     # delegation model fails every task identically and must not stay buried.
-    lines += _notice_lines(results, is_batch=True)
+    lines += _notice_lines(results, is_batch=len(results) > 1)
     for r in sorted(results, key=lambda x: x.get("task_index", 0)):
         idx, r_truncated = r.get("task_index", 0), _is_truncated(r)
         r_status, r_summary, r_error = r.get("status", "?"), r.get("summary"), r.get("error")
