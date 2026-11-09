@@ -61,6 +61,7 @@ class TestRequestToolApproval:
         monkeypatch.setattr(approval_prompt, "prompt_dangerous_approval", lambda *a, **k: "once")
         res = request_tool_approval("write_file", "writing ~/.ssh/authorized_keys")
         assert res["approved"] is True
+        assert res["user_approved"] is True
 
     def test_cli_deny_blocks(self, monkeypatch):
         from hermes_cli import lifecycle

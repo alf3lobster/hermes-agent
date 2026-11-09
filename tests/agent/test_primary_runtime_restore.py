@@ -413,7 +413,7 @@ class TestRestorePrimaryRuntime:
         with (
             patch("agent.process_bootstrap.OpenAI", build_client),
             patch("agent.credential_pool.load_pool", load_pool),
-            patch("agent.conversation_compression.revalidate_compression_feasibility", revalidate),
+            patch("agent.conversation_compression_feasibility.revalidate_compression_feasibility", revalidate),
             patch(
                 "agent.route_binding._commit_route_agent",
                 side_effect=RuntimeError("injected primary publication rejection"),

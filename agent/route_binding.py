@@ -124,7 +124,7 @@ def _stage_route_agent(agent: Any) -> Any:
 def _revalidate_committed_compression(agent: Any) -> None:
     """Refresh an existing feasibility verdict only after route publication."""
     if getattr(agent, "_compression_feasibility_checked", False) is True:
-        from agent.conversation_compression import revalidate_compression_feasibility
+        from agent.conversation_compression_feasibility import revalidate_compression_feasibility
         revalidate_compression_feasibility(agent)
 
 
@@ -366,7 +366,7 @@ def _reinstall_runtime_snapshot_in_place(
         )
     # A staged restore cannot resolve auxiliary clients or probe providers before publication.
     if not defer_client and getattr(agent, "_compression_feasibility_checked", False) is True:
-        from agent.conversation_compression import revalidate_compression_feasibility
+        from agent.conversation_compression_feasibility import revalidate_compression_feasibility
         revalidate_compression_feasibility(agent)
     # Older snapshots have no reasoning_config; keep the current value.
     saved_reasoning = rt.get("reasoning_config")

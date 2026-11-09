@@ -48,6 +48,46 @@ def test_delegation_schema_advertises_string_route_overrides():
     assert properties["provider"]["type"] == "string"
 
 
+def test_per_call_route_overrides_own_the_whole_batch(monkeypatch):
+    from tools import delegate_tool
+
+    seen = []
+
+    def resolve(cfg, parent):
+        seen.append(dict(cfg))
+        return {
+            "model": cfg.get("model"),
+            "provider": cfg.get("provider"),
+            "base_url": "https://provider.example/v1",
+            "api_key": "scoped-key",
+            "api_mode": "responses",
+            "request_overrides": {},
+            "command": None,
+            "args": [],
+        }
+
+    monkeypatch.setattr(delegate_tool, "_resolve_delegation_credentials", resolve)
+    routes, error = delegate_tool._routes_for(
+        [{"goal": "one"}, {"goal": "two"}],
+        {"model": "configured-model", "provider": "configured-provider"},
+        None,
+        SimpleNamespace(model="parent-model"),
+        model="call-model",
+        provider="call-provider",
+    )
+
+    assert error is None
+    assert len(routes) == 2
+    assert routes[0] is routes[1]
+    assert routes[0].routing_cfg == {
+        "model": "call-model",
+        "provider": "call-provider",
+    }
+    assert routes[0].creds["model"] == "call-model"
+    assert routes[0].creds["provider"] == "call-provider"
+    assert seen == [routes[0].routing_cfg]
+
+
 def test_heartbeat_touches_parent_immediately_before_scheduling(monkeypatch):
     from tools import delegate_tool_child_run
     from agent import periodic_scheduler

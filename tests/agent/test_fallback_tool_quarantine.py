@@ -1116,7 +1116,7 @@ def test_context_metadata_probe_runs_only_after_fallback_publication(monkeypatch
     monkeypatch.setattr(route_binding, "_commit_route_agent", commit)
     monkeypatch.setattr("agent.model_metadata.get_model_context_length", provider_probe)
     monkeypatch.setattr(
-        "agent.conversation_compression.revalidate_compression_feasibility", revalidate,
+        "agent.conversation_compression_feasibility.revalidate_compression_feasibility", revalidate,
     )
     monkeypatch.setattr(
         "agent.auxiliary_client.resolve_provider_client",
