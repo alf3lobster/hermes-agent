@@ -1054,9 +1054,7 @@ class GatewayShutdownMixin(GatewaySessionEndMixin):
                     continue
                 if not self._notice_allowed(platform, "active session"):
                     continue
-                # An in-chat /restart notice belongs to the command that requested it,
-                # not to whichever stale inbound message happened to seed the active
-                # session's cached source.
+                # Reply to the /restart command, never a stale cached inbound message.
                 reply_to_message_id = (
                     getattr(restart_source, "message_id", None)
                     if restart_key == dedup_key

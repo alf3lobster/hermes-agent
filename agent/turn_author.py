@@ -19,9 +19,6 @@ _MAX_CHAIN_HOPS = 1000
 
 
 _DROPPED_CATEGORIES = frozenset({"Cc", "Cs", "Cn", "Co"})
-_TRUTHY = frozenset({"true", "1", "yes"})
-
-
 def _clean_text(value: Any) -> Optional[str]:
     """Strip whitespace, control and unassigned characters, then cap the length. None when nothing is left.
     Format characters and non-breaking spaces stay so emoji sequences and display names survive."""
@@ -31,12 +28,6 @@ def _clean_text(value: Any) -> Optional[str]:
     if not text:
         return None
     return text[:_MAX_FIELD_LEN]
-
-
-def _bot_flag(value: Any) -> bool:
-    if isinstance(value, str):
-        return value.strip().lower() in _TRUTHY
-    return isinstance(value, (bool, int)) and bool(value)
 
 
 def bot_author_id(profile: str, origin: Optional[str] = None) -> str:
@@ -67,10 +58,12 @@ def parse_turn_author(raw: Any) -> Optional[dict[str, Any]]:
             raw = json.loads(raw)
         if not isinstance(raw, Mapping):
             return None
+        if not isinstance(raw.get("is_bot"), bool):
+            return None
         author = {
             "id": _clean_text(raw.get("id")),
             "name": _clean_text(raw.get("name")),
-            "is_bot": _bot_flag(raw.get("is_bot")),
+            "is_bot": raw["is_bot"],
         }
         if author["id"] is None and author["name"] is None:
             return None

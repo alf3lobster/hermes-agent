@@ -558,6 +558,52 @@ _CODEX_REPLAY_KEYS = (
 CODEX_FALLBACK_ACTIVATED = "codex_fallback_activated"
 
 
+def _activate_reasoning_stall_fallback(
+    agent: Any, messages: list[dict[str, Any]], *, api_call_count: int, streak: int,
+) -> bool:
+    if not agent._try_activate_fallback(reason=FailoverReason.incomplete_response):
+        return False
+    if api_call_count >= agent.max_iterations or agent.iteration_budget.remaining <= 0:
+        agent._budget_grace_call = True
+    agent._codex_incomplete_retries = 0
+    agent._codex_reasoning_only_streak = 0
+    if not agent.quiet_mode:
+        agent._vprint(
+            f"{agent.log_prefix}↻ Codex reasoning-only stall after {streak} attempts — "
+            f"switching to fallback {agent.model} ({agent.provider})", diagnostic=True,
+        )
+    agent._emit_diagnostic_wait("↻ model stuck on internal reasoning — switching to fallback provider")
+    agent._session_messages = messages
+    return True
+
+
+def _activate_visible_partial_fallback(
+    agent: Any, messages: list[dict[str, Any]], *, api_call_count: int, nudge: str,
+) -> bool:
+    if not agent._try_activate_fallback(reason=FailoverReason.rate_limit):
+        return False
+    while messages:
+        tail = messages[-1]
+        if (
+            isinstance(tail, dict)
+            and tail.get("role") == "assistant"
+            and tail.get("finish_reason") == "incomplete"
+        ) or (
+            isinstance(tail, dict)
+            and tail.get("role") == "user"
+            and tail.get("content") == nudge
+        ):
+            messages.pop()
+            continue
+        break
+    if api_call_count >= agent.max_iterations or agent.iteration_budget.remaining <= 0:
+        agent._budget_grace_call = True
+    agent._codex_incomplete_retries = 0
+    agent._codex_reasoning_only_streak = 0
+    agent._session_messages = messages
+    return True
+
+
 def continue_codex_incomplete(
     agent: Any, assistant_message: Any, finish_reason: str, *, messages: list[dict[str, Any]],
     conversation_history: Any, api_call_count: int, response: Any = None,
@@ -635,20 +681,9 @@ def continue_codex_incomplete(
             agent._emit_interim_assistant_message(interim_msg)
 
     if reasoning_only and streak >= 3:
-        if agent._try_activate_fallback(reason=FailoverReason.incomplete_response):
-            # The trigger may have consumed the turn budget; without a grace call the loop
-            # exits before the fallback is ever asked.
-            if api_call_count >= agent.max_iterations or agent.iteration_budget.remaining <= 0:
-                agent._budget_grace_call = True
-            agent._codex_incomplete_retries = 0
-            agent._codex_reasoning_only_streak = 0
-            if not agent.quiet_mode:
-                agent._vprint(
-                    f"{agent.log_prefix}↻ Codex reasoning-only stall after {streak} attempts — "
-                    f"switching to fallback {agent.model} ({agent.provider})", diagnostic=True,
-                )
-            agent._emit_diagnostic_wait("↻ model stuck on internal reasoning — switching to fallback provider")
-            agent._session_messages = messages
+        if _activate_reasoning_stall_fallback(
+            agent, messages, api_call_count=api_call_count, streak=streak,
+        ):
             return CODEX_FALLBACK_ACTIVATED
         # No fallback left: fall through to the terminal sentinel.
     elif n < 3 or reasoning_only:
@@ -699,26 +734,9 @@ def continue_codex_incomplete(
         # three continuations, give a configured fallback one bounded call. Remove Codex-only
         # replay scaffolding only after the handoff is accepted; otherwise the terminal partial
         # result must retain the visible answer.
-        if agent._try_activate_fallback(reason=FailoverReason.rate_limit):
-            while messages:
-                tail = messages[-1]
-                if (
-                    isinstance(tail, dict)
-                    and tail.get("role") == "assistant"
-                    and tail.get("finish_reason") == "incomplete"
-                ) or (
-                    isinstance(tail, dict)
-                    and tail.get("role") == "user"
-                    and tail.get("content") == _CODEX_INCOMPLETE_NUDGE
-                ):
-                    messages.pop()
-                    continue
-                break
-            if api_call_count >= agent.max_iterations or agent.iteration_budget.remaining <= 0:
-                agent._budget_grace_call = True
-            agent._codex_incomplete_retries = 0
-            agent._codex_reasoning_only_streak = 0
-            agent._session_messages = messages
+        if _activate_visible_partial_fallback(
+            agent, messages, api_call_count=api_call_count, nudge=_CODEX_INCOMPLETE_NUDGE,
+        ):
             return CODEX_FALLBACK_ACTIVATED
 
     agent._codex_incomplete_retries = 0

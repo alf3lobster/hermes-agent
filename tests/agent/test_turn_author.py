@@ -23,6 +23,17 @@ class TestParseTurnAuthor:
     def test_junk_and_authors_without_id_or_name_return_none(self, raw):
         assert parse_turn_author(raw) is None
 
+    @pytest.mark.parametrize("is_bot", [pytest.param(None, id="null"), pytest.param(0, id="integer-zero"), pytest.param("", id="empty-string")])
+    def test_is_bot_must_be_an_explicit_boolean(self, is_bot):
+        raw = {"id": "user-1", "name": "User", "is_bot": is_bot}
+        assert parse_turn_author(raw) is None
+
+    def test_missing_is_bot_is_rejected_but_explicit_false_is_human(self):
+        assert parse_turn_author({"id": "user-1", "name": "User"}) is None
+        assert parse_turn_author({"id": "user-1", "name": "User", "is_bot": False}) == {
+            "id": "user-1", "name": "User", "is_bot": False,
+        }
+
 
 class TestEnvCarrier:
     def test_round_trip_through_env(self):

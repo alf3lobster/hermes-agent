@@ -37,6 +37,29 @@ if TYPE_CHECKING:  # string annotations only; never imported at runtime (cycle)
 
 # Log-record parity with the origin module.
 logger = logging.getLogger("gateway.run")
+
+
+def _retired_predecessor_ids(session_entry: Any) -> set[str]:
+    metadata = getattr(session_entry, "metadata", None) or {}
+    raw = metadata.get("hygiene_retired_predecessor_ids", ())
+    values = raw if isinstance(raw, (list, tuple, set)) else ()
+    blocked = {str(session_id) for session_id in values if session_id}
+    predecessor = str(metadata.get("hygiene_retired_predecessor_id") or "")
+    if predecessor:
+        blocked.add(predecessor)
+    return blocked
+
+
+def _session_row_matches(row: Any, session_id: str) -> bool:
+    return isinstance(row, dict) and str(row.get("id") or "") == str(session_id)
+
+
+def _session_row_is_reset(row: Any) -> bool:
+    return isinstance(row, dict) and bool(
+        row.get("ended_at") and row.get("end_reason") == "session_reset"
+    )
+
+
 # ``_resolve_turn_agent_config``'s default tier: the runner's per-turn ``_service_tier``.
 _TIER_FROM_RUNNER = object()
 
@@ -389,20 +412,7 @@ class GatewayTurnPrepareMixin:
         if self._session_db is None:
             return session_entry
 
-        metadata = getattr(session_entry, "metadata", None) or {}
-        raw_predecessors = metadata.get("hygiene_retired_predecessor_ids", ())
-        blocked_predecessors = {
-            str(session_id)
-            for session_id in (
-                raw_predecessors
-                if isinstance(raw_predecessors, (list, tuple, set))
-                else ()
-            )
-            if session_id
-        }
-        predecessor = str(metadata.get("hygiene_retired_predecessor_id") or "")
-        if predecessor:
-            blocked_predecessors.add(predecessor)
+        blocked_predecessors = _retired_predecessor_ids(session_entry)
 
         try:
             current_row = await self._session_db.get_session(session_entry.session_id)
@@ -412,10 +422,7 @@ class GatewayTurnPrepareMixin:
                 "⚠️ I could not verify this conversation route safely. "
                 "Your message was not processed. Please try again."
             )
-        if current_row is not None and not (
-            isinstance(current_row, dict)
-            and str(current_row.get("id") or "") == str(session_entry.session_id)
-        ):
+        if current_row is not None and not _session_row_matches(current_row, session_entry.session_id):
             logger.warning("Refusing malformed current Telegram session %s", session_entry.session_id)
             return (
                 "⚠️ I could not verify this conversation route safely. "
@@ -427,11 +434,7 @@ class GatewayTurnPrepareMixin:
                 "⚠️ This conversation was retired, but its clean replacement could not be "
                 "verified durably. Your message was not processed. Please use /reset and resend it."
             )
-        if (
-            isinstance(current_row, dict)
-            and current_row.get("ended_at")
-            and current_row.get("end_reason") == "session_reset"
-        ):
+        if _session_row_is_reset(current_row):
             logger.warning("Refusing current Telegram route to reset tombstone %s", session_entry.session_id)
             return (
                 "⚠️ This conversation route points to a retired session. "
@@ -485,20 +488,14 @@ class GatewayTurnPrepareMixin:
                 "⚠️ I could not verify the bound Telegram session safely. "
                 "Your message was not processed. Please try again."
             )
-        if not (
-            isinstance(bound_row, dict)
-            and str(bound_row.get("id") or "") == stored_session_id
-        ):
+        if not _session_row_matches(bound_row, stored_session_id):
             logger.warning("Refusing unverifiable Telegram bound session %s", stored_session_id)
             return (
                 "⚠️ I could not verify the bound Telegram session safely. "
                 "Your message was not processed. Please try again."
             )
 
-        bound_is_reset = bool(
-            bound_row.get("ended_at") and bound_row.get("end_reason") == "session_reset"
-        )
-        if stored_session_id in blocked_predecessors or bound_is_reset:
+        if stored_session_id in blocked_predecessors or _session_row_is_reset(bound_row):
             logger.warning("Ignoring stale Telegram topic binding to retired session %s", stored_session_id)
             try:
                 await asyncio.to_thread(
@@ -513,6 +510,14 @@ class GatewayTurnPrepareMixin:
                 )
             return session_entry
 
+        return await self._hmwa_follow_telegram_binding(
+            source, session_entry, session_key, stored_session_id, blocked_predecessors,
+        )
+
+    async def _hmwa_follow_telegram_binding(
+        self, source, session_entry, session_key, stored_session_id, blocked_predecessors,
+    ):
+        """Follow a verified binding through compression and durably repair its pointer."""
         bound_session_id = stored_session_id
         try:
             canonical_session_id = await self._session_db.get_compression_tip(bound_session_id)
@@ -526,14 +531,15 @@ class GatewayTurnPrepareMixin:
             try:
                 canonical_row = await self._session_db.get_session(canonical_session_id)
             except Exception:
+                logger.warning(
+                    "Could not verify Telegram compression-tip row %s",
+                    canonical_session_id,
+                    exc_info=True,
+                )
                 canonical_row = None
             if not (
-                isinstance(canonical_row, dict)
-                and str(canonical_row.get("id") or "") == canonical_session_id
-                and not (
-                    canonical_row.get("ended_at")
-                    and canonical_row.get("end_reason") == "session_reset"
-                )
+                _session_row_matches(canonical_row, canonical_session_id)
+                and not _session_row_is_reset(canonical_row)
                 and canonical_session_id not in blocked_predecessors
             ):
                 logger.warning("Refusing unverifiable Telegram compression tip %s", canonical_session_id)
