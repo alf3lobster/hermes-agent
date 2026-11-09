@@ -108,7 +108,7 @@ def test_model_not_found_notice_ignores_historical_diagnostic_after_timeout(monk
             "task_index": 0,
             "status": "timeout",
             "exit_reason": "timeout",
-            "failure_reason": "timeout",
+            "failure_reason": "model_not_found",
             "api_calls": 4,
             "goal": "A",
             "error": "tool execution timed out",

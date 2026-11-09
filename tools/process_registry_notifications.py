@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from contextlib import suppress
 
 _DONE = ("completed", "success")
-_MODEL_REJECTION_STATUSES = frozenset({"failed", "error", "timeout", "rejected"})
+_MODEL_REJECTION_STATUSES = frozenset({"failed", "error", "rejected"})
 _REASON_STATUS = {"lost": "marked lost because the process backend disappeared", "failed_start": "failed to start"}
 
 
