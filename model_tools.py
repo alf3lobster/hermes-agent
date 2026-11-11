@@ -8,7 +8,9 @@ hooks/middleware) plus registry pass-throughs.
 
 import os
 import json
+import hashlib
 import re
+import secrets
 import asyncio
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass
@@ -29,6 +31,21 @@ from tools.todo_tool import TODO_LEGACY_ALIASES, TODO_SCHEMA
 logger = logging.getLogger(__name__)
 
 _post_tool_call_hook_suppressed: ContextVar[bool] = ContextVar("post_tool_call_hook_suppressed", default=False)
+_direct_user_task_context: ContextVar[Optional[str]] = ContextVar("direct_user_task_context", default=None)
+
+
+@contextmanager
+def _bind_executor_direct_user_task(user_task: str, capability: object):
+    """Bind transcript-owned user text only for the agent executor's private capability."""
+    from agent.tool_executor import _DIRECT_USER_TASK_CAPABILITY
+
+    if capability is not _DIRECT_USER_TASK_CAPABILITY:
+        raise PermissionError("direct-user task binding requires the executor capability")
+    token = _direct_user_task_context.set(user_task if isinstance(user_task, str) and user_task else None)
+    try:
+        yield
+    finally:
+        _direct_user_task_context.reset(token)
 
 
 @contextmanager
@@ -666,6 +683,114 @@ class _CallIds:
         return {k: v or "" for k, v in asdict(self).items()}
 
 
+_DIRECT_USER_DISPATCH_CAPABILITY = object()
+_DIRECT_USER_DISPATCH_LOCK = threading.Lock()
+_DIRECT_USER_DISPATCH_ISSUED: dict[str, "_DirectUserDispatchProvenance"] = {}
+_DIRECT_USER_INSTRUCTION_USED: set[tuple[str, str, str, str, str]] = set()
+
+
+@dataclass(frozen=True, slots=True)
+class _DirectUserDispatchProvenance:
+    capability: object
+    nonce: str
+    tool_name: str
+    user_task: str
+    session_id: str
+    turn_id: str
+    tool_call_id: str
+    session_key: str
+    request_hash: str
+
+
+def _issue_direct_user_dispatch_provenance(
+    *,
+    tool_name: str,
+    user_task: str,
+    session_id: str,
+    turn_id: str,
+    tool_call_id: str,
+    request_args: dict[str, Any],
+) -> _DirectUserDispatchProvenance:
+    from tools import approval_context
+
+    current = (
+        approval_context._approval_session_id.get(),
+        approval_context._approval_turn_id.get(),
+        approval_context._approval_tool_call_id.get(),
+    )
+    supplied = (session_id, turn_id, tool_call_id)
+    session_key = approval_context.get_current_session_key(default="")
+    if (
+        not all(isinstance(value, str) and value for value in (tool_name, user_task, session_key, *supplied))
+        or current != supplied
+        or _direct_user_task_context.get() != user_task
+        or not isinstance(request_args, dict)
+    ):
+        raise PermissionError("direct-user dispatch provenance requires the genuine current tool runtime")
+    request_hash = hashlib.sha256(
+        json.dumps(request_args, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    ).hexdigest()
+    provenance = _DirectUserDispatchProvenance(
+        capability=_DIRECT_USER_DISPATCH_CAPABILITY,
+        nonce=secrets.token_hex(16),
+        tool_name=tool_name,
+        user_task=user_task,
+        session_id=session_id,
+        turn_id=turn_id,
+        tool_call_id=tool_call_id,
+        session_key=session_key,
+        request_hash=request_hash,
+    )
+    instruction_key = (
+        session_key,
+        session_id,
+        turn_id,
+        tool_name,
+        hashlib.sha256(user_task.encode("utf-8")).hexdigest(),
+    )
+    with _DIRECT_USER_DISPATCH_LOCK:
+        if instruction_key in _DIRECT_USER_INSTRUCTION_USED:
+            raise PermissionError("direct-user instruction authority was already used")
+        _DIRECT_USER_INSTRUCTION_USED.add(instruction_key)
+        _DIRECT_USER_DISPATCH_ISSUED[provenance.nonce] = provenance
+    return provenance
+
+
+def consume_direct_user_dispatch_provenance(
+    provenance: Any,
+    *,
+    expected_tool_name: str,
+    expected_args: dict[str, Any],
+) -> tuple[str, str, str, str]:
+    from tools import approval_context
+
+    if (
+        type(provenance) is not _DirectUserDispatchProvenance
+        or provenance.capability is not _DIRECT_USER_DISPATCH_CAPABILITY
+        or provenance.tool_name != expected_tool_name
+    ):
+        raise PermissionError("direct-user dispatch provenance is invalid")
+    current = (
+        approval_context._approval_session_id.get(),
+        approval_context._approval_turn_id.get(),
+        approval_context._approval_tool_call_id.get(),
+    )
+    if current != (provenance.session_id, provenance.turn_id, provenance.tool_call_id):
+        raise PermissionError("direct-user dispatch provenance does not match the current runtime")
+    if approval_context.get_current_session_key(default="") != provenance.session_key:
+        raise PermissionError("direct-user dispatch provenance does not match the current gateway session")
+    expected_request_hash = hashlib.sha256(
+        json.dumps(expected_args, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    ).hexdigest()
+    if expected_request_hash != provenance.request_hash:
+        raise PermissionError("direct-user dispatch provenance does not match the exact request")
+    with _DIRECT_USER_DISPATCH_LOCK:
+        if _DIRECT_USER_DISPATCH_ISSUED.get(provenance.nonce) is not provenance:
+            raise PermissionError("direct-user dispatch provenance is invalid or already consumed")
+        del _DIRECT_USER_DISPATCH_ISSUED[provenance.nonce]
+    return provenance.user_task, provenance.session_id, provenance.turn_id, provenance.tool_call_id
+
+
 def _tool_result_observer_fields(tool_name: str, result: Any) -> tuple[str, Optional[str], Optional[str]]:
     """Derive (status, error_type, error_message) from a tool result for observer hooks."""
     try:
@@ -852,6 +977,22 @@ def _execute_tool(function_name: str, function_args: dict[str, Any], original_ar
         return registry.dispatch(function_name, next_args, **dispatch_kwargs)
 
     with _approval_observability(ids):
+        dispatch_kwargs["dispatch_provenance"] = None
+        if (
+            function_name == "piperis_calendar_write"
+            and function_args.get("operation") in {"update", "delete"}
+        ):
+            try:
+                dispatch_kwargs["dispatch_provenance"] = _issue_direct_user_dispatch_provenance(
+                    tool_name=function_name,
+                    user_task=user_task or "",
+                    session_id=ids.session_id or "",
+                    turn_id=ids.turn_id or "",
+                    tool_call_id=ids.tool_call_id or "",
+                    request_args=function_args,
+                )
+            except PermissionError:
+                pass
         if skip_tool_execution_middleware:
             return _dispatch(function_args)
         from hermes_cli.middleware import run_tool_execution_middleware
