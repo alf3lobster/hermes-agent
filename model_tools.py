@@ -32,19 +32,28 @@ logger = logging.getLogger(__name__)
 
 _post_tool_call_hook_suppressed: ContextVar[bool] = ContextVar("post_tool_call_hook_suppressed", default=False)
 _direct_user_task_context: ContextVar[Optional[str]] = ContextVar("direct_user_task_context", default=None)
+_runtime_continuation_context: ContextVar[Any] = ContextVar("runtime_continuation_context", default=None)
 
 
 @contextmanager
-def _bind_executor_direct_user_task(user_task: str, capability: object):
+def _bind_executor_direct_user_task(
+    user_task: str,
+    capability: object,
+    *,
+    runtime_context: Optional[dict[str, str]] = None,
+):
     """Bind transcript-owned user text only for the agent executor's private capability."""
     from agent.tool_executor import _DIRECT_USER_TASK_CAPABILITY
 
     if capability is not _DIRECT_USER_TASK_CAPABILITY:
         raise PermissionError("direct-user task binding requires the executor capability")
     token = _direct_user_task_context.set(user_task if isinstance(user_task, str) and user_task else None)
+    continuation = _RuntimeContinuationContext.from_executor(runtime_context)
+    continuation_token = _runtime_continuation_context.set(continuation)
     try:
         yield
     finally:
+        _runtime_continuation_context.reset(continuation_token)
         _direct_user_task_context.reset(token)
 
 
@@ -687,6 +696,67 @@ _DIRECT_USER_DISPATCH_CAPABILITY = object()
 _DIRECT_USER_DISPATCH_LOCK = threading.Lock()
 _DIRECT_USER_DISPATCH_ISSUED: dict[str, "_DirectUserDispatchProvenance"] = {}
 _DIRECT_USER_INSTRUCTION_USED: set[tuple[str, str, str, str, str]] = set()
+_RUNTIME_CONTINUATION_CAPABILITY = object()
+
+
+@dataclass(frozen=True, slots=True)
+class _RuntimeContinuationContext:
+    capability: object
+    session_id: str
+    session_key: str
+    source: str
+    user_id: str
+    chat_id: str
+    chat_type: str
+    thread_id: str
+    platform_message_id: str
+
+    @classmethod
+    def from_executor(cls, raw: Optional[dict[str, str]]) -> Optional["_RuntimeContinuationContext"]:
+        fields = (
+            "session_id", "session_key", "source", "user_id", "chat_id", "chat_type",
+            "thread_id", "platform_message_id",
+        )
+        if not isinstance(raw, dict) or set(raw) != set(fields):
+            return None
+        if not all(isinstance(raw[field], str) for field in fields):
+            return None
+        return cls(_RUNTIME_CONTINUATION_CAPABILITY, *(raw[field] for field in fields))
+
+
+def _issue_runtime_continuation_context(ids: "_CallIds") -> Optional[_RuntimeContinuationContext]:
+    from tools import approval_context
+
+    context = _runtime_continuation_context.get()
+    if (
+        type(context) is not _RuntimeContinuationContext
+        or context.capability is not _RUNTIME_CONTINUATION_CAPABILITY
+        or context.session_id != (ids.session_id or "")
+        or context.session_key != approval_context.get_current_session_key(default="")
+        or context.source != "telegram"
+        or context.chat_type != "dm"
+        or not context.user_id
+        or context.user_id != context.chat_id
+        or not context.platform_message_id
+    ):
+        return None
+    return context
+
+
+def consume_runtime_continuation_context(context: Any) -> dict[str, str]:
+    """Return executor-owned Telegram routing identity only in its live tool-call context."""
+    if (
+        type(context) is not _RuntimeContinuationContext
+        or context.capability is not _RUNTIME_CONTINUATION_CAPABILITY
+        or _runtime_continuation_context.get() is not context
+    ):
+        raise PermissionError("runtime continuation context is invalid")
+    return {
+        field: getattr(context, field) for field in (
+            "session_id", "session_key", "source", "user_id", "chat_id", "chat_type",
+            "thread_id", "platform_message_id",
+        )
+    }
 
 
 @dataclass(frozen=True, slots=True)
@@ -978,10 +1048,12 @@ def _execute_tool(function_name: str, function_args: dict[str, Any], original_ar
 
     with _approval_observability(ids):
         dispatch_kwargs["dispatch_provenance"] = None
+        dispatch_kwargs["continuation_context"] = None
         if (
             function_name == "piperis_calendar_write"
-            and function_args.get("operation") in {"update", "delete"}
+            and function_args.get("operation") in {"create", "update", "delete"}
         ):
+            dispatch_kwargs["continuation_context"] = _issue_runtime_continuation_context(ids)
             try:
                 dispatch_kwargs["dispatch_provenance"] = _issue_direct_user_dispatch_provenance(
                     tool_name=function_name,

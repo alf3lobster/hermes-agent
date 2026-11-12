@@ -2520,11 +2520,22 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
                 effective_task_id=effective_task_id, tool_call_id=tool_call_id, duration_ms=duration_ms,
             )
     else:
+        current_user_task = ""
+        current_user_message = None
+        current_user_index = getattr(agent, "_persist_user_message_idx", None)
+        if isinstance(messages, list) and isinstance(current_user_index, int) and 0 <= current_user_index < len(messages):
+            current_user_message = messages[current_user_index]
+            if isinstance(current_user_message, dict) and current_user_message.get("role") == "user":
+                current_content = current_user_message.get("content")
+                if isinstance(current_content, str):
+                    current_user_task = current_content
+
         def _execute(next_args: dict) -> Any:
-            dispatch_kwargs = dict(
+            dispatch_kwargs: dict[str, Any] = dict(
                 tool_call_id=tool_call_id, session_id=agent.session_id or "",
                 turn_id=getattr(agent, "_current_turn_id", "") or "",
                 api_request_id=getattr(agent, "_current_api_request_id", "") or "",
+                user_task=current_user_task,
                 enabled_tools=list(agent.valid_tool_names) if agent.valid_tool_names else None,
                 skip_pre_tool_call_hook=True, skip_tool_request_middleware=True,
                 enabled_toolsets=getattr(agent, "enabled_toolsets", None),
@@ -2534,7 +2545,19 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
             if skip_tool_execution_middleware:
                 dispatch_kwargs["skip_tool_execution_middleware"] = True
             import model_tools
-            return model_tools.handle_function_call(function_name, next_args, effective_task_id, **dispatch_kwargs)
+            from agent.tool_executor import _DIRECT_USER_TASK_CAPABILITY, _runtime_continuation_identity
+
+            with model_tools._bind_executor_direct_user_task(
+                current_user_task,
+                _DIRECT_USER_TASK_CAPABILITY,
+                runtime_context=_runtime_continuation_identity(agent, current_user_message),
+            ):
+                return model_tools.handle_function_call(
+                    function_name,
+                    next_args,
+                    effective_task_id,
+                    **dispatch_kwargs,
+                )
     if skip_tool_execution_middleware:
         return _execute(function_args)
     from hermes_cli.middleware import run_tool_execution_middleware

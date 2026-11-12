@@ -71,6 +71,24 @@ from hermes_cli.observability.shared_metrics_efficiency import note_tool_result,
 _LARGE_TOOL_RESULT_TRIM_CHARS = 1_000_000
 
 logger = logging.getLogger(__name__)
+_DIRECT_USER_TASK_CAPABILITY = object()
+
+
+def _runtime_continuation_identity(agent: Any, user_message: Any) -> dict[str, str] | None:
+    """Project executor-owned gateway identity for one persisted inbound message."""
+    if not isinstance(user_message, dict):
+        return None
+    values = {
+        "session_id": getattr(agent, "session_id", "") or "",
+        "session_key": getattr(agent, "_gateway_session_key", "") or "",
+        "source": getattr(agent, "platform", "") or "",
+        "user_id": getattr(agent, "_user_id", "") or "",
+        "chat_id": getattr(agent, "_chat_id", "") or "",
+        "chat_type": getattr(agent, "_chat_type", "") or "",
+        "thread_id": getattr(agent, "_thread_id", "") or "",
+        "platform_message_id": user_message.get("platform_message_id") or "",
+    }
+    return values if all(isinstance(value, str) for value in values.values()) else None
 
 
 _pairing_tool_call_id = coalesce_tool_call_id  # canonical id used by the persisted assistant message
@@ -1725,10 +1743,24 @@ def _resolve_sequential_dispatch(agent, ref: _ToolCallRef, messages: list) -> _S
         )
 
     # Registry tools: post hook is owned by this executor (inner observer suppressed).
+    current_user_task = ""
+    current_user_message = None
+    current_user_index = getattr(agent, "_persist_user_message_idx", None)
+    if isinstance(current_user_index, int) and 0 <= current_user_index < len(messages):
+        current_user_message = messages[current_user_index]
+        if isinstance(current_user_message, dict) and current_user_message.get("role") == "user":
+            current_content = current_user_message.get("content")
+            if isinstance(current_content, str):
+                current_user_task = current_content
+
     def _execute(next_args: dict) -> Any:
         import model_tools
 
-        with model_tools.suppress_post_tool_call_hook():
+        with model_tools._bind_executor_direct_user_task(
+            current_user_task,
+            _DIRECT_USER_TASK_CAPABILITY,
+            runtime_context=_runtime_continuation_identity(agent, current_user_message),
+        ), model_tools.suppress_post_tool_call_hook():
             return model_tools.handle_function_call(
                 function_name,
                 next_args,
@@ -1737,6 +1769,7 @@ def _resolve_sequential_dispatch(agent, ref: _ToolCallRef, messages: list) -> _S
                 session_id=agent.session_id or "",
                 turn_id=getattr(agent, "_current_turn_id", "") or "",
                 api_request_id=getattr(agent, "_current_api_request_id", "") or "",
+                user_task=current_user_task,
                 enabled_tools=list(agent.valid_tool_names) if agent.valid_tool_names else None,
                 skip_pre_tool_call_hook=True,
                 skip_tool_request_middleware=True,
