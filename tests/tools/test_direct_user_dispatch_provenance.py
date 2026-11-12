@@ -1,3 +1,9 @@
+import copy
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
+import pickle
+from threading import Barrier
+
 import pytest
 from types import SimpleNamespace
 
@@ -5,6 +11,7 @@ import model_tools
 from agent import tool_executor
 from agent.agent_runtime_helpers import invoke_tool
 from tools import approval_context
+from tools.registry import ToolRegistry
 
 
 @pytest.fixture(autouse=True)
@@ -12,10 +19,14 @@ def _clear_direct_user_provenance_ledgers():
     with model_tools._DIRECT_USER_DISPATCH_LOCK:
         model_tools._DIRECT_USER_DISPATCH_ISSUED.clear()
         model_tools._DIRECT_USER_INSTRUCTION_USED.clear()
+    with model_tools._RUNTIME_CONTINUATION_LOCK:
+        model_tools._RUNTIME_CONTINUATION_ISSUED.clear()
     yield
     with model_tools._DIRECT_USER_DISPATCH_LOCK:
         model_tools._DIRECT_USER_DISPATCH_ISSUED.clear()
         model_tools._DIRECT_USER_INSTRUCTION_USED.clear()
+    with model_tools._RUNTIME_CONTINUATION_LOCK:
+        model_tools._RUNTIME_CONTINUATION_ISSUED.clear()
 
 
 def test_direct_handle_function_call_cannot_mint_user_provenance(monkeypatch):
@@ -91,6 +102,190 @@ def test_executor_supplies_trusted_telegram_continuation_context(monkeypatch):
 
     assert result == "ok"
     assert consumed == [runtime_identity]
+
+
+def test_registry_handler_in_another_thread_consumes_continuation_once(monkeypatch):
+    outcomes = []
+    runtime_identity = {
+        "session_id": "session-1",
+        "session_key": "agent:alfred:telegram:dm:6282086430:22786",
+        "source": "telegram",
+        "user_id": "6282086430",
+        "chat_id": "6282086430",
+        "chat_type": "dm",
+        "thread_id": "22786",
+        "platform_message_id": "23675",
+    }
+    threaded_registry = ToolRegistry()
+
+    def handler(args, *, continuation_context=None, **kwargs):
+        barrier = Barrier(2)
+
+        def consume():
+            barrier.wait(timeout=5)
+            try:
+                return ("consumed", model_tools.consume_runtime_continuation_context(continuation_context))
+            except PermissionError:
+                return ("rejected", None)
+
+        with ThreadPoolExecutor(max_workers=2) as consumers:
+            futures = (consumers.submit(consume), consumers.submit(consume))
+            outcomes.extend(future.result(timeout=5) for future in futures)
+        return "ok"
+
+    threaded_registry.register(
+        name="piperis_calendar_write",
+        toolset="test",
+        schema={"name": "piperis_calendar_write", "parameters": {"type": "object"}},
+        handler=handler,
+    )
+    real_dispatch = threaded_registry.dispatch
+
+    def dispatch_in_fresh_thread(name, args, **kwargs):
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            return pool.submit(real_dispatch, name, args, **kwargs).result(timeout=5)
+
+    monkeypatch.setattr(model_tools.registry, "dispatch", dispatch_in_fresh_thread)
+    session_key_token = approval_context.set_current_session_key(runtime_identity["session_key"])
+    try:
+        with model_tools._bind_executor_direct_user_task(
+            "Continue the exact request",
+            tool_executor._DIRECT_USER_TASK_CAPABILITY,
+            runtime_context=runtime_identity,
+        ):
+            result = model_tools._execute_tool(
+                "piperis_calendar_write",
+                {"operation": "update", "authority_id": "auth-1"},
+                {"operation": "update", "authority_id": "auth-1"},
+                model_tools._CallIds(
+                    task_id="task-1", session_id="session-1",
+                    tool_call_id="call-1", turn_id="turn-1",
+                ),
+                user_task="Continue the exact request",
+                enabled_tools=None,
+                skip_tool_execution_middleware=True,
+            )
+    finally:
+        approval_context.reset_current_session_key(session_key_token)
+
+    assert result == "ok"
+    assert sorted(outcome for outcome, _ in outcomes) == ["consumed", "rejected"]
+    assert [identity for outcome, identity in outcomes if outcome == "consumed"] == [runtime_identity]
+
+
+def test_continuation_receipt_rejects_copies_pickle_forgery_and_raw_dict(monkeypatch):
+    runtime_identity = {
+        "session_id": "session-1",
+        "session_key": "agent:alfred:telegram:dm:6282086430:22786",
+        "source": "telegram",
+        "user_id": "6282086430",
+        "chat_id": "6282086430",
+        "chat_type": "dm",
+        "thread_id": "22786",
+        "platform_message_id": "23675",
+    }
+
+    def dispatch(name, args, **kwargs):
+        receipt = kwargs["continuation_context"]
+        forged = type(receipt)(
+            receipt.capability,
+            receipt.nonce,
+            receipt.session_id,
+            receipt.session_key,
+            receipt.source,
+            receipt.user_id,
+            receipt.chat_id,
+            receipt.chat_type,
+            receipt.thread_id,
+            receipt.platform_message_id,
+        )
+        candidates = (
+            runtime_identity,
+            copy.copy(receipt),
+            copy.deepcopy(receipt),
+            pickle.loads(pickle.dumps(receipt)),
+            replace(receipt),
+            forged,
+        )
+        for candidate in candidates:
+            with pytest.raises(PermissionError, match="invalid"):
+                model_tools.consume_runtime_continuation_context(candidate)
+        assert model_tools.consume_runtime_continuation_context(receipt) == runtime_identity
+        with pytest.raises(PermissionError, match="invalid|consumed"):
+            model_tools.consume_runtime_continuation_context(receipt)
+        return "ok"
+
+    monkeypatch.setattr(model_tools.registry, "dispatch", dispatch)
+    session_key_token = approval_context.set_current_session_key(runtime_identity["session_key"])
+    try:
+        with model_tools._bind_executor_direct_user_task(
+            "Continue the exact request",
+            tool_executor._DIRECT_USER_TASK_CAPABILITY,
+            runtime_context=runtime_identity,
+        ):
+            result = model_tools._execute_tool(
+                "piperis_calendar_write",
+                {"operation": "update", "authority_id": "auth-1"},
+                {"operation": "update", "authority_id": "auth-1"},
+                model_tools._CallIds(session_id="session-1", tool_call_id="call-1", turn_id="turn-1"),
+                user_task="Continue the exact request",
+                enabled_tools=None,
+                skip_tool_execution_middleware=True,
+            )
+    finally:
+        approval_context.reset_current_session_key(session_key_token)
+
+    assert result == "ok"
+
+
+@pytest.mark.parametrize("dispatch_fails", [False, True])
+def test_unconsumed_continuation_receipt_expires_when_dispatch_ends(monkeypatch, dispatch_fails):
+    captured = []
+    runtime_identity = {
+        "session_id": "session-1",
+        "session_key": "agent:alfred:telegram:dm:6282086430:22786",
+        "source": "telegram",
+        "user_id": "6282086430",
+        "chat_id": "6282086430",
+        "chat_type": "dm",
+        "thread_id": "22786",
+        "platform_message_id": "23675",
+    }
+
+    def dispatch(name, args, **kwargs):
+        captured.append(kwargs["continuation_context"])
+        if dispatch_fails:
+            raise RuntimeError("dispatcher failed")
+        return "not consumed"
+
+    monkeypatch.setattr(model_tools.registry, "dispatch", dispatch)
+    session_key_token = approval_context.set_current_session_key(runtime_identity["session_key"])
+    try:
+        with model_tools._bind_executor_direct_user_task(
+            "Continue the exact request",
+            tool_executor._DIRECT_USER_TASK_CAPABILITY,
+            runtime_context=runtime_identity,
+        ):
+            call = lambda: model_tools._execute_tool(
+                "piperis_calendar_write",
+                {"operation": "create", "subject": "Private block"},
+                {"operation": "create", "subject": "Private block"},
+                model_tools._CallIds(session_id="session-1", tool_call_id="call-1", turn_id="turn-1"),
+                user_task="Continue the exact request",
+                enabled_tools=None,
+                skip_tool_execution_middleware=True,
+            )
+            if dispatch_fails:
+                with pytest.raises(RuntimeError, match="dispatcher failed"):
+                    call()
+            else:
+                call()
+    finally:
+        approval_context.reset_current_session_key(session_key_token)
+
+    with pytest.raises(PermissionError, match="invalid|consumed"):
+        model_tools.consume_runtime_continuation_context(captured[0])
+    assert model_tools._RUNTIME_CONTINUATION_ISSUED == {}
 
 
 def test_direct_caller_cannot_supply_trusted_continuation_context(monkeypatch):

@@ -697,6 +697,8 @@ _DIRECT_USER_DISPATCH_LOCK = threading.Lock()
 _DIRECT_USER_DISPATCH_ISSUED: dict[str, "_DirectUserDispatchProvenance"] = {}
 _DIRECT_USER_INSTRUCTION_USED: set[tuple[str, str, str, str, str]] = set()
 _RUNTIME_CONTINUATION_CAPABILITY = object()
+_RUNTIME_CONTINUATION_LOCK = threading.Lock()
+_RUNTIME_CONTINUATION_ISSUED: dict[str, "_RuntimeContinuationReceipt"] = {}
 
 
 @dataclass(frozen=True, slots=True)
@@ -724,14 +726,30 @@ class _RuntimeContinuationContext:
         return cls(_RUNTIME_CONTINUATION_CAPABILITY, *(raw[field] for field in fields))
 
 
-def _issue_runtime_continuation_context(ids: "_CallIds") -> Optional[_RuntimeContinuationContext]:
+@dataclass(frozen=True, slots=True)
+class _RuntimeContinuationReceipt:
+    capability: object
+    nonce: str
+    session_id: str
+    session_key: str
+    source: str
+    user_id: str
+    chat_id: str
+    chat_type: str
+    thread_id: str
+    platform_message_id: str
+
+
+def _issue_runtime_continuation_context(ids: "_CallIds") -> Optional[_RuntimeContinuationReceipt]:
     from tools import approval_context
 
     context = _runtime_continuation_context.get()
     if (
         type(context) is not _RuntimeContinuationContext
         or context.capability is not _RUNTIME_CONTINUATION_CAPABILITY
+        or not context.session_id
         or context.session_id != (ids.session_id or "")
+        or not context.session_key
         or context.session_key != approval_context.get_current_session_key(default="")
         or context.source != "telegram"
         or context.chat_type != "dm"
@@ -740,17 +758,41 @@ def _issue_runtime_continuation_context(ids: "_CallIds") -> Optional[_RuntimeCon
         or not context.platform_message_id
     ):
         return None
-    return context
+    with _RUNTIME_CONTINUATION_LOCK:
+        nonce = secrets.token_hex(16)
+        while nonce in _RUNTIME_CONTINUATION_ISSUED:
+            nonce = secrets.token_hex(16)
+        receipt = _RuntimeContinuationReceipt(
+            _RUNTIME_CONTINUATION_CAPABILITY,
+            nonce,
+            *(getattr(context, field) for field in (
+                "session_id", "session_key", "source", "user_id", "chat_id", "chat_type",
+                "thread_id", "platform_message_id",
+            )),
+        )
+        _RUNTIME_CONTINUATION_ISSUED[nonce] = receipt
+    return receipt
+
+
+def _revoke_runtime_continuation_context(context: Any) -> None:
+    if type(context) is not _RuntimeContinuationReceipt:
+        return
+    with _RUNTIME_CONTINUATION_LOCK:
+        if _RUNTIME_CONTINUATION_ISSUED.get(context.nonce) is context:
+            del _RUNTIME_CONTINUATION_ISSUED[context.nonce]
 
 
 def consume_runtime_continuation_context(context: Any) -> dict[str, str]:
-    """Return executor-owned Telegram routing identity only in its live tool-call context."""
+    """Atomically consume one executor-issued cross-dispatch routing receipt."""
     if (
-        type(context) is not _RuntimeContinuationContext
+        type(context) is not _RuntimeContinuationReceipt
         or context.capability is not _RUNTIME_CONTINUATION_CAPABILITY
-        or _runtime_continuation_context.get() is not context
     ):
         raise PermissionError("runtime continuation context is invalid")
+    with _RUNTIME_CONTINUATION_LOCK:
+        if _RUNTIME_CONTINUATION_ISSUED.get(context.nonce) is not context:
+            raise PermissionError("runtime continuation context is invalid or already consumed")
+        del _RUNTIME_CONTINUATION_ISSUED[context.nonce]
     return {
         field: getattr(context, field) for field in (
             "session_id", "session_key", "source", "user_id", "chat_id", "chat_type",
@@ -1049,11 +1091,11 @@ def _execute_tool(function_name: str, function_args: dict[str, Any], original_ar
     with _approval_observability(ids):
         dispatch_kwargs["dispatch_provenance"] = None
         dispatch_kwargs["continuation_context"] = None
+        continuation_context = None
         if (
             function_name == "piperis_calendar_write"
             and function_args.get("operation") in {"create", "update", "delete"}
         ):
-            dispatch_kwargs["continuation_context"] = _issue_runtime_continuation_context(ids)
             try:
                 dispatch_kwargs["dispatch_provenance"] = _issue_direct_user_dispatch_provenance(
                     tool_name=function_name,
@@ -1065,11 +1107,16 @@ def _execute_tool(function_name: str, function_args: dict[str, Any], original_ar
                 )
             except PermissionError:
                 pass
-        if skip_tool_execution_middleware:
-            return _dispatch(function_args)
-        from hermes_cli.middleware import run_tool_execution_middleware
-        return run_tool_execution_middleware(function_name, function_args, _dispatch, original_args=original_args,
-                                             **ids.hook_kwargs())
+            continuation_context = _issue_runtime_continuation_context(ids)
+            dispatch_kwargs["continuation_context"] = continuation_context
+        try:
+            if skip_tool_execution_middleware:
+                return _dispatch(function_args)
+            from hermes_cli.middleware import run_tool_execution_middleware
+            return run_tool_execution_middleware(function_name, function_args, _dispatch, original_args=original_args,
+                                                 **ids.hook_kwargs())
+        finally:
+            _revoke_runtime_continuation_context(continuation_context)
 
 
 def _apply_transform_tool_result_hook(function_name: str, function_args: dict[str, Any], result: Any, duration_ms: int,
